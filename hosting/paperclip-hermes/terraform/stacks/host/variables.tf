@@ -129,10 +129,6 @@ variable "monthly_credit" {
   description = "Subscription credit."
 }
 
-variable "budget_start" {
-  type        = string
-  description = "Budget start date in RFC3339."
-}
 
 variable "billing_month_verified" {
   type        = bool

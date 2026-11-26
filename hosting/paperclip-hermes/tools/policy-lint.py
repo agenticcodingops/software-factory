@@ -47,6 +47,40 @@ def load_policy(text):
     return value
 
 
+def lower_keys(value):
+    if not isinstance(value, dict):
+        raise ValueError("policy sections/rules must be objects")
+    result = {}
+    for key, item in value.items():
+        key = key.lower()
+        if key in result:
+            raise ValueError("policy keys collide after case normalization")
+        result[key] = item
+    return result
+
+
+def normalize_policy(policy):
+    policy = lower_keys(policy)
+    allowed = {"acls", "grants", "ssh", "hosts", "groups", "tagowners", "autoapprovers",
+               "nodeattrs", "tests", "sshtests", "derpmap", "randomizeclientport", "disableipv4",
+               "postures", "defaultsrcposture", "ipsets"}
+    if policy.keys() - allowed:
+        raise ValueError("unsupported policy section")
+    for section in ("grants", "acls", "ssh"):
+        entries = policy.get(section, [])
+        if not isinstance(entries, list):
+            raise ValueError("policy rules must be arrays")
+        entries = [lower_keys(rule) for rule in entries]
+        allowed_rule = {"action", "src", "dst", "proto", "ip", "app", "via", "srcposture"}
+        if section == "ssh":
+            allowed_rule |= {"users", "checkperiod", "acceptenv"}
+        for rule in entries:
+            if rule.keys() - allowed_rule:
+                raise ValueError("unsupported rule key (legacy ACL users/ports are forbidden)")
+        policy[section] = entries
+    return policy
+
+
 def selectors(policy, value, trail=()):
     if not isinstance(value, str):
         raise ValueError("selectors must be strings")
@@ -96,6 +130,9 @@ def covers_pilot(value):
 
 
 def findings(policy, operator):
+    # Remember absence before normalization supplies empty rule arrays.
+    missing_rules = not any(key.lower() in {"grants", "acls"} for key in policy)
+    policy = normalize_policy(policy)
     result = []
     operator = operator.lower()
     # Selectors must not be hidden by aliases named after reserved tags, networks or users.
@@ -107,7 +144,7 @@ def findings(policy, operator):
             pattern = r"[a-zA-Z][a-zA-Z0-9_.-]*" if section == "hosts" else r"group:[a-zA-Z0-9_-]+"
             if not re.fullmatch(pattern, key):
                 raise ValueError("invalid host alias or group name")
-    if "grants" not in policy and "acls" not in policy:
+    if missing_rules:
         result.append("missing grants/acls inherits Tailscale's default allow-all policy")
     for section in ("grants", "acls"):
         entries = policy.get(section, [])
@@ -118,6 +155,8 @@ def findings(policy, operator):
                 raise ValueError("every rule requires nonempty src/dst arrays")
             src = {s for item in rule["src"] for s in selectors(policy, item)}
             dst = {s for item in rule["dst"] for s in selectors(policy, destination(item, section == "acls"))}
+            if section == "grants" and any(covers_pilot(s) for item in rule.get("via", []) for s in selectors(policy, item)):
+                result.append(f"grants[{index}]: pilot cannot route traffic via itself")
             if any(covers_pilot(s) for s in src):
                 result.append(f"{section}[{index}]: source covers {PILOT}")
             if any(covers_pilot(d) for d in dst) and src != {operator}:
@@ -130,11 +169,25 @@ def findings(policy, operator):
         if any(covers_pilot(d) for d in dst):
             if src != {operator} or rule.get("action") != "check" or rule.get("users") != ["admin"]:
                 result.append(f"ssh[{index}]: pilot SSH requires operator check mode as admin")
-    for test in policy.get("sshTests", []):
+    for test in policy.get("sshtests", []):
         if not isinstance(test.get("src"), str) or not isinstance(test.get("dst"), list) or "user" in test:
             raise ValueError("sshTests requires src and a dst array, with accept/check/deny user arrays")
         if any(not isinstance(test[key], list) or not all(isinstance(user, str) for user in test[key]) for key in ("accept", "check", "deny") if key in test):
             raise ValueError("sshTests accept/check/deny must be arrays of SSH users")
+    for entry in policy.get("nodeattrs", []):
+        entry = lower_keys(entry)
+        attrs = entry.get("attr", [])
+        # No pilot node attributes are currently authorized. Funnel is always rejected.
+        if "funnel" in attrs or attrs and any(covers_pilot(s) for item in entry.get("target", []) for s in selectors(policy, item)):
+            result.append("nodeAttrs: unauthorized pilot/public attribute")
+    approvers = lower_keys(policy.get("autoapprovers", {}))
+    for entries in [approvers.get("exitnode", []), *approvers.get("routes", {}).values()]:
+        if any(covers_pilot(s) for item in entries for s in selectors(policy, item)):
+            result.append("autoApprovers: pilot must not auto-approve routes or exit nodes")
+    owners = lower_keys(policy.get("tagowners", {}))
+    for tag, expected in ((PILOT, ["tag:pc-deployer"]), ("tag:pc-deployer", [operator])):
+        if tag in owners and owners[tag] != expected:
+            result.append(f"tagOwners: {tag} requires exactly {expected}")
     return result
 
 
@@ -172,7 +225,15 @@ def main():
     args = parser.parse_args()
     try:
         text = args.policy.read_text()
-        issues = findings(load_policy(text), args.operator)
+        loaded = load_policy(text)
+        try:
+            issues = findings(loaded, args.operator)
+        except ValueError as exc:
+            if args.mode != "report-only":
+                raise
+            # An exact read-only baseline can report unsupported legacy semantics.
+            # The complete no-diff/live-byte checks below still forbid any mutation.
+            issues = [str(exc)]
         if args.mode == "report-only":
             if args.operation != "plan" or not args.baseline_plan or not args.live_policy:
                 raise ValueError("report-only requires a read-only no-diff baseline plan and live policy; apply/join forbidden")

@@ -1,6 +1,10 @@
 variable "prefix" {
   type        = string
   description = "Instance prefix; storage names must be globally unique."
+  validation {
+    condition     = can(regex("^[a-z0-9]{1,17}$", var.prefix))
+    error_message = "Prefix must contain 1-17 lowercase alphanumeric characters."
+  }
 }
 
 variable "location" {
@@ -69,4 +73,19 @@ variable "container_retention_fallback" {
   type        = bool
   description = "Enable only if self-test 3 shows account retention is not inherited."
   default     = false
+}
+
+variable "role_home_target" {
+  type        = string
+  description = "Immutable registered target that anchors target roles and tenant twins."
+  validation {
+    condition     = contains(keys(var.targets), var.role_home_target)
+    error_message = "The trust home must remain a registered target."
+  }
+}
+
+variable "target_client_id" {
+  type        = string
+  default     = null
+  description = "Target-tenant OIDC client ID; use the plan twin for cross-tenant drift."
 }

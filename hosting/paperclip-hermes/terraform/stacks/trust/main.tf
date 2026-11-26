@@ -8,6 +8,7 @@ module "trust" {
   vault_tenant_id              = var.vault_tenant_id
   target_tenant_id             = var.target_tenant_id
   targets                      = var.targets
+  role_home_target             = var.role_home_target
   operator_object_id           = var.operator_object_id
   state_account_name           = var.state_account_name
   sub_claim_prefix             = var.sub_claim_prefix

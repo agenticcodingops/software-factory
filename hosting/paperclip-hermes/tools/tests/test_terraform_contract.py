@@ -126,11 +126,10 @@ class MockPlanTests(unittest.TestCase):
         ratio = re.search(r'threshold_ratio\s*=\s*"(.*)"', text)[1]
         expression = re.search(r'expression\s*=\s*"(@.*)"', text)[1]
         expression = expression.replace('${local.threshold_ratio}', ratio).replace('${var.name}', 'fixture').replace('${split("/", var.subscription_resource_id)[2]}', '00000000-0000-0000-0000-000000000000')
-        for verified in (True, False):
-            rendered = expression.replace('${var.billing_month_verified}', str(verified).lower())
-            self.assertEqual(budget_alerts.findings(rendered, verified), [])
-            unnormalized = rendered.replace(ratio, "float(triggerBody()?['data']?['NotificationThresholdAmount'])")
-            self.assertTrue(budget_alerts.findings(unnormalized, verified))
+        rendered = expression.replace('${var.billing_month_verified}', 'true')
+        for kind, budget, amount, expected in (("rg", 5.03, 4.024, True), ("rg", 5.03, 4.02, True), ("rg", 35, 27.99, False), ("subscription", 100.17, 85.1445, True), ("subscription", 101.7, 86.44, True), ("subscription", 100, 84.99, False)):
+            payload = {"schemaId": "AIP Budget Notification", "data": {"SubscriptionId": "00000000-0000-0000-0000-000000000000", "BudgetName": f"fixture-{kind}", "Budget": budget, "NotificationThresholdAmount": amount}}
+            self.assertEqual(budget_alerts.evaluate(rendered, payload, {}), expected)
 
     def test_secret_resource_and_pem_rejections(self):
         for typ, after in (("tls_private_key", {}), ("random_password", {}), ("azurerm_storage_account", {}), ("terraform_data", {"private_key_pem": "planted"})):

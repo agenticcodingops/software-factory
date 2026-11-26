@@ -146,13 +146,13 @@ class ReviewTests(unittest.TestCase):
         notifications = re.findall(r'actual100 = \{ threshold = 100, type = "Actual", action = ([^}]+)\}', text)
         self.assertEqual([item.strip() for item in notifications], ['"deallocate"', 'var.billing_month_verified ? "deallocate" : "email"'])
         expressions = re.findall(r'expression\s*=\s*"(@.*)"', text)
-        ratio = re.search(r'threshold_ratio\s*=\s*"(.*)"', text)[1]
-        expression = expressions[1].replace('${local.threshold_ratio}', ratio)
+        hard_ratio = re.search(r'hard_ratio\s*=\s*"(.*)"', text)[1]
+        expression = expressions[1].replace('${local.hard_ratio}', hard_ratio)
         payload = {"data": {"Budget": 35, "NotificationThresholdAmount": 28}}
-        self.assertTrue(budget_alerts.evaluate(expression, payload, {}))
-        self.assertFalse(budget_alerts.evaluate(expression, payload, {"sf-maintenance-until": "2026-11-26T14:00:00Z"}))
+        self.assertFalse(budget_alerts.evaluate(expression, payload, {}))
         payload["data"]["NotificationThresholdAmount"] = 35
-        self.assertTrue(budget_alerts.evaluate(expression, payload, {"sf-maintenance-until": "2026-11-26T14:00:00Z"}))
+        self.assertTrue(budget_alerts.evaluate(expression, payload, {"sf-maintenance-until": "bad"}))
+        self.assertIn('Parse_maintenance = ["Failed", "TimedOut"]', text)
         self.assertIn('runAfter = { Recheck_VM = ["Succeeded"] }', text)
         self.assertIn('retryPolicy = { type = "none" }', text)
         self.assertEqual(text.count('depends_on'), 2)
@@ -175,6 +175,8 @@ class SelectorAuditTests(unittest.TestCase):
             for selector in ("autogroup:danger-all", "tag:PCPilot", "AUTOGROUP:TAGGED"):
                 for side in ("src", "dst"):
                     rule = {"src": ["another@" + "example.com"], "dst": ["tag:other:22" if section == "acls" else "tag:other"], "action": "accept", "users": ["admin"]}
+                    if section != "ssh":
+                        del rule["users"]
                     rule[side] = [selector + ":22" if side == "dst" and section == "acls" else selector]
                     self.assertTrue(policy.findings({"grants": [], section: [rule]}, "operator@example.com"))
         self.assertFalse(policy.findings({"grants": [{"src": ["operator@example.com"], "dst": ["tag:PCPilot"]}]}, "operator@example.com"))
@@ -264,6 +266,189 @@ class WormClosureTests(unittest.TestCase):
     def test_missing_retention_inventory_fails_closed(self):
         with self.assertRaises(ValueError):
             worm.lock_versions(lambda *_: ({}, b'<EnumerationResults><Blobs><Blob><Name>a</Name></Blob></Blobs></EnumerationResults>'), "2026-11-26T12:00:00Z", apply=True, now=self.now)
+
+
+class PrePushReviewTests(unittest.TestCase):
+    def resource(self, typ, kind, before=None, after=None, actions=None, **extra):
+        return {"address": extra.pop("address", f"{typ}.fixture"), "type": typ, "change": {
+            "actions": actions or ["create"], "before": before,
+            "after": {"type": kind + "@2024-03-02", **(after or {})} if after is not None else None,
+            **extra}}
+
+    def test_park_patch_delete_is_state_only_but_disk_delete_is_blocked(self):
+        vm = self.resource("azapi_resource", "Microsoft.Compute/virtualMachines", before={"type": "Microsoft.Compute/virtualMachines@2024-07-01"}, actions=["delete"])
+        patch = self.resource("azapi_update_resource", "Microsoft.Compute/disks", before={"type": "Microsoft.Compute/disks@2024-03-02"}, actions=["delete"])
+        self.assertFalse(plan.guard({"resource_changes": [vm, patch]}, True))
+        patch["type"] = "azapi_resource"
+        self.assertTrue(plan.guard({"resource_changes": [vm, patch]}, True))
+
+    def test_arm_actions_cannot_destroy_disks_storage_or_vms(self):
+        for kind in ("Microsoft.Compute/disks", "Microsoft.Storage/storageAccounts", "Microsoft.Compute/virtualMachines", "Microsoft.Network/networkSecurityGroups"):
+            for method in ("DELETE", "POST", "PATCH"):
+                r = self.resource("azapi_resource_action", kind, after={"resource_id": "/fixture/resource", "method": method})
+                if method == "DELETE" or not kind.startswith("Microsoft.Network"):
+                    self.assertTrue(plan.guard({"resource_changes": [r]}, True))
+        r = self.resource("azapi_resource_action", "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies", after={"method": "POST", "action": "lock"}, address="module.trust.azapi_resource_action.lock_container_retention[0]")
+        self.assertTrue(any("immutability/lifecycle" in x for x in plan.guard({"resource_changes": [r]})))
+
+    def test_destroy_actions_are_checked_but_ordinary_action_state_removal_is_safe(self):
+        before = {"type": "Microsoft.Compute/disks@2024-03-02", "method": "DELETE", "when": "destroy"}
+        r = self.resource("azapi_resource_action", "Microsoft.Compute/disks", before=before, actions=["delete"])
+        self.assertTrue(plan.guard({"resource_changes": [r]}, True))
+        before["when"] = "apply"
+        self.assertFalse(plan.guard({"resource_changes": [r]}, True))
+
+    def test_indirect_vm_tags_cannot_bypass_protocol_guard(self):
+        vm_id = "/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/pc"
+        for typ, kind, after in (
+            ("azapi_resource", "Microsoft.Resources/tags", {"parent_id": vm_id, "body": {"properties": {"tags": {}}}}),
+            ("azapi_resource_action", "Microsoft.Compute/virtualMachines", {"resource_id": vm_id, "method": "PATCH", "body": {"tags": {}}}),
+            ("azapi_update_resource", "Microsoft.Compute/virtualMachines", {"resource_id": vm_id, "body": {"properties": {"tags": {}}}}),
+        ):
+            self.assertTrue(plan.guard({"resource_changes": [self.resource(typ, kind, after=after)]}, True))
+        r = self.resource("azapi_update_resource", "Microsoft.Compute/virtualMachines", after={"resource_id": vm_id}, after_unknown={"body": True})
+        self.assertTrue(plan.guard({"resource_changes": [r]}, True))
+
+    def test_tag_extension_delete_and_destroy_action_also_change_protocol_tags(self):
+        for typ, when in (("azapi_resource", None), ("azapi_resource_action", "destroy")):
+            before = {"type": "Microsoft.Resources/tags@2021-04-01", "method": "PATCH", "when": when, "body": {"properties": {"tags": {}}}}
+            r = self.resource(typ, "Microsoft.Resources/tags", before=before, actions=["delete"])
+            self.assertTrue(plan.guard({"resource_changes": [r]}, True))
+
+    def test_blob_service_retention_fields_are_guarded_in_avm_shape(self):
+        for key, old, new in (("isVersioningEnabled", True, False), ("deleteRetentionPolicy", {"enabled": True, "days": 7}, {"enabled": False}), ("containerDeleteRetentionPolicy", {"enabled": True}, None), ("restorePolicy", {"enabled": True}, None), ("changeFeed", {"enabled": True}, None)):
+            kind = "Microsoft.Storage/storageAccounts/blobServices"
+            r = self.resource("azapi_update_resource", kind, before={"type": kind + "@2025-08-01", "body": {"properties": {key: old}}}, after={"body": {"properties": {key: new}}}, actions=["update"])
+            self.assertTrue(plan.guard({"resource_changes": [r]}, True))
+            r["change"]["after"] = copy.deepcopy(r["change"]["before"])
+            self.assertFalse(plan.guard({"resource_changes": [r]}))
+            r["change"]["after_unknown"] = {"body": {"properties": {key: True}}}
+            self.assertTrue(plan.guard({"resource_changes": [r]}))
+        kind = "Microsoft.Storage/storageAccounts/blobServices/containers"
+        r = self.resource("azapi_resource", kind, before={"type": kind + "@2025-08-01", "body": {"properties": {"immutableStorageWithVersioning": {"enabled": True}}}}, after={"body": {"properties": {}}}, actions=["update"])
+        self.assertTrue(plan.guard({"resource_changes": [r]}, True))
+
+    def test_trust_anchor_replacements_are_never_overridden(self):
+        for address in ('module.trust.azurerm_role_definition.target["deallocator"]', 'module.trust.azurerm_resource_group.target_identities[0]', 'module.trust.module.target_identities["plan"].azurerm_user_assigned_identity.this'):
+            r = {"address": address, "type": "azurerm_user_assigned_identity", "change": {"actions": ["delete", "create"], "before": {}, "after": {}}}
+            self.assertTrue(plan.guard({"resource_changes": [r]}, True))
+
+        # Removing a target's grant must not be mistaken for rotating a twin principal.
+        r = {"address": 'module.trust.module.target_identities["plan"].azurerm_role_assignment.this["retired-Reader"]', "type": "azurerm_role_assignment", "change": {"actions": ["delete"], "before": {}, "after": None}}
+        self.assertFalse(plan.guard({"resource_changes": [r]}))
+
+    def test_policy_case_normalization_and_legacy_fields_fail_closed(self):
+        import json
+        p = {"grants": [{"src": ["operator@example.com"], "dst": ["tag:pcpilot"], "ip": ["tcp:22"]}], "ACLs": [{"Action": "accept", "Src": ["*"], "Dst": ["*:*"]}]}
+        self.assertTrue(policy.findings(policy.load_policy(json.dumps(p)), "operator@example.com"))
+        p = {"Hosts": {"pilot": "100.64.0.1"}, "Grants": [{"Src": ["*"], "Dst": ["pilot"]}]}
+        self.assertTrue(policy.findings(p, "operator@example.com"))
+        for p in ({"acls": [], "ACLs": []}, {"Hosts": {}, "hosts": {}}, {"grants": [{"src": ["*"], "Src": ["operator@example.com"], "dst": ["tag:pcpilot"]}]}, {"grants": [], "typo": []}):
+            with self.assertRaises(ValueError):
+                policy.findings(p, "operator@example.com")
+        for key in ("users", "ports", "Users", "Ports", "unrecognized"):
+            p = {"acls": [{"src": ["operator@example.com"], "dst": ["tag:pcpilot:*"], key: ["*"]}]}
+            with self.assertRaises(ValueError):
+                policy.findings(p, "operator@example.com")
+
+    def test_legacy_policy_remains_importable_only_as_exact_read_only_baseline(self):
+        import json
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            live = directory / "live.json"
+            live.write_text(json.dumps({"ACLs": [{"Action": "accept", "Users": ["*"], "Ports": ["*:*"]}]}))
+            baseline = directory / "plan.json"
+            baseline.write_text(json.dumps({"resource_changes": [
+                {"type": "tailscale_acl", "change": {"actions": ["no-op"], "before": {"acl": live.read_text()}, "after": {"acl": live.read_text()}}},
+                {"type": "tailscale_tailnet_settings", "change": {"actions": ["no-op"], "after": {}}},
+            ]}))
+            args = [sys.executable, BASE.parent / "tools/policy-lint.py", live, "--operator", "operator@example.com"]
+            self.assertEqual(subprocess.run(args, capture_output=True).returncode, 2)
+            report = [*args, "--mode", "report-only", "--baseline-plan", baseline, "--live-policy", live]
+            self.assertEqual(subprocess.run(report, capture_output=True).returncode, 0)
+            self.assertEqual(subprocess.run([*report, "--operation", "apply"], capture_output=True).returncode, 2)
+            self.assertEqual(subprocess.run([*report, "--operation", "join"], capture_output=True).returncode, 2)
+
+    def test_policy_cannot_publish_route_through_or_delegate_pilot(self):
+        cases = [
+            {"nodeAttrs": [{"target": ["tag:pcpilot"], "attr": ["funnel"]}]},
+            {"nodeAttrs": [{"target": ["100.64.0.0/10"], "attr": ["future-capability"]}]},
+            {"autoApprovers": {"exitNode": ["tag:pcpilot"]}},
+            {"autoApprovers": {"routes": {"10.0.0.0/8": ["tag:pcpilot"]}}},
+            {"grants": [{"src": ["autogroup:member"], "dst": ["autogroup:internet"], "ip": ["*"], "via": ["tag:pcpilot"]}]},
+            {"tagOwners": {"tag:pcpilot": ["autogroup:member"]}},
+            {"tagOwners": {"tag:pc-deployer": ["autogroup:member"]}},
+        ]
+        for additions in cases:
+            p = {"grants": [], **additions}
+            self.assertTrue(policy.findings(p, "operator@example.com"), additions)
+        self.assertFalse(policy.findings({"grants": [], "tagOwners": {"tag:pcpilot": ["tag:pc-deployer"], "tag:pc-deployer": ["operator@example.com"]}}, "operator@example.com"))
+
+    def test_storage_data_reads_and_prior_state_cannot_hide_credentials(self):
+        inspector = module("check-mock-plans")
+        for typ, values in (("azurerm_storage_account", {}), ("azurerm_storage_account_sas", {}), ("azurerm_storage_account_blob_container_sas", {}), ("azapi_resource_action", {"action": "listKeys"}), ("azapi_resource_action", {"action": "listAccountSas"}), ("terraform_data", {"primary_access_key": "fixture"})):
+            for mode in ("data", "managed"):
+                resource = {"type": typ, "mode": mode, "change": {"after": values}}
+                self.assertTrue(inspector.inspect_plan({"resource_changes": [resource]}))
+                resource = {"type": typ, "mode": mode, "values": values}
+                self.assertTrue(inspector.inspect_plan({"prior_state": {"values": {"root_module": {"child_modules": [{"resources": [resource]}]}}}}))
+
+    def test_encryption_prerequisite_is_read_only_and_fails_clearly(self):
+        import os
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "az"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$AZ_CALLS"\nif [ "$1" = feature ]; then echo "$FEATURE_STATE"; else echo Registered; fi\n')
+            stub.chmod(0o755)
+            for state in ("Registered", "NotRegistered"):
+                log = Path(tmp) / "calls"
+                log.write_text("")
+                env = {**os.environ, "PATH": tmp + ":" + os.environ["PATH"], "FEATURE_STATE": state, "AZ_CALLS": str(log)}
+                result = subprocess.run([BASE.parent / "tools/check-azure-prerequisites.sh", "fixture"], env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, int(state != "Registered"))
+                self.assertIn("Microsoft.DevTestLab", log.read_text())
+                self.assertIn("EncryptionAtHost", log.read_text())
+                self.assertNotIn(" register ", log.read_text())
+                if result.returncode:
+                    self.assertIn("Owner bootstrap required", result.stderr)
+
+    def test_trust_home_and_target_client_contracts(self):
+        module_text = (BASE / "modules/trust/main.tf").read_text()
+        providers = (BASE / "stacks/trust/providers.tf").read_text()
+        self.assertNotIn("values(var.targets)[0]", module_text + providers)
+        home_guard = module_text.split('resource "terraform_data" "trust_home"')[1]
+        self.assertIn("prevent_destroy = true", home_guard)
+        for field in ("key", "subscription", "location"):
+            self.assertRegex(home_guard, field + r"\s*=")
+        self.assertEqual(providers.count("client_id"), 4)  # LHS and variable reference on both aliases.
+        for provider in trust_renderer.composition(targets())["provider"]["azapi"]:
+            self.assertEqual(provider["client_id"], "${var.target_client_id}")
+        for name in ("modules/trust/variables.tf", "stacks/trust/variables.tf"):
+            text = (BASE / name).read_text()
+            self.assertIn('contains(keys(var.targets), var.role_home_target)', text)
+            self.assertIn('^[a-z0-9]{1,17}$', text)
+
+    def test_plan_reader_audit_rejects_missing_authorization_and_rg_reads(self):
+        inspector = module("check-mock-plans")
+        resources = []
+        for name, scope in (("vault_read", "/subscriptions/v/resourceGroups/vault"), ("drill_read", "/subscriptions/v/resourceGroups/drill"), ("authorization_read", "/subscriptions/v")):
+            resources.append({"address": f'module.trust.module.identities["plan"].azurerm_role_assignment.this["{name}"]', "type": "azurerm_role_assignment", "change": {"after": {"scope": scope}}})
+        resources += [
+            {"address": "module.trust.azurerm_role_definition.vault", "type": "azurerm_role_definition", "change": {"after": {"scope": "/subscriptions/v"}}},
+            {"address": "module.trust.azurerm_resource_group.drill", "type": "azurerm_resource_group", "change": {"after": {"id": "/subscriptions/v/resourceGroups/drill"}}},
+        ]
+        self.assertFalse(inspector.trust_read_findings({"resource_changes": resources}))
+        for index in (1, 2):
+            changed = copy.deepcopy(resources)
+            changed.pop(index)
+            self.assertTrue(inspector.trust_read_findings({"resource_changes": changed}))
+
+    def test_bootstrap_lock_name_is_explicit_in_both_contracts(self):
+        root = BASE.parents[2]
+        for p in (BASE / "README.md", root / "docs/adr/0001-azure-deployment.md"):
+            self.assertIn('`state-cannot-delete`', p.read_text())
 
 
 if __name__ == "__main__":

@@ -1,6 +1,10 @@
 variable "prefix" {
   type        = string
   description = "Instance prefix; storage names must be globally unique."
+  validation {
+    condition     = can(regex("^[a-z0-9]{1,17}$", var.prefix))
+    error_message = "Prefix must contain 1-17 lowercase alphanumeric characters."
+  }
 }
 
 variable "location" {
@@ -84,4 +88,13 @@ variable "container_retention_fallback" {
 variable "workload_resource_group_ids" {
   type        = map(string)
   description = "Created or read workload RG IDs from subscription-specific root modules."
+}
+
+variable "role_home_target" {
+  type        = string
+  description = "Immutable registered target that anchors target roles and tenant twins."
+  validation {
+    condition     = contains(keys(var.targets), var.role_home_target)
+    error_message = "The trust home must remain a registered target."
+  }
 }

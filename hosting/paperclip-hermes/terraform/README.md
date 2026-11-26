@@ -44,7 +44,7 @@ Tailscale 0.30.0 exposes `https_enabled`; this is managed rather than left to a 
 
 Initialize each root with private `-backend-config` files. The backend always enables OIDC and
 Entra data-plane authentication; trust apply uses the operator login with `-backend-config=use_oidc=false`.
-The bootstrap-created vault RG, state account, `tfstate` container and deletion lock are explicitly imported
+The bootstrap-created vault RG, state account, `tfstate` container and `CanNotDelete` lock named `state-cannot-delete` are explicitly imported
 by `stacks/trust/main.tf` using AzAPI, which does not persist account keys.
 The `tfstate` container, soft delete, versioning, Shared Key prohibition and deletion lock are managed.
 No SAS, password or SSH private key is created by these modules.
@@ -69,6 +69,20 @@ those resources using the retained provider alias.
 If an earlier multi-subscription apply created an RG in the wrong subscription, the operator must
 inspect that partial state and its resources before approving the corrective plan.
 
+Set `role_home_target` once to the existing target that anchored the first trust apply (for an
+upgrade, the formerly first lexical target). Its subscription and region anchor the custom roles,
+trust RG and tenant twins. Keep this target registered even after its host is decommissioned.
+A state-persisted `terraform_data.trust_home` with `prevent_destroy` refuses changes to the home key,
+subscription or region; role definitions and the trust RG also prevent destruction. Run plan-guard
+on trust plans to reject replacement/removal of target roles and every twin identity. Home migration
+requires a separate operator-reviewed migration with preserved role/principal IDs.
+
+The plan identity has Reader on the vault, drill and workload RGs, plus Reader on the twin trust RG
+in the target tenant. Its custom authorization-reader roles grant only `Microsoft.Authorization/*/read`
+at the vault and target subscriptions, allowing drift refresh of subscription roles and assignments.
+For cross-tenant plans set `target_client_id` to the plan twin's client ID; the default vault providers
+use the vault plan client. Generated subscription aliases also use `target_client_id`.
+
 The trust root has default vault providers and explicit target aliases. `targets` includes every
 subscription in the configured target tenant, including targets being added. If the target tenant
 differs, target-facing identities are duplicated there and receive only target grants; vault identities
@@ -78,7 +92,18 @@ with an explicit alias per tenant; Terraform cannot select provider aliases dyna
 separate copies of the vault resources to independent states.
 AzureRM's automatic registration is explicitly `none`, and AzAPI's registration is skipped on every
 root/generated alias. The Owner bootstrap must register the required namespaces in each subscription
-before trust/host initialization. Read-only plans and RG-scoped workflow identities cannot perform
+before trust/host initialization: `Microsoft.Compute`, `Microsoft.Network`, `Microsoft.Logic`,
+`Microsoft.Insights`, `Microsoft.Consumption`, `Microsoft.DevTestLab`, `Microsoft.ManagedIdentity`,
+`Microsoft.Storage` and `Microsoft.KeyVault` in each subscription where used.
+Encryption at host is an **operator-registered, validated prerequisite**. In each target subscription,
+the Owner runs `az feature register --namespace Microsoft.Compute --name EncryptionAtHost`, polls
+`az feature show --namespace Microsoft.Compute --name EncryptionAtHost --query properties.state -o tsv`
+until `Registered`, then runs `az provider register -n Microsoft.Compute` and waits for provider
+registration. Before every `ph-deploy` host plan/apply the later deployment workflow must run
+`bash hosting/paperclip-hermes/tools/check-azure-prerequisites.sh "$SUBSCRIPTION_ID"` under its target
+identity, whose `SF Prerequisite Reader` role grants only `Microsoft.Features/providers/features/read`
+and `Microsoft.Resources/subscriptions/providers/read` at each target subscription. The read-only gate validates the target namespaces (Compute, Network, Logic, Insights, Consumption,
+DevTestLab and ManagedIdentity) and feature and fails with an Owner bootstrap instruction. Read-only plans and RG-scoped workflow identities cannot perform
 subscription-level provider registration as a side effect of provider setup.
 
 `rg_managed_by=trust` references the existing workload RG; `host` creates it for subscription scope.
@@ -292,3 +317,18 @@ sources, platform-managed encryption instead of extra disk/storage keys, public 
 for hosted runners, the ADR choice to leave optional diagnostic sinks to adopter infrastructure. None suppresses
 the Shared Key, purge protection, retention, role scope or inbound-network invariants; mock tests check
 those controls against the resolved resources.
+
+## Budget creation and maintenance
+
+Budget start dates use the current apply month's first day via `timestamp()`, with
+`ignore_changes` preserving the existing start on ordinary refresh. Terraform evaluates the
+configured start during apply for a new/replaced budget (including approval across a month boundary), so a later target or recreation needs no stale input.
+There is no `budget_start` input. AzureRM 4.81.0 replaces the subscription budget when switching
+`billing_month_verified` from Monthly to BillingMonth; review that temporary protection gap during
+the Owner's self-test 7 rollout. RG budgets round down to whole pounds (minimum five).
+Monetary alerts allow half a penny of rounding tolerance plus floating-point slack at 80%/85%; the 100% override remains exact.
+
+The deallocator rereads VM tags before stopping. Only a valid future maintenance deadline within
+two hours suppresses the lower thresholds. A farther-future or malformed tag deallocates; a failed
+`ticks()` scope has an explicit failure handler. A separate outer 100% branch bypasses tag parsing.
+All ARM HTTP actions use the managed identity with audience `https://management.azure.com/`.

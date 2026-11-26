@@ -37,7 +37,6 @@ variables {
   alert_application        = { object_id = "00000000-0000-0000-0000-000000000000", identifier_uri = "api://sf-fixture-alerts", monitor_application_id = "00000000-0000-0000-0000-000000000000" }
   headroom                 = 0
   monthly_credit           = 100
-  budget_start             = "2026-11-01T00:00:00Z"
 }
 run "new_host_invariants" {
   command = plan
@@ -143,7 +142,7 @@ run "billing_month_and_override_budget" {
     error_message = "Verified BillingMonth and explicitly overridden pilot cap are preserved."
   }
   assert {
-    condition     = length(output.guardrails.rg_budget.notification) == 4 && length(output.guardrails.subscription_budget.notification) == 4 && strcontains(output.guardrails.logic_app.body.properties.definition.actions.Threshold_and_maintenance.expression, "NotificationThresholdAmount") && strcontains(output.guardrails.logic_app.body.properties.definition.actions.Threshold_and_maintenance.expression, "sf-maintenance-until")
+    condition     = length(output.guardrails.rg_budget.notification) == 4 && length(output.guardrails.subscription_budget.notification) == 4 && strcontains(output.guardrails.logic_app.body.properties.definition.actions.Threshold_and_maintenance.expression, "NotificationThresholdAmount") && strcontains(output.guardrails.logic_app.body.properties.definition.actions.Threshold_and_maintenance.actions.Hard_threshold.else.actions.Parse_maintenance.actions.Maintenance_active.inputs, "sf-maintenance-until")
     error_message = "Both budgets have the exact thresholds and deallocator uses documented budget payload and maintenance guard."
   }
 }

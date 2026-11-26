@@ -73,7 +73,29 @@ def guard(plan, override_replace=False):
             issues.append(f"{addr}: protected resource removed from Terraform ownership")
         # Preservation applies to VMs left behind. An approved delete-only plan has no successor.
         authorized_delete = override_replace and vm and actions == ["delete"] and change.get("after") is None
-        if "delete" in actions and protected and not authorized_delete:
+        state_only_delete = typ == "azapi_update_resource" or typ == "azapi_resource_action" and before.get("when", "apply") != "destroy"
+        changing = actions != ["no-op"]
+        trust_anchor = addr.startswith(('module.trust.azurerm_role_definition.target[', 'module.trust.azurerm_resource_group.target_identities[')) or (addr.startswith('module.trust.module.target_identities[') and typ == 'azurerm_user_assigned_identity')
+        if trust_anchor and any(action in actions for action in ("delete", "forget")):
+            issues.append(f"{addr}: trust home roles/identities must not be replaced or removed")
+        if changing and typ == "azapi_resource_action" and (actions != ["delete"] or before.get("when", "apply") == "destroy"):
+            action_values = after or before
+            method = str(action_values.get("method", "POST")).upper()
+            retention_lock = (addr == "module.trust.azapi_resource_action.lock_container_retention[0]"
+                              and action_values.get("action") == "lock" and method == "POST"
+                              and action_values.get("when", "apply") == "apply"
+                              and kind.endswith("/immutabilitypolicies"))
+            if method == "DELETE" or unknown_at(unknown, "method") or ((protected or vm) and not retention_lock):
+                issues.append(f"{addr}: unapproved mutating ARM action")
+        # Tag-extension PUTs and VM patches bypass top-level VM tag comparisons.
+        vm_reference = any("/providers/microsoft.compute/virtualmachines/" in str(value.get(key, "")).lower()
+                           for value in (before, after) for key in ("parent_id", "resource_id"))
+        if changing and ("microsoft.resources/tags" in kinds or
+                         typ in {"azapi_update_resource", "azapi_resource_action"} and (vm or vm_reference)):
+            # Delete-only state removal of a patch/action does not execute an ARM write.
+            if actions != ["delete"] or not state_only_delete:
+                issues.append(f"{addr}: indirect VM/tag mutation is forbidden")
+        if "delete" in actions and protected and not authorized_delete and not state_only_delete:
             issues.append(f"{addr}: protected resource delete/replace")
         if vm and (after or authorized_delete):
             # A later VM-only delete must never cascade to the separately protected data disk.
@@ -120,6 +142,19 @@ def guard(plan, override_replace=False):
             for key in ("immutableStorageWithVersioning", "allowSharedKeyAccess"):
                 if old_props.get(key) != new_props.get(key) or unknown_at(unknown, "body", "properties", key):
                     issues.append(f"{addr}: storage protection changed: {key}")
+        retention_keys = ()
+        if kind == "microsoft.storage/storageaccounts/blobservices":
+            retention_keys = ("isVersioningEnabled", "deleteRetentionPolicy", "containerDeleteRetentionPolicy", "restorePolicy", "changeFeed")
+        elif kind == "microsoft.storage/storageaccounts/blobservices/containers":
+            retention_keys = ("immutableStorageWithVersioning",)
+        if before and after:
+            for key in retention_keys:
+                old = before.get("body", {}).get("properties", {}).get(key)
+                new = after.get("body", {}).get("properties", {}).get(key)
+                if old != new or unknown_at(unknown, "body", "properties", key):
+                    issues.append(f"{addr}: storage retention changed/unknown: {key}")
+        elif retention_keys and actions != ["delete"] and unknown_at(unknown, "body"):
+            issues.append(f"{addr}: storage retention is unknown")
         if not before and kind == "microsoft.storage/storageaccounts":
             policy = after.get("body", {}).get("properties", {}).get("immutableStorageWithVersioning") or {}
             if policy.get("immutabilityPolicy", {}).get("state") == "Locked":

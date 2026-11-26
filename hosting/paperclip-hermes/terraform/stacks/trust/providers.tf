@@ -9,8 +9,9 @@ provider "azurerm" {
   resource_provider_registrations = "none"
   alias                           = "target"
   features {}
-  subscription_id     = split("/", values(var.targets)[0].subscription_resource_id)[2]
+  subscription_id     = split("/", var.targets[var.role_home_target].subscription_resource_id)[2]
   tenant_id           = var.target_tenant_id
+  client_id           = var.target_client_id
   storage_use_azuread = true
 }
 provider "azapi" {
@@ -21,6 +22,7 @@ provider "azapi" {
 provider "azapi" {
   skip_provider_registration = true
   alias                      = "target"
-  subscription_id            = split("/", values(var.targets)[0].subscription_resource_id)[2]
+  subscription_id            = split("/", var.targets[var.role_home_target].subscription_resource_id)[2]
   tenant_id                  = var.target_tenant_id
+  client_id                  = var.target_client_id
 }

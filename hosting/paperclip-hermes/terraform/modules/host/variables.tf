@@ -113,7 +113,7 @@ resource "terraform_data" "invariants" {
       error_message = "Select paperclip, hermes or both."
     }
     precondition {
-      condition     = can(base64decode(var.bootstrap_custom_data)) && length(regexall("[0-9a-f]{40}|PRIVATE KEY|tskey-|sig=|kit_ref|kit_commit", try(base64decode(var.bootstrap_custom_data), ""))) == 0
+      condition     = can(base64decode(var.bootstrap_custom_data)) && length(regexall("(^|[^0-9a-fA-F])[0-9a-fA-F]{40}([^0-9a-fA-F]|$)|PRIVATE KEY|tskey-|sig=|kit_ref|kit_commit", try(base64decode(var.bootstrap_custom_data), ""))) == 0
       error_message = "Creation-time cloud-init must contain neither secrets nor a release SHA."
     }
   }

@@ -14,7 +14,6 @@ module "guardrails" {
   headroom                 = var.headroom
   override_cost            = var.override_cost
   monthly_credit           = var.monthly_credit
-  budget_start             = var.budget_start
   billing_month_verified   = var.billing_month_verified
   depends_on               = [module.host]
 }

@@ -1,6 +1,7 @@
 
 mock_provider "azurerm" {
   override_during = plan
+  mock_resource "azurerm_key_vault" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.KeyVault/vaults/kv-sffixture", vault_uri = "https://kv-sffixture.vault.azure.net/" } }
   mock_resource "azurerm_resource_group" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault" } }
   mock_resource "azurerm_user_assigned_identity" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-sf-fixture", principal_id = "00000000-0000-0000-0000-000000000000", client_id = "00000000-0000-0000-0000-000000000000", tenant_id = "00000000-0000-0000-0000-000000000000" } }
   mock_resource "azurerm_role_definition" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000", role_definition_id = "00000000-0000-0000-0000-000000000000", role_definition_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000" } }
@@ -26,8 +27,9 @@ mock_provider "random" {}
 mock_provider "azurerm" {
   override_during = plan
   alias           = "target"
+  mock_resource "azurerm_resource_group" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-trust" } }
   mock_resource "azurerm_role_definition" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000", role_definition_id = "00000000-0000-0000-0000-000000000000", role_definition_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000" } }
-  mock_resource "azurerm_user_assigned_identity" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-sf-fixture", principal_id = "00000000-0000-0000-0000-000000000000" } }
+  mock_resource "azurerm_user_assigned_identity" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-trust/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-sf-fixture", principal_id = "00000000-0000-0000-0000-000000000000", client_id = "00000000-0000-0000-0000-000000000000", tenant_id = "00000000-0000-0000-0000-000000000000" } }
 }
 mock_provider "azapi" {
   override_during = plan
@@ -35,6 +37,7 @@ mock_provider "azapi" {
   mock_data "azapi_client_config" { defaults = { subscription_id = "00000000-0000-0000-0000-000000000000" } }
 }
 variables {
+  role_home_target      = "alpha"
   prefix                = "sffixture"
   location              = "uksouth"
   vault_subscription_id = "00000000-0000-0000-0000-000000000000"
@@ -52,8 +55,22 @@ override_resource {
   values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault" }
   override_during = plan
 }
+override_resource {
+  target          = module.trust.azurerm_resource_group.drill
+  values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-drill" }
+  override_during = plan
+}
 run "trust_storage_and_authorization" {
   command = plan
+  assert {
+    condition = (output.authorization.roles.prerequisite_reader.actions == ["Microsoft.Features/providers/features/read", "Microsoft.Resources/subscriptions/providers/read"] &&
+    alltrue([for key, target in var.targets : output.authorization.target.deploy["${target.subscription_resource_id}-SF Prerequisite Reader"].scope == target.subscription_resource_id]))
+    error_message = "Deploy preflight needs only subscription feature/provider reads, never registration writes."
+  }
+  assert {
+    condition     = output.authorization.roles.authorization_reader.actions == ["Microsoft.Authorization/*/read"] && output.authorization.roles.vault_authorization_reader.actions == ["Microsoft.Authorization/*/read"]
+    error_message = "Subscription authorization roles must grant exactly read-only authorization actions."
+  }
   assert {
     condition = alltrue([for account in [output.storage.backups, output.storage.staging, output.storage.state] :
       account.body.sku.name == "Standard_GRS" && account.body.properties.publicNetworkAccess == "Enabled" &&
@@ -269,7 +286,7 @@ run "role_names_include_instance_prefix" {
   command = plan
   variables { prefix = "sfsecond" }
   assert {
-    condition     = length(output.authorization.role_names) == 4 && alltrue([for name in values(output.authorization.role_names) : startswith(name, "sfsecond SF ")])
+    condition     = length(output.authorization.role_names) == 7 && alltrue([for name in values(output.authorization.role_names) : startswith(name, "sfsecond SF ")])
     error_message = "Custom role display names must differ across instance prefixes in the same tenant."
   }
 }
@@ -302,5 +319,32 @@ run "initialized_account_can_transition_to_locked" {
   assert {
     condition     = output.storage.backups.body.properties.immutableStorageWithVersioning.immutabilityPolicy.state == "Locked"
     error_message = "Restoring the intended pilot end must lock the initialized account default."
+  }
+}
+
+run "reject_invalid_prefix" {
+  command = plan
+  variables { prefix = "Invalid-prefix" }
+  expect_failures = [var.prefix]
+}
+run "reject_missing_home" {
+  command = plan
+  variables { role_home_target = "missing" }
+  expect_failures = [var.role_home_target]
+}
+
+run "initialize_twins_for_target_map_change" {
+  command = apply
+  variables { target_tenant_id = "different-mocked-tenant" }
+}
+run "adding_lexically_first_target_preserves_trust_home" {
+  command = plan
+  variables {
+    target_tenant_id = "different-mocked-tenant"
+    targets = {
+      a0    = { subscription_resource_id = "/subscriptions/${uuidv5("dns", "beta.example.test")}", resource_group_name = "rg-new", location = "northeurope" }
+      alpha = { subscription_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000", resource_group_name = "rg-fixture", location = "uksouth" }
+      beta  = { subscription_resource_id = "/subscriptions/${uuidv5("dns", "beta.example.test")}", resource_group_name = "rg-second", location = "uksouth" }
+    }
   }
 }

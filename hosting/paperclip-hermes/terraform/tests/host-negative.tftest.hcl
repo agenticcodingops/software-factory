@@ -38,7 +38,6 @@ variables {
   alert_application        = { object_id = "00000000-0000-0000-0000-000000000000", identifier_uri = "api://sf-fixture-alerts", monitor_application_id = "00000000-0000-0000-0000-000000000000" }
   headroom                 = 0
   monthly_credit           = 100
-  budget_start             = "2026-11-01T00:00:00Z"
 }
 
 run "reject_short_backup_gap" {
@@ -79,5 +78,21 @@ run "reject_maintenance_from_ordinary_tags" {
   command = plan
   module { source = "../../modules/host" }
   variables { tags = { sf-maintenance-until = "2026-11-26T14:00:00Z" } }
+  expect_failures = [terraform_data.invariants]
+}
+
+run "sha256_checksum_in_cloud_init" {
+  command = plan
+  module { source = "../../modules/host" }
+  variables { bootstrap_custom_data = base64encode("#cloud-config\n# sha256:${join("", [for i in range(64) : "a"])}\n") }
+  assert {
+    condition     = output.disk.protection_enabled
+    error_message = "A standalone SHA-256 checksum is valid creation data."
+  }
+}
+run "reject_standalone_release_sha" {
+  command = plan
+  module { source = "../../modules/host" }
+  variables { bootstrap_custom_data = base64encode("#cloud-config\n# commit ${join("", [for i in range(40) : "A"])}\n") }
   expect_failures = [terraform_data.invariants]
 }

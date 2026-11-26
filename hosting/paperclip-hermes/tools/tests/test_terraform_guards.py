@@ -57,6 +57,8 @@ class PolicyTests(unittest.TestCase):
                         "src": ["group:members"], "dst": ["tag:unrelated:443" if section == "acls" else "tag:unrelated"],
                         "ip": ["tcp:443"], "action": "accept", "users": ["admin"],
                     }]}
+                    if section != "ssh":
+                        del p[section][0]["users"]
                     self.assertFalse(policy.findings(p, "operator@example.com"))
                     p[section][0]["dst"] = ["tag:pcpilot:443" if section == "acls" else "tag:pcpilot"]
                     self.assertTrue(policy.findings(p, "operator@example.com"))

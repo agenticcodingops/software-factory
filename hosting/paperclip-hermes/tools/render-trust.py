@@ -23,7 +23,7 @@ def composition(targets):
     for subscription in sorted(subscriptions):
         alias = "subscription_" + subscription.rsplit("/", 1)[1].replace("-", "_")
         name = "workload_rg_" + alias
-        providers.append({"alias": alias, "subscription_id": subscription.rsplit("/", 1)[1], "tenant_id": "${var.target_tenant_id}", "skip_provider_registration": True})
+        providers.append({"alias": alias, "subscription_id": subscription.rsplit("/", 1)[1], "tenant_id": "${var.target_tenant_id}", "skip_provider_registration": True, "client_id": "${var.target_client_id}"})
         modules[name] = {
             "source": "../../modules/workload-rg",
             "providers": {"azapi": "azapi." + alias},

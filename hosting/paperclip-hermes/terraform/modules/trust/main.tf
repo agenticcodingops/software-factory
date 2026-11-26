@@ -15,10 +15,13 @@ locals {
   staging_scope      = "${local.staging_account_id}/blobServices/default/containers/restore-staging"
   state_scope        = "${local.vault_rg_id}/providers/Microsoft.Storage/storageAccounts/${var.state_account_name}/blobServices/default/containers/tfstate"
   roles = {
-    host_operator = { name = "SF Host Operator", actions = ["Microsoft.Compute/virtualMachines/read", "Microsoft.Compute/virtualMachines/start/action", "Microsoft.Compute/virtualMachines/deallocate/action", "Microsoft.Compute/virtualMachines/runCommands/*"], data_actions = [] }
-    deallocator   = { name = "SF VM Deallocator", actions = ["Microsoft.Compute/virtualMachines/read", "Microsoft.Compute/virtualMachines/deallocate/action"], data_actions = [] }
-    backup_writer = { name = "SF Backup Writer", actions = [], data_actions = ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"] }
-    delegation    = { name = "SF Delegation Key", actions = ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"], data_actions = [] }
+    prerequisite_reader        = { name = "SF Prerequisite Reader", actions = ["Microsoft.Features/providers/features/read", "Microsoft.Resources/subscriptions/providers/read"], data_actions = [] }
+    vault_authorization_reader = { name = "SF Vault Authorization Reader", actions = ["Microsoft.Authorization/*/read"], data_actions = [] }
+    authorization_reader       = { name = "SF Authorization Reader", actions = ["Microsoft.Authorization/*/read"], data_actions = [] }
+    host_operator              = { name = "SF Host Operator", actions = ["Microsoft.Compute/virtualMachines/read", "Microsoft.Compute/virtualMachines/start/action", "Microsoft.Compute/virtualMachines/deallocate/action", "Microsoft.Compute/virtualMachines/runCommands/*"], data_actions = [] }
+    deallocator                = { name = "SF VM Deallocator", actions = ["Microsoft.Compute/virtualMachines/read", "Microsoft.Compute/virtualMachines/deallocate/action"], data_actions = [] }
+    backup_writer              = { name = "SF Backup Writer", actions = [], data_actions = ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"] }
+    delegation                 = { name = "SF Delegation Key", actions = ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"], data_actions = [] }
   }
   # Both assign and delete must be constrained, otherwise RBAC Administrator could remove arbitrary grants.
   deallocator_condition = <<-CONDITION
@@ -31,10 +34,10 @@ locals {
   CONDITION
   target_grants = { for identity in keys(local.environments) : identity => merge([
     for key, target in var.targets : {
-      for role in(identity == "plan" ? ["Reader", "Cost Management Reader"] : identity == "deploy" ? ["Contributor", "Cost Management Contributor", "Role Based Access Control Administrator"] : identity == "ops" ? ["SF Host Operator", "Cost Management Reader"] : ["SF Host Operator"]) :
-      (startswith(role, "Cost Management") ? "${target.subscription_resource_id}-${role}" : "${key}-${role}") => {
-        role_definition_id_or_name = role == "SF Host Operator" ? azurerm_role_definition.target["host_operator"].role_definition_resource_id : role
-        scope                      = startswith(role, "Cost Management") ? target.subscription_resource_id : "${target.subscription_resource_id}/resourceGroups/${target.resource_group_name}"
+      for role in(identity == "plan" ? ["Reader", "Cost Management Reader", "SF Authorization Reader"] : identity == "deploy" ? ["Contributor", "Cost Management Contributor", "Role Based Access Control Administrator", "SF Prerequisite Reader"] : identity == "ops" ? ["SF Host Operator", "Cost Management Reader"] : ["SF Host Operator"]) :
+      ((startswith(role, "Cost Management") || contains(["SF Authorization Reader", "SF Prerequisite Reader"], role)) ? "${target.subscription_resource_id}-${role}" : "${key}-${role}") => {
+        role_definition_id_or_name = role == "SF Prerequisite Reader" ? azurerm_role_definition.target["prerequisite_reader"].role_definition_resource_id : role == "SF Authorization Reader" ? azurerm_role_definition.target["authorization_reader"].role_definition_resource_id : role == "SF Host Operator" ? azurerm_role_definition.target["host_operator"].role_definition_resource_id : role
+        scope                      = (startswith(role, "Cost Management") || contains(["SF Authorization Reader", "SF Prerequisite Reader"], role)) ? target.subscription_resource_id : "${target.subscription_resource_id}/resourceGroups/${target.resource_group_name}"
         condition                  = role == "Role Based Access Control Administrator" ? local.deallocator_condition : null
         condition_version          = role == "Role Based Access Control Administrator" ? "2.0" : null
       }
@@ -42,8 +45,10 @@ locals {
   ]...) }
   vault_grants = {
     plan = {
-      vault_read = { role_definition_id_or_name = "Reader", scope = local.vault_rg_id }
-      state_read = { role_definition_id_or_name = "Storage Blob Data Reader", scope = local.state_scope }
+      authorization_read = { role_definition_id_or_name = azurerm_role_definition.vault["vault_authorization_reader"].role_definition_resource_id, scope = "/subscriptions/${var.vault_subscription_id}" }
+      drill_read         = { role_definition_id_or_name = "Reader", scope = azurerm_resource_group.drill.id }
+      vault_read         = { role_definition_id_or_name = "Reader", scope = local.vault_rg_id }
+      state_read         = { role_definition_id_or_name = "Storage Blob Data Reader", scope = local.state_scope }
     }
     deploy = {
       state_write = { role_definition_id_or_name = "Storage Blob Data Contributor", scope = local.state_scope }
@@ -72,17 +77,18 @@ resource "azurerm_resource_group" "drill" {
 }
 resource "azurerm_role_definition" "target" {
   provider          = azurerm.target
-  for_each          = { for k, v in local.roles : k => v if contains(["host_operator", "deallocator"], k) }
+  for_each          = { for k, v in local.roles : k => v if contains(["host_operator", "deallocator", "authorization_reader", "prerequisite_reader"], k) }
   name              = "${var.prefix} ${each.value.name}"
-  scope             = values(var.targets)[0].subscription_resource_id
+  scope             = var.targets[var.role_home_target].subscription_resource_id
   assignable_scopes = distinct([for t in var.targets : t.subscription_resource_id])
+  lifecycle { prevent_destroy = true }
   permissions {
     actions      = each.value.actions
     data_actions = each.value.data_actions
   }
 }
 resource "azurerm_role_definition" "vault" {
-  for_each = { for k, v in local.roles : k => v if contains(["backup_writer", "delegation"], k) }
+  for_each = { for k, v in local.roles : k => v if contains(["backup_writer", "delegation", "vault_authorization_reader"], k) }
   name     = "${var.prefix} ${each.value.name}"
   scope    = "/subscriptions/${var.vault_subscription_id}"
   permissions {
@@ -110,12 +116,14 @@ module "target_identities" {
   version                        = "0.6.0"
   providers                      = { azurerm = azurerm.target, azapi = azapi.target }
   name                           = "id-sf-${each.key}"
-  location                       = values(var.targets)[0].location
+  location                       = var.targets[var.role_home_target].location
   resource_group_name            = azurerm_resource_group.target_identities[0].name
   federated_identity_credentials = local.federations[each.key]
-  outbound_role_assignments      = local.target_grants[each.key]
-  enable_telemetry               = false
-  depends_on                     = [terraform_data.workload_rg_ready]
+  outbound_role_assignments = merge(local.target_grants[each.key], each.key == "plan" ? {
+    trust_read = { role_definition_id_or_name = "Reader", scope = azurerm_resource_group.target_identities[0].id }
+  } : {})
+  enable_telemetry = false
+  depends_on       = [terraform_data.workload_rg_ready]
 }
 resource "azurerm_role_assignment" "operator" {
   for_each = {
@@ -133,7 +141,8 @@ resource "azurerm_resource_group" "target_identities" {
   provider = azurerm.target
   count    = var.vault_tenant_id != var.target_tenant_id ? 1 : 0
   name     = "rg-${var.prefix}-trust"
-  location = values(var.targets)[0].location
+  location = var.targets[var.role_home_target].location
+  lifecycle { prevent_destroy = true }
 }
 
 # Referencing the resolved module outputs also orders RG creation before scoped grants.
@@ -147,4 +156,14 @@ resource "terraform_data" "workload_rg_ready" {
       error_message = "Every workload RG must be created or read through its subscription provider; run render-trust.py and initialize host-owned RGs as Owner before scoped grants."
     }
   }
+}
+
+# Replacement would rotate role GUIDs and twin principal IDs. Refuse home edits in state.
+resource "terraform_data" "trust_home" {
+  triggers_replace = {
+    key          = var.role_home_target
+    subscription = var.targets[var.role_home_target].subscription_resource_id
+    location     = var.targets[var.role_home_target].location
+  }
+  lifecycle { prevent_destroy = true }
 }
