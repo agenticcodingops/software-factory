@@ -49,7 +49,7 @@ This ADR specifies a reusable deployment for adopters whose private repositories
 3. **Privileged resources are applied only with the operator's Owner login, through the reviewed bootstrap script.**
    - `sf-bootstrap.sh` creates the state storage account with `az`. This is the only resource made outside Terraform, because of the chicken-and-egg problem with the backend.
    - It then applies the **`trust` stack** under the operator's own login. That stack is Terraform in the public repo and holds:
-     - identities, federated credentials, custom roles and role assignments;
+     - identities, federated credentials, custom roles and role assignments, including read-only Cost Management Reader for `id-sf-ops` on each target subscription (on its target-tenant twin when tenants differ);
      - the workload resource group (in resource-group scope mode);
      - the backup storage account, with its WORM policy, lifecycle rules and locks;
      - the Key Vault.
@@ -103,6 +103,8 @@ This ADR specifies a reusable deployment for adopters whose private repositories
    - Human secrets never use this path (decision 12).
 
 10. **Upgrades are detected by Renovate and deployed in a fixed order: off-site backup → Terraform apply → kit upgrade with a local rollback point → health check → automatic rollback.**
+    - Existing VMs retain their creation-time bootstrap `custom_data`, with no release SHA. Every later kit SHA reaches the host only through the upgrade protocol.
+    - To create the rollback point, stop application writers (Paperclip, Hermes, sandbox and Caddy), dump the still-running PostgreSQL with `pg_dump`, then stop PostgreSQL before archiving volumes. Skip the database steps when Paperclip is not installed.
     - Rollback restores the local plaintext rollback point (a database dump plus the volumes) after checking out the previous kit commit.
     - Terraform changes cannot be rolled back automatically. Destructive plans are therefore refused before apply (see "Upgrades").
     - Renovate rather than Dependabot, because it can share one preset across instance repos, update tag@digest pins and refresh lock files, and its Terraform support covers versions beyond 1.15 [V].
@@ -141,7 +143,7 @@ This ADR specifies a reusable deployment for adopters whose private repositories
       - an enforced daily run time;
       - a 14-hour uptime cap;
       - budget-driven deallocation;
-      - `ph-cost-guard`, which is authoritative;
+      - `ph-cost-guard`, which is authoritative and queries usage and forecast using `id-sf-ops` with read-only Cost Management Reader on each target subscription;
       - an approval-gated **park** tier for when deallocation is not enough.
 
 14. **App selection.**
@@ -195,7 +197,7 @@ If the vault and the target are in different tenants, the `trust` stack creates 
 |---|---|---|---|---|
 | `id-sf-plan` | `plan` (any branch) | Reader on the workload RG(s); Cost Management Reader | Reader on `rg-sf-vault`; Blob Data Reader on `tfstate` | Reads configuration and state; the only state secret is an expired, single-use join key |
 | `id-sf-deploy` | `production` (approval) | Contributor on the workload RG; Cost Management Contributor on the subscription; RBAC Administrator on the RG with an ABAC condition that allows only assigning `SF VM Deallocator` to service principals | Blob Data Contributor on `tfstate`; Contributor on `rg-sf-drill` | Changes the workload RG, after approval. **No rights on backups, the Key Vault or other identities** |
-| `id-sf-ops` | `ops` | `SF Host Operator` on the workload RG (VM read, start, deallocate, `runCommands/*`; **no** VM write, **no** `tags/write`) | `SF Backup Writer` on the `backups` container (blob add, create, write; no delete); Blob Data Reader on `backups` (ciphertext and metadata, for verification); `SF Delegation Key` on the backup **account** (`generateUserDelegationKey` only) | Root on the VM through run command at `sf-approved-sha`; the previous approved SHA has a time-limited recovery path during handoff; mints a write-only SAS; reads ciphertext, never a key |
+| `id-sf-ops` | `ops` | `SF Host Operator` on the workload RG (VM read, start, deallocate, `runCommands/*`; **no** VM write, **no** `tags/write`); Cost Management Reader on each target subscription (read-only usage and forecast queries) | `SF Backup Writer` on the `backups` container (blob add, create, write; no delete); Blob Data Reader on `backups` (ciphertext and metadata, for verification); `SF Delegation Key` on the backup **account** (`generateUserDelegationKey` only) | Root on the VM through run command at `sf-approved-sha`; the previous approved SHA has a time-limited recovery path during handoff; reads subscription cost data; mints a write-only SAS; reads ciphertext, never a key |
 | `id-sf-restore` | `restore` (approval) | `SF Host Operator` | Blob Data Reader on `backups`; Blob Data Contributor on `restore-staging`; `SF Delegation Key` on the account; Key Vault Secrets User on the age secrets (vault custody only) | Under operator custody, reads ciphertext only. Under vault custody, can decrypt backups after approval plus `accept_runner_exposure` |
 
 A separate verify identity was considered and rejected. It would trust the same `ops` subject, so splitting it adds no isolation, and the data it reads is ciphertext only.
@@ -267,7 +269,7 @@ There is no `kit_ref`. The kit commit on the VM is always the `job_workflow_sha`
 | Need | Stack | Source | Version |
 |---|---|---|---|
 | Workload RG (resource-group scope mode) | trust | `Azure/avm-res-resources-resourcegroup/azurerm` | 0.5.0 |
-| UAMIs, federated credentials, outbound role assignments | trust | `Azure/avm-res-managedidentity-userassignedidentity/azurerm` | 0.6.0 |
+| UAMIs, federated credentials, outbound role assignments, including Cost Management Reader for `id-sf-ops` on each target subscription | trust | `Azure/avm-res-managedidentity-userassignedidentity/azurerm` | 0.6.0 |
 | Custom roles (`SF Host Operator`, `SF VM Deallocator`, `SF Backup Writer`, `SF Delegation Key`) | trust | `azurerm_role_definition` (no AVM module) | — |
 | Backup account: Shared Key off, versioning, version-level WORM, account `immutability_policy` 30 d; containers `backups` and `restore-staging`; `CanNotDelete` lock | trust | `Azure/avm-res-storage-storageaccount/azurerm` | 0.11.0 |
 | Lifecycle rules: `backups/` prefix `baseBlob.delete` and `version.delete` after 45 d; `restore-staging/` after 1 d | trust | the storage module's management policy input, or `azurerm_storage_management_policy` | — |
@@ -290,24 +292,26 @@ There is no `kit_ref`. The kit commit on the VM is always the `job_workflow_sha`
 - **The join key** is `reusable=false`, `ephemeral=false`, `preauthorized=true`, `expiry=3600`, `tags=["tag:pcpilot"]` and `recreate_if_invalid="never"`.
   - A `terraform_data` generation counter, not the VM, triggers its replacement.
   - It is delivered encrypted to the host delivery key through run command, never in `custom_data`.
-- `custom_data` holds only cloud-init that does not depend on secrets. It mounts the disk, installs Docker and a pinned Tailscale, generates the delivery key, and checks out the kit at the release SHA passed in as a variable.
+- `custom_data` is creation-time configuration that cannot change after VM creation. It contains no secrets or release SHA: cloud-init prepares the host (disk mounts, Docker, pinned Tailscale and the delivery key) and installs only a fixed bootstrap agent that fetches the kit when instructed through run command. It never checks out a release during cloud-init. Record the original bootstrap template and inputs per VM in the deployment receipt and reuse them byte-for-byte on later plans, even when a release changes the bootstrap template for new VMs. The initial approved kit SHA is delivered separately through run command; every later kit SHA is delivered exclusively through the upgrade protocol. `plan-guard.py` rejects any change to `custom_data` for an existing VM, including an unknown planned value; `override_replace` cannot bypass this guard. A rebuild creates a new VM through the approved restore/rebuild path.
 - **`terraform test` with mock providers asserts these invariants:**
   - The NSG has no inbound rule with `access = Allow` other than the Azure defaults.
   - The NIC has exactly one public IP, and no load balancer, NAT rule or Bastion exists.
   - `managed_identities` is empty, and `generate_admin_password_or_ssh_key = false`.
   - The plan contains no `tls_private_key` or `random_password` resource.
   - All four current VM protocol tags pass through unchanged; they are absent on a new VM.
+   - An existing VM's `custom_data` stays byte-for-byte unchanged across release/workflow SHA bumps, contains no release SHA, and is independent of the candidate kit SHA; plan-guard tests reject changed or unknown `custom_data` even with `override_replace`.
   - A shutdown schedule exists, set at least 45 minutes after the backup timer.
   - The data disk has `prevent_destroy`.
   - Shared Key is off on the backup and state accounts.
   - Both lifecycle actions exist, with their prefix filters.
   - `id-sf-ops` and `id-sf-restore` hold the delegation role at account scope and their data roles at container scope.
+   - `id-sf-ops` (or its target-tenant twin) holds Cost Management Reader on every target subscription, including a newly added target; it receives no cost-write role.
   - The RG budget is at least £5.
-- **The policy invariant** runs against the instance's real policy, not a mock. `tools/policy-lint.py` runs in `ph-plan` and `ph-deploy` before Terraform. It expands every `grants` and `acls` entry and fails when:
+- **The policy invariant** runs against the instance's real policy, not a mock. `tools/policy-lint.py` runs before Terraform in `ph-plan` and `ph-deploy`. It runs in **enforcing mode** for the hardening PR, all later PRs, nightly drift and every deployment. The sole exception is the read-only baseline-import PR described under "Tailscale": `ph-plan` verifies that it preserves the live policy and settings with no resource diff, then runs the linter in **report-only mode**, listing findings without blocking on them. A label or caller input alone cannot select this exception; policy/settings edits or unrelated deployment changes disqualify it. There is no baseline apply or application of `tag:pcpilot` grants. Enforcing mode must pass before any host joins the tailnet. The linter expands every `grants` and `acls` entry and, in enforcing mode, fails when:
   - any `src` covers `tag:pcpilot` (the literal tag, `*`, `autogroup:tagged`, or a host alias resolving to it);
   - any `dst` covering `tag:pcpilot` has a `src` other than the operator login.
 
-  The tailnet module also renders the `tests` and `sshTests` entries (see "Tailscale").
+  The tailnet module also renders the `tests` and `sshTests` entries in the hardening PR (see "Tailscale"). Linter/workflow acceptance tests preserve an allow-all baseline without blocking, list its findings, reject a modified baseline or an attempt to apply it, fail the same allow-all policy in enforcing mode, and block host joins until hardening passes and is applied.
 
 ## Bootstrap script
 
@@ -319,7 +323,7 @@ There is no `kit_ref`. The kit commit on the VM is always the `job_workflow_sha`
 | `trust --vault-subscription V [--vault-mode separate-subscription\|same-subscription] --target NAME --subscription S --scope resource-group\|subscription --resource-group G --location L [--apply]` | Registers resource providers. Reads `spendingLimit` and enforces the vault-mode rule. Creates the state account and container with `az` if absent: Shared Key off, TLS 1.2, versioning, soft delete, `CanNotDelete` lock. Assigns the signed-in operator **temporary** Blob Data Contributor on `tfstate` and Key Vault Secrets Officer, waits for propagation, then runs `terraform apply` of the `trust` stack under the operator's login (`use_azuread_auth = true`), importing the state account. Removes the temporary assignments. Writes `config/targets/<NAME>.json`. Prints the vCPU headroom (for the VM family and Total Regional) and the cost headroom. Repeated for each new target; `--remove-target` removes one. |
 | `age-key [--custody operator\|vault] [--escrow-cmd "…"] [--rotate]` | Generates the key pair in memory and writes no file. The private key goes to `--escrow-cmd` (a password-manager CLI) through stdin, or is shown once on screen. Under vault custody it is also written to Key Vault with `az keyvault secret set --file /dev/stdin` under secret name `age-<fingerprint>`, never as `--value`; records the returned version URI in the fingerprint map. Sets the public recipient and its fingerprint as instance variables. `--rotate` keeps the old key enabled and readable by the gated restore identity until decision 8's retirement checks pass, and triggers `ph-rotate-age`. |
 | `vault-move --phase state\|backups\|keys [--apply]` | Operator-run data migration under the operator's own login; see "Moving the vault" for temporary data roles, verification and cleanup. The deploy and restore identities never receive destination backup or key-write permissions; `ops` gets only its normal `SF Backup Writer` role on the destination `backups` container from `trust`. |
-| `tailscale --token-stdin` | Reads a short-lived Tailscale API access token from stdin. Adds the two `tagOwners` lines with `POST /acl` and `If-Match` on the current ETag. Creates two federated identities through the API: `plan` (read scopes) and `production` (full scopes). Checks that MagicDNS and HTTPS certificates are on (`GET /tailnet/-/settings`, DNS preferences) and refuses if not. Stores the client IDs and audiences as variables, then revokes the token. |
+| `tailscale --token-stdin` | Reads a short-lived Tailscale API access token from stdin. Creates two federated identities through the API: `plan` (read scopes) and `production` (full scopes); any credential creation requiring the new tag ownership waits for the reviewed hardening PR. Does not edit the live policy, add `tagOwners` or apply `tag:pcpilot` grants during baseline import; those changes belong to the following hardening PR. Checks that MagicDNS and HTTPS certificates are on (`GET /tailnet/-/settings`, DNS preferences) and refuses if not. Stores the client IDs and audiences as variables, then revokes the token. |
 | `tailscale --print-subject` | Prints the subjects, scopes and tags for the console fallback. |
 | `rulesets [--apply]` | Applies the committed `rulesets/*.json` to the public repo, the instance repo and the org (the merge-gate required workflow at a pinned SHA). The operator runs it, because these are GitHub settings changes. |
 | `--revoke` | Deletes the federated credentials and role assignments, through a `trust` destroy limited by `-target`. |
@@ -330,12 +334,13 @@ Bats tests assert:
 
 - the dry-run output and idempotence;
 - subjects read from the API;
-- the role scopes (RG by default; the delegation role at account scope);
+- the role scopes (RG by default; the delegation role at account scope; read-only Cost Management Reader for `id-sf-ops` on each target subscription, including target-tenant twins);
 - the ABAC condition text;
 - that no secret appears in argv or on disk;
 - the self-review rule for one and for two reviewers;
 - refusal on Free, Pro, Team, unknown capability and failed protection-rule readback; Enterprise acceptance only after the reviewer probe waits for approval;
-- the vault-mode refusal on a spending-limited target.
+- the vault-mode refusal on a spending-limited target;
+- no policy/settings writes or tag grants during baseline tailnet import.
 
 ## Workflows
 
@@ -345,27 +350,28 @@ Shared rules:
 - Callers pass no secrets.
 - Each reusable workflow learns its own SHA by requesting an OIDC token (audience `sf-self`) and reading the `job_workflow_sha` claim. It checks out `software-factory` at that SHA and has no ref input.
 - VM-touching operations share `sf-host-<target>` with `cancel-in-progress: false`, `queue: max` and the cancellation monitor in decision 15.
+- Every host plan/apply, including restore and move preparation, preserves the existing VM's original `custom_data` and runs the same plan-guard; changed or unknown `custom_data` is never allowed for an existing VM. Every host join, including restore/move hosts, requires reviewed hardening that passed enforcing policy-lint and was applied.
 - Agents may dispatch `plan`, `power`, `ops`, `cost-guard`, `backup-verify` and the jobs the operator then approves. Agents never approve.
 
 | Name | Trigger | Env | What it does |
 |---|---|---|---|
 | `ci` (public) | PR, push | none | fmt, validate, TFLint, `terraform test`, checkov; the lock-file platform check; kit pytest; shellcheck; bats; actionlint; zizmor; gitleaks; the deny-list; the Renovate config validator; every `uses:` pinned to a SHA; tests for `ref-bump-check.py`, `policy-lint.py` and `plan-guard.py` |
-| `kit-e2e` (public) | PRs touching the kit or pins; weekly | none | Backup and restore e2e on the runner. **Upgrade-rollback e2e** (force a failed health check, assert rollback). **Cross-version restore** (a backup made under the previous release restores through its own kit commit) |
+| `kit-e2e` (public) | PRs touching the kit or pins; weekly | none | Backup and restore e2e on the runner. **Upgrade-rollback e2e** (assert application writers stop before `pg_dump`, PostgreSQL stays running until the dump succeeds, and PostgreSQL stops before volume archives; force a failed health check and assert rollback). **Cross-version restore** (a backup made under the previous release restores through its own kit commit) |
 | `release` (public) | push to `main` | none | release-please tag `vX.Y.Z`; kit tarball with its SHA-256 |
 | `release-notes-gate` (public) | PR by `renovate[bot]` | none | Fetches upstream release bodies between the old and new tags. If one says "breaking", "migration" or "rollback floor", it applies `needs-operator` and fails a required check that agents may not bypass |
 | `sf-merge-gate` (org-required) | instance PRs | `plan` | Decision 11 rules, through `ref-bump-check.py` |
-| `ph-plan` | instance PR on `config/**` or `.github/**`; nightly | `plan` | `policy-lint.py`. Plans `tailnet` and `host` for every active target, and `trust` for drift, all with `-lock=false`, passing through current VM protocol tags unchanged (see Details). Posts a redacted diff, image-pin changes with release notes, a Retail Prices estimate, the headroom and the projected spending-limit date. `plan-guard.py` flags any delete or replace of the VM, a disk, storage or `tailscale_acl`, and any change to the immutability or lifecycle rules; it fails any plan that changes or removes protocol tags. Nightly drift or a pending `trust` diff opens an `ops-alert` |
-| `ph-deploy` | push to `main`; dispatch(`target`,`stacks`,`allow_stale_backup`,`override_replace`,`override_cost`,`finalize_handoff`) | `production` + `ops` (SAS minting only) | See "First deployment" and "Upgrades". Refuses before `not_before`, below the headroom threshold, within 150 minutes of the scheduled shutdown, or when `plan-guard` flags a delete or replace without `override_replace`. A plan that changes or removes protocol tags always fails. After health and port-scan success, publishes approval tags and pushes `sf/ops-ref-<sha>`. The mint-only ops job must `needs:` the approved `production` job of the same run before returning encrypted credentials; production delivers them to the host. `finalize_handoff` verifies merged callers and retires the recovery tags without another upgrade |
+| `ph-plan` | instance PR on `config/**` or `.github/**`; nightly | `plan` | For a verified read-only baseline-import PR only, plans `tailnet` with no resource diff and runs `policy-lint.py` in report-only mode, listing findings without blocking and performing no apply. For the hardening PR, all later PRs and nightly drift, policy-lint is enforcing before Terraform; plans `tailnet` and `host` for every active target, and `trust` for drift, all with `-lock=false`, preserving existing VM `custom_data` and passing through current protocol tags unchanged (see Details). Posts a redacted diff, image-pin changes with release notes, a Retail Prices estimate, the headroom and the projected spending-limit date. `plan-guard.py` flags any delete or replace of the VM, a disk, storage or `tailscale_acl`, and any change to the immutability or lifecycle rules; it fails any plan that changes or removes protocol tags or changes an existing VM's `custom_data` (unknown values also fail). Nightly drift or a pending `trust` diff opens an `ops-alert` |
+| `ph-deploy` | push to `main`; dispatch(`target`,`stacks`,`allow_stale_backup`,`override_replace`,`override_cost`,`finalize_handoff`) | `production` + `ops` (SAS minting only) | See "First deployment" and "Upgrades". Always runs policy-lint in enforcing mode; a baseline-import merge authorizes no apply or host join, and hardening must pass and be applied before joining any host. Refuses before `not_before`, below the headroom threshold, within 150 minutes of the scheduled shutdown, or when `plan-guard` flags a delete or replace without `override_replace`. A plan that changes or removes protocol tags or changes an existing VM's `custom_data` (including an unknown value) always fails, regardless of `override_replace`. Later kit SHAs travel only through the upgrade protocol. After health and port-scan success, publishes approval tags and pushes `sf/ops-ref-<sha>`. The mint-only ops job must `needs:` the approved `production` job of the same run before returning encrypted credentials; production delivers them to the host. `finalize_handoff` verifies merged callers and retires the recovery tags without another upgrade |
 | `ph-power` | dispatch(`start`\|`stop`) | `ops` | Start: start the VM, re-mint the SAS if under 72 h remain, run the catch-up backup **after** the re-mint, run the health check, and schedule a stop at start + `daily_run_hours`. Stop: `backup.sh --reason pre-stop`, then deallocate |
 | `ph-ops` | every 2 h, 07:00–23:00 | `ops` | Applies the shared ops SHA check below, including the bounded previous-SHA recovery path. If the VM is running: SAS re-mint under 72 h with a canary upload, health check, and pre-stop backup then deallocate when past 14 h or the scheduled stop. Dead-man check: the newest backup must be younger than the last VM stop. Interrupted-op recovery from `last-op.json`. Disk over 70 %. Worker-token expiry from the recorded header (alert at T-7 days). `expires` tag (alert at T-3, deallocate at expiry). WORM still Unlocked after the pilot end date. Retries pending decommissions. Maintains `ops-alert` issues and a pinned Status issue |
 | `ph-host-monitor` | `workflow_run` completed; scheduled reconciliation | none | Outside the host concurrency group. Reads Actions run/job metadata, alerts on cancellations and reconciles pending stops under decision 15. Minimal Actions read/write and issues write permissions for inspection, retry dispatch and alerts; no OIDC or VM credentials. Never executes code or artifacts from the observed run |
-| `ph-cost-guard` | daily; dispatch | `ops` | The **authoritative** cost trigger. Queries the Cost Management Query API with a custom time period from the last `billing_period_start_day` to now, plus the forecast to the end of the period. Runs a pre-stop backup and deallocates above the thresholds. Above 95 % of the subscription forecast, opens an `ops-alert` and dispatches `ph-teardown mode=park`, which waits for approval |
+| `ph-cost-guard` | daily; dispatch | `ops` | The **authoritative** cost trigger. Uses `id-sf-ops` (its target-tenant twin when needed) with read-only Cost Management Reader on each target subscription to query subscription-wide usage through the Cost Management Query API from the last `billing_period_start_day` to now, plus the forecast to the end of the period. Runs a pre-stop backup and deallocates above the thresholds. Above 95 % of the subscription forecast, opens an `ops-alert` and dispatches `ph-teardown mode=park`, which waits for approval |
 | `ph-backup-verify` | weekly | `ops` | Metadata and header only: one blob per day the VM ran; the `age` header; size within 20 % of the previous blob; the oldest blob younger than 47 days; metadata keys present (`kit_commit`, digests, `schema`, `recipient_fp`). Never decrypts |
 | `ph-restore` | dispatch(`target`,`blob`,`rebuild`,`unfence`,`accept_runner_exposure`) | `production` (rebuild job only) + `restore` | 1. Read the blob metadata. 2. If `rebuild`, apply the host in restore mode as a `production` job using the deploy identity. 3. On the host: check out `kit-<kit_commit>` into a fresh directory, generate an ephemeral key, and return its recipient. 4. Re-encrypt: under operator custody, poll `restore-staging` for up to 60 minutes while the operator runs the `sf restore-assist` command printed in the summary; under vault custody, re-encrypt on the runner. 5. The host fetches the staged blob with a 1 h read SAS, runs `restore.sh --fenced`, shreds the ephemeral key, and runs the health check with messaging off. 6. Optionally `upgrade.sh` to `sf-approved-sha` |
 | `ph-move` | dispatch(`from_target`,`to_target`,`phase`,`drill`,`drill_target`) | `production` + `restore` | See "Moving subscriptions" |
 | `ph-vault-move` | dispatch(`phase=switch\|verify`,`drill`) | `production` + `restore` + `ops` (SAS minting only) | Switches and verifies only after validating the operator's migration receipt. The mint-only `ops` job must `needs:` the approved `production` job of the same run, so it starts only after the operator has approved that SHA; a mint job that could start before that approval is a release-blocking defect. State, backup and key copies run in `sf-bootstrap.sh vault-move`, never under these workflow identities. See "Moving the vault" |
 | `ph-teardown` | dispatch(`target`,`confirm=<rg>`,`mode=destroy\|park`) | `production` | Final backup, then: `park` deletes the VM, OS disk and public IP and keeps the data disk; `destroy` also deletes the tailnet device and any outstanding keys, then destroys the host stack. Backups are kept |
-| `ph-tailnet-import` | dispatch, once | `plan` | Reads the live policy and tailnet settings. Pushes the branch `sf/tailnet-import` with `policy.hujson`, `import {}` blocks for `tailscale_acl` and `tailscale_tailnet_settings`, and attributes copied from the imported values. Runs the plan itself and posts it to the job summary. An agent (the machine user) opens the PR, so `ph-plan` and the gate run on it |
+| `ph-tailnet-import` | dispatch, once | `plan` | Reads the live policy and tailnet settings. Pushes the read-only baseline branch `sf/tailnet-import` with `policy.hujson`, `import {}` blocks for `tailscale_acl` and `tailscale_tailnet_settings`, and attributes copied from the live values. Requires no resource diff, preserving existing allow-all rules. Runs policy-lint in report-only mode, lists all findings without blocking, and posts the plan to the job summary. Performs no apply, adds no `tag:pcpilot` grants and joins no host. An agent (the machine user) opens the PR, so `ph-plan` and the gate run on it; a following operator-reviewed hardening PR must pass enforcing policy-lint before apply and any host join |
 | `ph-rotate-age` | dispatch after `sf-bootstrap.sh age-key --rotate` | `production` | Delivers the new recipient to `backup.env` through the envelope path, runs a canary backup, and records the fingerprint |
 | `ph-selftest` | dispatch | `production` | Runs the gating tests listed below |
 
@@ -393,12 +399,12 @@ The kit-control tests in "Context" and the deployment/recovery acceptance cases 
 
 `trust` creates the workload RG in resource-group scope mode (the host stack creates it in subscription scope), never the VM. `ph-deploy` selects initial installation only for a fresh named target with a bootstrap receipt, no completed installation record and no existing application data. VM absence or a missing backup alone never selects this branch: a retained disk, prior installation receipt or ambiguous state requires approved restore/recovery.
 
-1. Run the same policy, plan, cost and shutdown guards as an upgrade. Apply tailnet then host under `production`, with cloud-init in `--prepare-only` mode: create the VM, mount a fresh data disk, install the pinned kit and generate the delivery key. Keep services and the backup timer off. There is no pre-upgrade backup or local rollback requirement because no previous installation exists.
+1. Require the read-only baseline import and the following operator-reviewed hardening PR; run policy-lint in enforcing mode and apply the hardened tailnet before any host join. Run the same plan, cost and shutdown guards as an upgrade. Apply the host under `production`: create the VM with stable cloud-init that prepares the host and delivery key and installs the fixed bootstrap agent, without a release SHA or kit checkout in `custom_data`. Keep services and the backup timer off. There is no pre-upgrade backup or local rollback requirement because no previous installation exists.
 2. Wait for cloud-init and run-command readiness. Inspect the disk and initialization journal before initializing anything. Persist the initial-install run ID and phase on the host and in the deployment receipt. A retry resumes those phases without reformatting or overwriting existing data; disagreement between records stops for recovery.
-3. Read and pin the delivery recipient. Mint the SAS in the mint-only `ops` job, which must `needs:` the approved `production` job of the same run under the shared SHA check, then deliver it and the tailnet join key as ciphertext using the approved production identity. Join the tailnet and run the canary. Only then initialize and start the selected apps.
+3. Read and pin the delivery recipient. Deliver the initial approved `job_workflow_sha` through run command to the bootstrap agent, which fetches that kit in `--prepare-only` mode. Mint the SAS in the mint-only `ops` job, which must `needs:` the approved `production` job of the same run under the shared SHA check, then deliver it and the tailnet join key as ciphertext using the approved production identity. Verify that hardened policy is applied, join the tailnet and run the canary. Only then initialize and start the selected apps.
 4. Run health, the public-port scan and the first encrypted off-site backup. Publish `sf-approved-sha` only after all succeed, record installation completion and enable normal schedules. Push the ops-caller bump. A failure leaves an incomplete install with its data preserved, services stopped and an alert; rerun the approved deployment to resume. No ops run command is allowed before the first approval tag exists.
 
-Acceptance (Open): from an empty RG and no backups, deployment reaches a healthy installation and a restorable first backup. Interrupt after VM creation and after initialization; both retries preserve data and resume. A missing VM with a retained application disk must choose restore/recovery and never initial installation.
+Acceptance (Open): from an empty RG and no backups, deployment reaches a healthy installation and a restorable first backup. Verify cloud-init contains no release SHA and the agent receives the initial kit SHA through run command. An allow-all baseline passes report-only planning with findings but cannot apply or join a host; hardening must pass enforcing lint and be applied first. Interrupt after VM creation and after initialization; both retries preserve data and resume. A missing VM with a retained application disk must choose restore/recovery and never initial installation.
 
 ## Upgrades
 
@@ -422,15 +428,15 @@ Acceptance (Open): from an empty RG and no backups, deployment reaches a healthy
    - **AVM 0.x minor bumps**, which the preset treats as major;
    - Paperclip and Hermes version PRs that the notes gate flags.
 5. **Instance merges.** Renovate bumps the production-plane `@sha # vX.Y.Z`. The merge gate passes, an agent merges (subject to operator decision (e)), and `ph-deploy` waits for one operator approval. Then:
-   1. **Guards.** Refuse within 150 minutes of the scheduled shutdown. Refuse when `plan-guard` flags a delete or replace and `override_replace` is not set. Always refuse a plan that changes or removes protocol tags. Refuse below the headroom threshold or before `not_before`.
+   1. **Guards.** Run policy-lint in enforcing mode. Refuse within 150 minutes of the scheduled shutdown. Refuse when `plan-guard` flags a delete or replace and `override_replace` is not set. Always refuse a plan that changes or removes protocol tags or changes an existing VM's `custom_data` (unknown values also fail), regardless of `override_replace`. Refuse below the headroom threshold or before `not_before`.
    2. **Prepare.** Start the VM if it is deallocated and remember its previous power state. Set `sf-maintenance-until` = now + 2 h.
    3. **Re-mint.** A mint-only job in the `ops` environment re-mints the SAS and encrypts it to the pinned delivery recipient; the production job delivers it. It must `needs:` the approved `production` job of the same run, so it starts only after the operator has approved that SHA; a mint job that could start before that approval is a release-blocking defect. The mint job does not acquire the host concurrency group or run host commands.
    4. **Off-site backup.** `backup.sh --reason pre-upgrade`. If it fails, the run stops before changing anything, unless `allow_stale_backup` was passed (approval only). That input accepts an off-site blob younger than 24 hours, skips the health requirement for an unhealthy stack, and still takes the local rollback point.
-   5. **Terraform apply,** tailnet then host. Read the current VM protocol tags with `az` before planning and pass them to the host stack unchanged (see Details); the candidate is not yet approved for unattended ops. If the apply fails: raise an alert, leave the kit untouched, restore the power state and stop. The documented recovery is re-running an approved `ph-deploy` at the previous release. The existing ops callers still pass the SHA check.
+   5. **Terraform apply,** tailnet then host. Preserve the existing VM's original bootstrap `custom_data`; no candidate kit SHA is passed into it. Read the current VM protocol tags with `az` before planning and pass them to the host stack unchanged (see Details); the candidate is not yet approved for unattended ops. If the apply fails: raise an alert, leave the kit untouched, restore the power state and stop. The documented recovery is re-running an approved `ph-deploy` at the previous release. The existing ops callers still pass the SHA check.
    6. **Kit upgrade** (`upgrade.sh` on the host, under `op.lock`):
       1. Check free space against the volumes plus the dump estimate. It must be at least 2× that, plus 10 %; otherwise refuse.
-      2. Stop the stack and create the rollback point under `/data/rollback/<run>` (root, 0700): `pg_dump`, volume archives, the previous kit SHA and the digests.
-      3. Check out the new kit SHA (`job_workflow_sha`), pull by digest, and run `compose up --wait`.
+      2. Create the rollback point under `/data/rollback/<run>` (root, 0700) in this order: stop the application writers (Paperclip, Hermes, sandbox and Caddy, as installed); leave PostgreSQL running and take `pg_dump`; only after the dump succeeds, stop PostgreSQL; then archive the stopped services' volumes and record the previous kit SHA and digests. For Hermes-only installs, skip the absent PostgreSQL/dump steps. A dump failure aborts before PostgreSQL shutdown, volume archiving or candidate installation; preserve the previous kit and report the failure.
+      3. Receive the new kit SHA (`job_workflow_sha`) exclusively through the upgrade command over run command, check it out, pull by digest, and run `compose up --wait`; `custom_data` remains unchanged.
       4. Run `health.sh`. It prints one JSON line of at most 4 KB covering compose health, Paperclip `/api/health` through Caddy, Caddy→Hermes returning 401 with TLS verified, the IMDS and WireServer DROP counters, the migration journal and Tailscale Serve.
       5. On failure: **check out the previous kit SHA first**, restore the rollback point, then run the health check again. If that also fails, the stack stays stopped and an `ops-alert` names the off-site blob for an approved `ph-restore`.
    7. **Finish and handoff.** Run the port scan. On success, write a durable `healthy-awaiting-handoff` journal entry, then publish the previous SHA and a maximum 24 h expiry in the recovery tags **before** advancing `sf-approved-sha` to the new workflow SHA. Read back the tags and push `sf/ops-ref-<sha>`. Tag writes and branch creation are idempotent; a retry preserves the original recovery deadline. Clear the maintenance tag and restore the previous power state. A failed health check or rollback never advances approval.
@@ -443,7 +449,7 @@ After publication, old callers use only the shared recovery command set while th
 
 `ph-ops` alerts when handoff is pending for an hour and before its deadline. After the ops-caller PR merges and a run at the new SHA passes health, an approved `ph-deploy finalize_handoff=true` verifies those facts, marks the journal complete and removes the recovery tags. Ops never writes tags. Expiry closes the previous-SHA exception; if handoff is still incomplete, raise an urgent alert and require an approved deployment to resume it. There is no indefinite recovery authorization.
 
-Acceptance (Open): interrupt after host apply, during upgrade, between recovery-tag and approved-tag writes, and after approved-tag publication but before branch creation. In each case the previous caller can inspect the journal and renew credentials; interrupted upgrades roll back, healthy upgrades resume handoff. Force a failed health check and assert the approved SHA stays unchanged. Verify recovery expiry, successful finalization, and rejection of new-install/unfence commands on the previous-SHA path. Until these pass, upgrades remain operator-run with an approved restore available.
+Acceptance (Open): bump the workflow/kit SHA and assert the existing VM's `custom_data` is unchanged and the new SHA is delivered only through the upgrade command; deliberately change `custom_data` or make it unknown and assert plan-guard rejects it even with `override_replace`. Assert application writers stop before `pg_dump`, PostgreSQL remains running until the dump succeeds and stops before archives begin; inject a dump failure and prove no archive or candidate install occurs. Cover both Paperclip and Hermes-only profiles. Interrupt after host apply, during upgrade, between recovery-tag and approved-tag writes, and after approved-tag publication but before branch creation. In each case the previous caller can inspect the journal and renew credentials; interrupted upgrades roll back, healthy upgrades resume handoff. Force a failed health check and assert the approved SHA stays unchanged. Verify recovery expiry, successful finalization, and rejection of new-install/unfence commands on the previous-SHA path. Until these pass, upgrades remain operator-run with an approved restore available.
 
 ## Backups and key custody
 
@@ -474,7 +480,7 @@ Acceptance (Open): interrupt after host apply, during upgrade, between recovery-
 
 Targets are named, so a move addresses two targets: `config/targets/<name>.json` gives each target its subscription, tenant, client IDs, RG, location, size and status. `ph-ops` and `ph-cost-guard` iterate over every target whose status is not `decommissioned`.
 
-1. The operator runs `sf-bootstrap.sh trust --target <new> --subscription <new> … --apply`.
+1. The operator runs `sf-bootstrap.sh trust --target <new> --subscription <new> … --apply`, including read-only Cost Management Reader for `id-sf-ops` on the new target subscription (its target-tenant twin when needed). Verify usage and forecast access before preparing the host.
 2. **`phase=prepare`** applies the host stack for `to_target` under the state key `<instance>/<to_target>/host.tfstate`, with `restore_mode=true` and the backup timer off. The new host joins the tailnet with a fresh key as `<hostname>-next`.
 3. **`phase=fence`** runs a final backup on the old host, deallocates it, removes its schedules and sets status `fenced`. If the old subscription is disabled or gone, this phase is skipped, `fence_skipped=true` is recorded, and the latest nightly backup is used.
 4. **`phase=restore`** (approval) runs `ph-restore` of that exact blob, under the backup's own kit commit, with the **final** configured hostname baked into the configuration. Messaging stays off.
@@ -522,8 +528,8 @@ Acceptance (Open): copies succeed with exactly the temporary roles above in each
   - Every job that touches Tailscale runs in `plan` (read) or `production` (write). That includes `ph-move cutover`, which deletes a device in its `production` job.
   - Fallback: an OAuth client ID and secret as `production` environment secrets.
 - **Ownership of the policy file and settings.**
-  1. The `ph-tailnet-import` PR carries the live policy and settings with their `import {}` blocks. The plan must show **no diff** for both, which avoids resetting unrelated tailnet-wide settings.
-  2. A second PR, reviewed by the operator under CODEOWNERS:
+  1. The `ph-tailnet-import` PR is a **read-only baseline import** carrying the live policy and settings with their `import {}` blocks. The plan must show **no resource diff** for both, preserving even existing allow-all rules. Policy-lint runs in **report-only mode**, listing findings without blocking on them. Neither this workflow nor a merge of the baseline PR applies Terraform, edits the policy/settings, applies `tag:pcpilot` grants or joins a host. `ph-plan` verifies this narrow baseline exception against the live values; any hardening or unrelated deployment delta requires enforcing mode.
+  2. A second hardening PR, reviewed by the operator under CODEOWNERS:
      - adds the `tagOwners`;
      - adds a grant from the operator's login to `tag:pcpilot`;
      - **removes or narrows every existing grant or ACL whose `src` or `dst` is `*`, `autogroup:member` or `autogroup:tagged` in a way that covers `tag:pcpilot`**;
@@ -532,10 +538,10 @@ Acceptance (Open): copies succeed with exactly the temporary roles above in each
      - adds `tests`: the operator is accepted to `tag:pcpilot:22,443,9443`; `tag:pcpilot` is **denied** to a sample of every other tag, user and host:port in the file; a second user or an `autogroup:member` stand-in is denied to `tag:pcpilot`;
      - adds `sshTests` for the check rule.
 
-     `policy-lint.py` enforces the same rules on every plan.
-  3. `tailscale_tailnet_settings.acls_externally_managed_on = true` locks the console editor, and `reset_acl_on_destroy = false`.
+     `policy-lint.py` must pass in **enforcing mode** on this PR before apply. Its approved apply imports the resources into state and applies the reviewed hardening; no host may join until that hardened policy is applied. Every later PR, nightly drift and deployment uses enforcing mode; the report-only exception never applies to deployment or host joins.
+  3. In the hardening PR, set `tailscale_tailnet_settings.acls_externally_managed_on = true` to lock the console editor and `reset_acl_on_destroy = false`; the baseline copies the live settings unchanged.
   4. MagicDNS is managed by `tailscale_dns_preferences`. HTTPS certificates are managed by the settings resource if provider 0.30.0 exposes them; otherwise the bootstrap and `ph-deploy` verify them as a precondition.
-- **Break-glass** (`docs/break-glass.md`): turn off "externally managed" in the console, edit, then re-run `ph-tailnet-import`.
+- **Break-glass** (`docs/break-glass.md`): turn off "externally managed" in the console, edit, then re-run `ph-tailnet-import` as a read-only no-diff baseline followed by an operator-reviewed hardening PR with enforcing lint; block new host joins until hardening is applied again.
 - **Revocation.** Teardown deletes outstanding keys, because revoking a credential does not revoke them [V].
 
 ## Secrets and the manual sign-ins
@@ -581,12 +587,14 @@ These are UK retail estimates for `Standard_B4as_v2`: about £0.142 an hour, plu
 - **Subscription budget** = the credit:
   - e-mail at 70 % actual; deallocate *only the pilot VM* at 85 % actual; e-mail at 100 % forecast;
   - `time_grain = BillingMonth` if self-test 7 passes; otherwise `Monthly`, with the budget used for e-mail only.
-- `ph-cost-guard` is the authoritative trigger, on the real billing period. Its thresholds are lowered by 4 days × the daily run rate to cover data lag.
+- `ph-cost-guard` is the authoritative trigger, on the real billing period. The operator-applied `trust` stack grants `id-sf-ops` read-only Cost Management Reader on each target subscription so usage and forecast queries run at their queried scope. Its thresholds are lowered by 4 days × the daily run rate to cover data lag.
 - Above 95 % of the forecast, the approval-gated park tier runs.
 - `ph-plan` and `ph-deploy` print the projected date on which the subscription hits its spending limit.
 - Code never changes the spending limit.
 
 **On a subscription whose other resources already forecast the whole credit, the headroom is about zero, so deploy refuses.** The operator must cut other spend, set `override_cost` knowingly, or pick another target. Even with deallocation, the deallocated floor still accrues, which is why the park tier exists.
+
+Acceptance (Open): authenticate as `id-sf-ops` (or the target-tenant twin) and successfully query subscription-wide usage and forecast for every target, including a newly added target; assert cost writes are denied. An authorization failure raises an `ops-alert` and leaves cost evaluation failed, never a successful below-threshold result. This access check gates deployment to that target.
 
 ## Required kit implementation
 
@@ -596,12 +604,13 @@ These are proposed files and changes, not files present in this revision. WP2 im
    - The validator accepts only a user-delegation SAS: `skoid`, `sktid`, `ske` at most 7 days ahead, `sp` in {`c`,`cw`}, `sr=c`, no `si`. Reject stored-policy, service and account SAS forms; test rejection with Shared Key disabled.
    - Writes the blob metadata listed under "Backups and key custody".
    - Adds `rollback-point create|restore`, `--canary`, `--reason`, the status files, `--verify-only`, and restore from a re-encrypted staged blob with an identity file in `/run`.
+   - `rollback-point create` stops the installed application writers (Paperclip, Hermes, sandbox and Caddy), dumps the still-running PostgreSQL with `pg_dump`, then stops PostgreSQL before archiving volumes. Hermes-only skips the absent database. A failed dump prevents archives and candidate installation.
    - Restore runs under the backup's own kit commit, so the byte-for-byte kit check and the image-pin check pass.
 2. **New scripts:**
    - `upgrade.sh`, including the free-space check and `op.lock`;
    - `health.sh`, which prints JSON;
    - `sfctl`, with the commands `status`, `secret set`, `claim-url`, `set-backup-credential`, `delivery-recipient`, `restore-key-ephemeral`, `set-hostname`, `messaging on|off`, `upgrade` and `rollback`;
-   - `join-tailnet.sh`, which decrypts the key, runs `--ssh --advertise-tags=tag:pcpilot` and configures Serve.
+   - `join-tailnet.sh`, which requires evidence that the reviewed hardening passed enforcing policy-lint and was applied before it decrypts the key, runs `--ssh --advertise-tags=tag:pcpilot` and configures Serve; a report-only baseline never authorizes a join.
 3. **`bootstrap.sh`:**
    - `--non-interactive` and `--prepare-only`;
    - generates missing random values on the host;
@@ -637,8 +646,8 @@ Each item is allowed by R11 or reserved to the operator by R12 and the operator'
    - creating federated identities through the API with an access token;
    - the read-only scopes and the settings scope.
 
-   Self-tests 4–6 cover them, and the console path (`--print-subject`) is the fallback.
-5. **Budgets.** Whether forecast alerts drive action groups, and whether `BillingMonth` works for this offer, are unverified. `ph-cost-guard` is authoritative regardless.
+   Self-tests 4–6 cover them, and the console path (`--print-subject`) is the fallback. An imported baseline may retain allow-all rules only during the read-only report-only phase; enforcing hardening and its approved apply are mandatory before any host joins. Baseline/hardening acceptance tests gate that transition.
+5. **Budgets.** Whether forecast alerts drive action groups, and whether `BillingMonth` works for this offer, are unverified. `ph-cost-guard` is authoritative regardless, with read-only Cost Management Reader for `id-sf-ops` on every queried target subscription; successful usage/forecast queries gate deployment, and authorization failures alert rather than report a safe cost result.
 6. **`ops` has unattended root through run command** at `sf-approved-sha`, plus the bounded previous-SHA recovery exception during handoff. The shared SHA check, merge gate and Renovate exclusion of the ops callers enforce this protocol. Flexible federated credentials that bind `job_workflow_ref` stay off until that preview reaches GA.
 7. **Vault custody** puts the long-term key in runner memory during a restore. It is opt-in and gated twice.
 8. **Paperclip image provenance** and tag immutability are unconfirmed. The mitigations are digest pins and `minimumReleaseAge`.
@@ -646,6 +655,6 @@ Each item is allowed by R11 or reserved to the operator by R12 and the operator'
 10. **Open versions.** The exact patches of `azapi` and `azurerm`, and whether an AVM disk module is Available, are fixed at implementation time.
 11. **Org required-workflow capability** is checked separately within the supported Enterprise setup. If unavailable, `init` requires operator merges; required deployment reviewers remain mandatory.
 12. **The `trust` stack is applied only by the operator**, so AVM bumps in it are not automated. That is deliberate.
-13. **Implementation is absent.** The six kit controls, initial-install path, recovery handoff and vault migration remain Open until the acceptance evidence specified above exists. This ADR alone supplies no operational protection.
+13. **Implementation is absent.** The six kit controls, initial-install path, recovery handoff and vault migration remain Open until the acceptance evidence specified above exists. Stable creation-time `custom_data` and the writer-stop → live PostgreSQL dump → PostgreSQL-stop → volume-archive sequence are mandatory upgrade gates, covered by plan-guard and upgrade-rollback tests. This ADR alone supplies no operational protection.
 
 ---
