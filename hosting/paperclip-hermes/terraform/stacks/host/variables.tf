@@ -36,7 +36,7 @@ variable "bootstrap_custom_data" {
 
 variable "protocol_tags" {
   type        = map(string)
-  description = "Current protocol tags read from ARM; absent on a new VM."
+  description = "Current protocol tags and sf-maintenance-until read from ARM; absent on a new VM."
   default     = {}
 }
 

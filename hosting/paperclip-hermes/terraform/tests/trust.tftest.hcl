@@ -3,15 +3,16 @@ mock_provider "azurerm" {
   override_during = plan
   mock_resource "azurerm_resource_group" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault" } }
   mock_resource "azurerm_user_assigned_identity" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-sf-fixture", principal_id = "00000000-0000-0000-0000-000000000000", client_id = "00000000-0000-0000-0000-000000000000", tenant_id = "00000000-0000-0000-0000-000000000000" } }
-  mock_resource "azurerm_role_definition" { defaults = { role_definition_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000" } }
+  mock_resource "azurerm_role_definition" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000", role_definition_id = "00000000-0000-0000-0000-000000000000", role_definition_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000" } }
   mock_data "azurerm_role_definition" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000", role_definition_id = "00000000-0000-0000-0000-000000000000" } }
 }
 mock_provider "azapi" {
   override_during = plan
   mock_resource "azapi_resource" {
     defaults = {
-      id     = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture"
-      output = { properties = { vmId = "00000000-0000-0000-0000-000000000000", storageProfile = { osDisk = { managedDisk = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.Compute/disks/os" } } } }, identity = { principalId = "00000000-0000-0000-0000-000000000000", tenantId = "00000000-0000-0000-0000-000000000000" } }
+      location = "uksouth"
+      id       = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture"
+      output   = { properties = { vmId = "00000000-0000-0000-0000-000000000000", storageProfile = { osDisk = { managedDisk = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.Compute/disks/os" } } } }, identity = { principalId = "00000000-0000-0000-0000-000000000000", tenantId = "00000000-0000-0000-0000-000000000000" } }
     }
   }
 }
@@ -25,7 +26,7 @@ mock_provider "random" {}
 mock_provider "azurerm" {
   override_during = plan
   alias           = "target"
-  mock_resource "azurerm_role_definition" { defaults = { role_definition_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000" } }
+  mock_resource "azurerm_role_definition" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000", role_definition_id = "00000000-0000-0000-0000-000000000000", role_definition_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000" } }
   mock_resource "azurerm_user_assigned_identity" { defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-sf-fixture", principal_id = "00000000-0000-0000-0000-000000000000" } }
 }
 mock_provider "azapi" {
@@ -46,8 +47,21 @@ variables {
   pilot_end_date        = "2000-01-01T00:00:00Z"
   targets               = { alpha = { subscription_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000", resource_group_name = "rg-fixture", location = "uksouth" }, beta = { subscription_resource_id = "/subscriptions/${uuidv5("dns", "beta.example.test")}", resource_group_name = "rg-second", location = "uksouth" } }
 }
+override_resource {
+  target          = module.trust.azurerm_resource_group.vault
+  values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault" }
+  override_during = plan
+}
 run "trust_storage_and_authorization" {
   command = plan
+  assert {
+    condition = alltrue([for account in [output.storage.backups, output.storage.staging, output.storage.state] :
+      account.body.sku.name == "Standard_GRS" && account.body.properties.publicNetworkAccess == "Enabled" &&
+      account.body.properties.networkAcls.defaultAction == "Allow" && !account.body.properties.allowSharedKeyAccess &&
+      account.body.properties.defaultToOAuthAuthentication && !account.body.properties.allowBlobPublicAccess
+    ])
+    error_message = "Every storage account must be geo-redundant and publicly reachable with Entra-only authorization."
+  }
   assert {
     condition     = length(output.storage.container_retention) == 0 && length(output.storage.container_retention_locks) == 0
     error_message = "A successful inheritance self-test needs no fallback policy or lock action."
@@ -175,7 +189,7 @@ override_resource {
 }
 override_resource {
   target          = module.trust.module.backups.module.containers["backups"].azapi_resource.this
-  values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups/blobServices/default/containers/backups" }
+  values          = { location = "uksouth", id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups/blobServices/default/containers/backups" }
   override_during = plan
 }
 
@@ -249,4 +263,44 @@ override_resource {
   target          = module.trust.module.staging.azapi_resource.this
   values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturestaging" }
   override_during = plan
+}
+
+run "role_names_include_instance_prefix" {
+  command = plan
+  variables { prefix = "sfsecond" }
+  assert {
+    condition     = length(output.authorization.role_names) == 4 && alltrue([for name in values(output.authorization.role_names) : startswith(name, "sfsecond SF ")])
+    error_message = "Custom role display names must differ across instance prefixes in the same tenant."
+  }
+}
+run "host_owned_rg_is_read_before_grants" {
+  command = plan
+  variables {
+    targets = { alpha = { subscription_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000", resource_group_name = "rg-fixture", location = "uksouth", rg_managed_by = "host" } }
+  }
+  override_data {
+    target = module.workload_rg_subscription_00000000_0000_0000_0000_000000000000.data.azapi_resource.host_owned["alpha"]
+    values = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture" }
+  }
+  assert {
+    condition     = length(output.workload_resource_groups) == 0 && output.authorization.target.deploy["alpha-Contributor"].scope == "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture"
+    error_message = "A host-owned RG is read, never created in trust, before establishing RG-only permissions."
+  }
+}
+
+# Exercise the documented new-account-after-pilot sequence with uploads held paused.
+run "initialize_account_policy_unlocked" {
+  command = apply
+  variables { pilot_end_date = "9999-01-01T00:00:00Z" }
+  assert {
+    condition     = output.storage.backups.body.properties.immutableStorageWithVersioning.immutabilityPolicy.state == "Unlocked"
+    error_message = "A new account must first create its default policy as Unlocked."
+  }
+}
+run "initialized_account_can_transition_to_locked" {
+  command = plan
+  assert {
+    condition     = output.storage.backups.body.properties.immutableStorageWithVersioning.immutabilityPolicy.state == "Locked"
+    error_message = "Restoring the intended pilot end must lock the initialized account default."
+  }
 }

@@ -34,7 +34,7 @@ def evaluate(expression, payload, tags):
         "coalesce": lambda *args: next((arg for arg in args if arg is not None), None),
         "ticks": ticks, "utcNow": lambda: "2026-11-26T12:00:00Z",
         "triggerBody": lambda: payload,
-        "body": lambda name: {"tags": tags} if name == "Read_VM" else None,
+        "body": lambda name: {"tags": tags} if name in {"Read_VM", "Recheck_VM"} else None,
     }
 
     def value():

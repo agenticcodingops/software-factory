@@ -17,7 +17,11 @@ module "trust" {
   container_retention_fallback = var.container_retention_fallback
 }
 
-# Bootstrap's sole out-of-Terraform resource is adopted before its first trust apply.
+# Adopt the bootstrap state account and its parent RG, container and lock.
+import {
+  to = module.trust.azurerm_resource_group.vault
+  id = "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault"
+}
 import {
   to = module.trust.module.state.azapi_resource.this
   id = "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault/providers/Microsoft.Storage/storageAccounts/${var.state_account_name}"

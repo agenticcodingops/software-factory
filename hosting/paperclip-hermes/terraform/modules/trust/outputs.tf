@@ -12,7 +12,7 @@ output "deallocator_role_id" {
 }
 output "authorization" {
   description = "Resolved least-privilege grants and exact subjects, used by acceptance tests."
-  value       = { target = local.target_grants, vault = local.vault_grants, federations = local.federations, roles = local.roles, condition = local.deallocator_condition, twins = keys(module.target_identities) }
+  value       = { target = local.target_grants, vault = local.vault_grants, federations = local.federations, roles = local.roles, role_names = merge({ for k, v in azurerm_role_definition.target : k => v.name }, { for k, v in azurerm_role_definition.vault : k => v.name }), condition = local.deallocator_condition, twins = keys(module.target_identities) }
 }
 output "storage" {
   description = "Actual storage inputs and state settings for mocked invariant checks."

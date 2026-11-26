@@ -10,8 +10,15 @@ import sys
 
 PILOT = "tag:pcpilot"
 # The pilot is a tagged identity; member-owned devices and internet routes do not include it.
-BROAD = {"*", "autogroup:tagged"}
-TAILNET_NETWORKS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+BROAD = {"*", "autogroup:tagged", "autogroup:danger-all"}
+USER_AUTOGROUPS = {"autogroup:" + name for name in (
+    "member", "members", "owner", "admin", "it-admin", "billing-admin", "network-admin",
+    "auditor", "shared", "self", "internet",
+)}
+TAILNET_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"),
+    ipaddress.ip_network("::ffff:100.64.0.0/106"),  # Do not hide tailnet IPv4 in mapped IPv6.
+)
 
 
 def load_policy(text):
@@ -43,16 +50,27 @@ def load_policy(text):
 def selectors(policy, value, trail=()):
     if not isinstance(value, str):
         raise ValueError("selectors must be strings")
+    value = value.lower()
     if value in trail:
         raise ValueError("cyclic group/host alias")
+    if value.startswith("ipset:"):
+        raise ValueError("IP-set selectors are unsupported; use explicit addresses or tags")
     if value.startswith("group:"):
-        members = policy.get("groups", {}).get(value)
+        members = {key.lower(): members for key, members in policy.get("groups", {}).items()}.get(value)
         if not isinstance(members, list) or not members:
             raise ValueError("unknown or empty group")
         return {item for member in members for item in selectors(policy, member, (*trail, value))}
-    if value in policy.get("hosts", {}):
-        return selectors(policy, policy["hosts"][value], (*trail, value))
-    return {value}
+    hosts = {key.lower(): address for key, address in policy.get("hosts", {}).items()}
+    if value in hosts:
+        return selectors(policy, hosts[value], (*trail, value))
+    if value in BROAD or value in USER_AUTOGROUPS or re.fullmatch(r"tag:[a-z0-9][a-z0-9-]*", value):
+        return {value}
+    if re.fullmatch(r"(?:user:\*|[^@\s:]+)@[^@\s:]+", value):
+        return {value}
+    try:
+        return {str(ipaddress.ip_network(value, strict=False))}
+    except ValueError as exc:
+        raise ValueError("unknown or unsupported selector") from exc
 
 
 def destination(value, acl=False):
@@ -79,6 +97,18 @@ def covers_pilot(value):
 
 def findings(policy, operator):
     result = []
+    operator = operator.lower()
+    # Selectors must not be hidden by aliases named after reserved tags, networks or users.
+    for section in ("hosts", "groups"):
+        definitions = policy.get(section, {})
+        if not isinstance(definitions, dict) or len({key.lower() for key in definitions}) != len(definitions):
+            raise ValueError("invalid or duplicate selector definitions")
+        for key in definitions:
+            pattern = r"[a-zA-Z][a-zA-Z0-9_.-]*" if section == "hosts" else r"group:[a-zA-Z0-9_-]+"
+            if not re.fullmatch(pattern, key):
+                raise ValueError("invalid host alias or group name")
+    if "grants" not in policy and "acls" not in policy:
+        result.append("missing grants/acls inherits Tailscale's default allow-all policy")
     for section in ("grants", "acls"):
         entries = policy.get(section, [])
         if not isinstance(entries, list):
@@ -94,8 +124,10 @@ def findings(policy, operator):
                 result.append(f"{section}[{index}]: only the operator may reach {PILOT}")
     for index, rule in enumerate(policy.get("ssh", [])):
         dst = {s for item in rule.get("dst", []) for s in selectors(policy, item)}
+        src = {s for item in rule.get("src", []) for s in selectors(policy, item)}
+        if any(covers_pilot(s) for s in src):
+            result.append(f"ssh[{index}]: source covers {PILOT}")
         if any(covers_pilot(d) for d in dst):
-            src = {s for item in rule.get("src", []) for s in selectors(policy, item)}
             if src != {operator} or rule.get("action") != "check" or rule.get("users") != ["admin"]:
                 result.append(f"ssh[{index}]: pilot SSH requires operator check mode as admin")
     for test in policy.get("sshTests", []):
@@ -124,7 +156,7 @@ def baseline_findings(plan, policy_text, live_policy):
     for resource in plan.get("resource_changes", []):
         if resource.get("type") == "tailscale_acl" and resource.get("change", {}).get("after", {}).get("acl") != live_policy:
             errors.append("baseline plan does not preserve live policy")
-    if plan.get("errored") or plan.get("deferred_changes"):
+    if plan.get("errored") or plan.get("deferred_changes") or plan.get("complete") is False:
         errors.append("baseline plan is incomplete")
     return errors
 

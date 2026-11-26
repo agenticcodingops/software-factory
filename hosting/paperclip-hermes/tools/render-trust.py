@@ -23,7 +23,7 @@ def composition(targets):
     for subscription in sorted(subscriptions):
         alias = "subscription_" + subscription.rsplit("/", 1)[1].replace("-", "_")
         name = "workload_rg_" + alias
-        providers.append({"alias": alias, "subscription_id": subscription.rsplit("/", 1)[1], "tenant_id": "${var.target_tenant_id}"})
+        providers.append({"alias": alias, "subscription_id": subscription.rsplit("/", 1)[1], "tenant_id": "${var.target_tenant_id}", "skip_provider_registration": True})
         modules[name] = {
             "source": "../../modules/workload-rg",
             "providers": {"azapi": "azapi." + alias},
@@ -54,6 +54,10 @@ def render(source, destination, targets):
         raise ValueError("destination must be a new isolated directory outside the source tree")
     shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".terraform", "*.tfstate*", "*.tfplan", "*.tfvars*"), symlinks=True)
     root = destination / "stacks/trust"
+    outputs = [root / name for name in ("composition_override.tf.json", "workload-subscriptions.tf.json")]
+    if any(path.is_symlink() or not path.resolve().is_relative_to(destination) for path in outputs):
+        shutil.rmtree(destination)
+        raise ValueError("composition paths must be contained in the destination")
     # Override only the composition inputs/output; definitions remain in the normal root.
     overrides = {"module": {"trust": config["module"].pop("trust")}, "output": config.pop("output")}
     (root / "composition_override.tf.json").write_text(json.dumps(overrides, indent=2) + "\n")

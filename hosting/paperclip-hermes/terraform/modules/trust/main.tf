@@ -73,7 +73,7 @@ resource "azurerm_resource_group" "drill" {
 resource "azurerm_role_definition" "target" {
   provider          = azurerm.target
   for_each          = { for k, v in local.roles : k => v if contains(["host_operator", "deallocator"], k) }
-  name              = each.value.name
+  name              = "${var.prefix} ${each.value.name}"
   scope             = values(var.targets)[0].subscription_resource_id
   assignable_scopes = distinct([for t in var.targets : t.subscription_resource_id])
   permissions {
@@ -83,7 +83,7 @@ resource "azurerm_role_definition" "target" {
 }
 resource "azurerm_role_definition" "vault" {
   for_each = { for k, v in local.roles : k => v if contains(["backup_writer", "delegation"], k) }
-  name     = each.value.name
+  name     = "${var.prefix} ${each.value.name}"
   scope    = "/subscriptions/${var.vault_subscription_id}"
   permissions {
     actions      = each.value.actions
@@ -142,9 +142,9 @@ resource "terraform_data" "workload_rg_ready" {
   lifecycle {
     precondition {
       condition = alltrue([for key, target in var.targets :
-        target.rg_managed_by != "trust" || lookup(var.workload_resource_group_ids, key, "") == "${target.subscription_resource_id}/resourceGroups/${target.resource_group_name}"
+        lookup(var.workload_resource_group_ids, key, "") == "${target.subscription_resource_id}/resourceGroups/${target.resource_group_name}"
       ])
-      error_message = "Every trust-owned workload RG must be composed with its subscription provider; run render-trust.py before init."
+      error_message = "Every workload RG must be created or read through its subscription provider; run render-trust.py and initialize host-owned RGs as Owner before scoped grants."
     }
   }
 }

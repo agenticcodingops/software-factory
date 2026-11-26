@@ -7,7 +7,8 @@ from pathlib import Path
 import sys
 
 PROTOCOL = ("sf-approved-sha", "sf-recovery-sha", "sf-recovery-until", "sf-delivery-recipient")
-PROTECTED = {"azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine", "azurerm_virtual_machine", "azurerm_managed_disk", "azurerm_storage_account", "azurerm_storage_container", "tailscale_acl"}
+LIVE_TAGS = (*PROTOCOL, "sf-maintenance-until")
+PROTECTED = {"azurerm_subscription", "azurerm_resource_group", "azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine", "azurerm_virtual_machine", "azurerm_managed_disk", "azurerm_storage_account", "azurerm_storage_container", "azurerm_storage_blob", "azurerm_key_vault", "azurerm_key_vault_secret", "tailscale_acl"}
 
 
 def unknown_at(value, *path):
@@ -23,7 +24,20 @@ def unknown_at(value, *path):
 def azapi_kind(resource, before, after):
     if not resource.get("type", "").startswith("azapi_"):
         return ""
-    return str(after.get("type", before.get("type", ""))).split("@", 1)[0].lower()
+    return str(before.get("type") or after.get("type", "")).split("@", 1)[0].lower()
+
+
+def unknown_disk_deletion(value):
+    for key in ("body", "properties", "storageProfile", "dataDisks"):
+        if value is True:
+            return True
+        if not isinstance(value, dict):
+            return False
+        value = value.get(key, False)
+    if value is True:
+        return True
+    # Disk IDs may legitimately be unknown on first apply; only deletion semantics matter.
+    return isinstance(value, list) and any(item is True or isinstance(item, dict) and item.get("deleteOption") is True for item in value)
 
 
 def guard(plan, override_replace=False):
@@ -43,22 +57,36 @@ def guard(plan, override_replace=False):
         after = change.get("after") or {}
         unknown = change.get("after_unknown") or {}
         kind = azapi_kind(resource, before, after)
+        kinds = {kind, azapi_kind(resource, {}, after)}
         typ = resource.get("type", "")
         addr = resource.get("address", typ)
-        vm = typ in {"azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine", "azurerm_virtual_machine"} or kind == "microsoft.compute/virtualmachines"
-        protected = typ in PROTECTED or kind.startswith(("microsoft.compute/disks", "microsoft.storage/storageaccounts")) or vm
+        vm = typ in {"azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine", "azurerm_virtual_machine"} or "microsoft.compute/virtualmachines" in kinds
+        protected = typ in PROTECTED or any(k.startswith(("microsoft.compute/disks", "microsoft.storage/storageaccounts", "microsoft.keyvault/vaults")) or k in {"microsoft.resources/resourcegroups", "microsoft.subscription/aliases", "microsoft.resources/subscriptions"} for k in kinds) or vm
+        if typ.startswith("azapi_") and (not kind or unknown_at(unknown, "type")):
+            issues.append(f"{addr}: missing/unknown ARM resource type")
+        # Nested ARM templates can delete children without individual resource changes
+        # (Complete mode, or AzureRM deployment teardown). These stacks do not use them.
+        deployment = typ in {"azurerm_template_deployment", "azurerm_resource_group_template_deployment", "azurerm_subscription_template_deployment", "azurerm_management_group_template_deployment", "azurerm_tenant_template_deployment"} or "microsoft.resources/deployments" in kinds
+        if deployment and actions != ["no-op"]:
+            issues.append(f"{addr}: nested deployment may change protected resources indirectly")
         if "forget" in actions and protected:
             issues.append(f"{addr}: protected resource removed from Terraform ownership")
         # Preservation applies to VMs left behind. An approved delete-only plan has no successor.
         authorized_delete = override_replace and vm and actions == ["delete"] and change.get("after") is None
         if "delete" in actions and protected and not authorized_delete:
             issues.append(f"{addr}: protected resource delete/replace")
+        if vm and (after or authorized_delete):
+            # A later VM-only delete must never cascade to the separately protected data disk.
+            configuration = before if authorized_delete else after
+            disks = configuration.get("body", {}).get("properties", {}).get("storageProfile", {}).get("dataDisks", [])
+            if any(disk.get("deleteOption", "Detach") != "Detach" for disk in disks) or configuration.get("delete_data_disks_on_termination") is True or unknown_at(unknown, "delete_data_disks_on_termination") or unknown_disk_deletion(unknown):
+                issues.append(f"{addr}: VM may delete protected data disks indirectly")
         if vm and not before:
             new_tags = after.get("tags") or {}
-            if any(tag in new_tags or unknown_at(unknown, "tags", tag) for tag in PROTOCOL):
+            if any(tag in new_tags or unknown_at(unknown, "tags", tag) for tag in LIVE_TAGS):
                 issues.append(f"{addr}: new VM must not receive protocol tags before health approval")
         if vm and before and not authorized_delete:
-            for tag in PROTOCOL:
+            for tag in LIVE_TAGS:
                 old_tags, new_tags = before.get("tags") or {}, after.get("tags") or {}
                 if old_tags.get(tag) != new_tags.get(tag) or unknown_at(unknown, "tags", tag):
                     issues.append(f"{addr}: protocol tag changed/unknown: {tag}")
@@ -81,7 +109,7 @@ def guard(plan, override_replace=False):
                 if fingerprint(old) != fingerprint(new) or unknown_at(unknown, "replace_triggers_external_values") or unknown_at(unknown, "sensitive_body"):
                     issues.append(f"{addr}: AVM custom_data fingerprint changed/unknown")
         retention = typ in {"azurerm_storage_management_policy", "azurerm_storage_container_immutability_policy"} or "immutabilitypolicies" in kind or "managementpolicies" in kind
-        if before and retention and (before != after or unknown):
+        if retention and (before != after or unknown):
             issues.append(f"{addr}: immutability/lifecycle changed")
         if before and (typ == "azurerm_storage_account" or kind == "microsoft.storage/storageaccounts"):
             for key in ("immutability_policy", "blob_properties", "shared_access_key_enabled"):
@@ -92,6 +120,10 @@ def guard(plan, override_replace=False):
             for key in ("immutableStorageWithVersioning", "allowSharedKeyAccess"):
                 if old_props.get(key) != new_props.get(key) or unknown_at(unknown, "body", "properties", key):
                     issues.append(f"{addr}: storage protection changed: {key}")
+        if not before and kind == "microsoft.storage/storageaccounts":
+            policy = after.get("body", {}).get("properties", {}).get("immutableStorageWithVersioning") or {}
+            if policy.get("immutabilityPolicy", {}).get("state") == "Locked":
+                issues.append(f"{addr}: initialize new account policy as Unlocked before transitioning to Locked")
     return issues
 
 

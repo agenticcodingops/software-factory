@@ -7,9 +7,8 @@ locals {
     grants    = [{ src = [var.operator_login], dst = ["tag:pcpilot"], ip = ["tcp:22", "tcp:443", "tcp:9443"] }]
     ssh       = [{ action = "check", src = [var.operator_login], dst = ["tag:pcpilot"], users = ["admin"] }]
     tests = concat([
-      { src = var.operator_login, accept = ["tag:pcpilot:22", "tag:pcpilot:443", "tag:pcpilot:9443"], deny = [] },
-      { src = "autogroup:member", accept = [], deny = ["tag:pcpilot:22", "tag:pcpilot:443", "tag:pcpilot:9443"] }
-    ], [{ src = "tag:pcpilot", accept = [], deny = var.isolation_destinations }])
+      { src = var.operator_login, accept = ["tag:pcpilot:22", "tag:pcpilot:443", "tag:pcpilot:9443"], deny = [] }
+    ], var.non_operator_login == null ? [] : [{ src = var.non_operator_login, accept = [], deny = ["tag:pcpilot:22", "tag:pcpilot:443", "tag:pcpilot:9443"] }], [{ src = "tag:pcpilot", accept = [], deny = var.isolation_destinations }])
     sshTests = [{ src = var.operator_login, dst = ["tag:pcpilot"], check = ["admin"] }]
   }
 }

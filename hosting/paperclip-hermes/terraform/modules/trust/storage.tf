@@ -5,7 +5,9 @@ module "backups" {
   name                            = "${var.prefix}backups"
   parent_id                       = azurerm_resource_group.vault.id
   location                        = var.location
-  account_replication_type        = "GRS"
+  account_sku_name                = "Standard_GRS"
+  public_network_access_enabled   = true
+  network_rules                   = { default_action = "Allow", bypass = [] }
   shared_access_key_enabled       = false
   default_to_oauth_authentication = true
   min_tls_version                 = "TLS1_2"
@@ -57,7 +59,9 @@ module "staging" {
   name                            = "${var.prefix}staging"
   parent_id                       = azurerm_resource_group.vault.id
   location                        = var.location
-  account_replication_type        = "GRS"
+  account_sku_name                = "Standard_GRS"
+  public_network_access_enabled   = true
+  network_rules                   = { default_action = "Allow", bypass = [] }
   shared_access_key_enabled       = false
   default_to_oauth_authentication = true
   min_tls_version                 = "TLS1_2"
@@ -113,7 +117,9 @@ module "state" {
   name                            = var.state_account_name
   location                        = var.location
   parent_id                       = azurerm_resource_group.vault.id
-  account_replication_type        = "GRS"
+  account_sku_name                = "Standard_GRS"
+  public_network_access_enabled   = true
+  network_rules                   = { default_action = "Allow", bypass = [] }
   shared_access_key_enabled       = false
   default_to_oauth_authentication = true
   allow_nested_items_to_be_public = false

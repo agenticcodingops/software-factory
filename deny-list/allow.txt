@@ -3,4 +3,6 @@
 00000000-0000-0000-0000-000000000000
 # Existing kit policy example and URL user-info test fixture, never real addresses.
 operator@example.com
+# Synthetic non-operator for the tailnet deny-test fixture.
+user@example.com
 password@storage.example.test

@@ -2,6 +2,7 @@ module "tailnet" {
   source                 = "../../modules/tailnet"
   policy                 = var.policy
   operator_login         = var.operator_login
+  non_operator_login     = var.non_operator_login
   mode                   = var.mode
   settings               = var.settings
   magic_dns              = var.magic_dns

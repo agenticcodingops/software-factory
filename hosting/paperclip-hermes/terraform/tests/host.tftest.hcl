@@ -54,7 +54,7 @@ run "new_host_invariants" {
     error_message = "No managed identities or generated private credentials."
   }
   assert {
-    condition     = !contains(keys(output.invariants.tags), "sf-approved-sha") && !contains(keys(output.invariants.tags), "sf-recovery-sha") && !contains(keys(output.invariants.tags), "sf-recovery-until") && !contains(keys(output.invariants.tags), "sf-delivery-recipient")
+    condition     = !contains(keys(output.invariants.tags), "sf-maintenance-until") && !contains(keys(output.invariants.tags), "sf-approved-sha") && !contains(keys(output.invariants.tags), "sf-recovery-sha") && !contains(keys(output.invariants.tags), "sf-recovery-until") && !contains(keys(output.invariants.tags), "sf-delivery-recipient")
     error_message = "Protocol tags must be absent on new hosts."
   }
   assert {
@@ -76,7 +76,7 @@ run "new_host_invariants" {
 }
 run "upgrade_preserves_bootstrap_and_protocol" {
   command = plan
-  variables { protocol_tags = { sf-approved-sha = "d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", sf-recovery-sha = "d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", sf-recovery-until = "2026-11-27T00:00:00Z", sf-delivery-recipient = "age1fixture" } }
+  variables { protocol_tags = { sf-approved-sha = "d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", sf-recovery-sha = "d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", sf-recovery-until = "2026-11-27T00:00:00Z", sf-delivery-recipient = "age1fixture", sf-maintenance-until = "2026-11-26T14:00:00Z" } }
   assert {
     condition     = alltrue([for key, val in var.protocol_tags : output.invariants.tags[key] == val]) && output.invariants.custom_data == var.bootstrap_custom_data && output.disk.protection_enabled
     error_message = "All current protocol tags and original bootstrap pass unchanged through upgrades/moves."
@@ -129,6 +129,10 @@ override_resource {
 
 run "billing_month_and_override_budget" {
   command = plan
+  assert {
+    condition     = alltrue([for budget in [output.guardrails.rg_budget, output.guardrails.subscription_budget] : toset(one([for n in budget.notification : n if n.threshold_type == "Actual" && n.threshold == 100]).contact_groups) == toset([output.guardrails.action_groups.deallocate])])
+    error_message = "Actual 100 percent must reach the deallocator in both verified budgets."
+  }
   variables {
     billing_month_verified = true
     override_cost          = true
@@ -139,7 +143,25 @@ run "billing_month_and_override_budget" {
     error_message = "Verified BillingMonth and explicitly overridden pilot cap are preserved."
   }
   assert {
-    condition     = length(output.guardrails.rg_budget.notification) == 3 && length(output.guardrails.subscription_budget.notification) == 3 && strcontains(output.guardrails.logic_app.body.properties.definition.actions.Threshold_and_maintenance.expression, "NotificationThresholdAmount") && strcontains(output.guardrails.logic_app.body.properties.definition.actions.Threshold_and_maintenance.expression, "sf-maintenance-until")
+    condition     = length(output.guardrails.rg_budget.notification) == 4 && length(output.guardrails.subscription_budget.notification) == 4 && strcontains(output.guardrails.logic_app.body.properties.definition.actions.Threshold_and_maintenance.expression, "NotificationThresholdAmount") && strcontains(output.guardrails.logic_app.body.properties.definition.actions.Threshold_and_maintenance.expression, "sf-maintenance-until")
     error_message = "Both budgets have the exact thresholds and deallocator uses documented budget payload and maintenance guard."
+  }
+}
+
+override_resource {
+  target          = module.guardrails.module.action_group["email"].azapi_resource.this
+  values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.Insights/actionGroups/fixture-email" }
+  override_during = plan
+}
+override_resource {
+  target          = module.guardrails.module.action_group["deallocate"].azapi_resource.this
+  values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.Insights/actionGroups/fixture-deallocate" }
+  override_during = plan
+}
+run "actual100_subscription_email_only_fallback" {
+  command = plan
+  assert {
+    condition     = toset(one([for n in output.guardrails.subscription_budget.notification : n if n.threshold_type == "Actual" && n.threshold == 100]).contact_groups) == toset([output.guardrails.action_groups.email]) && toset(one([for n in output.guardrails.rg_budget.notification : n if n.threshold_type == "Actual" && n.threshold == 100]).contact_groups) == toset([output.guardrails.action_groups.deallocate])
+    error_message = "Unverified billing months must keep actual100 email-only for the subscription; RG actual100 deallocates."
   }
 }

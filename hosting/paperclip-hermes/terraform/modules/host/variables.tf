@@ -41,7 +41,7 @@ variable "bootstrap_custom_data" {
 
 variable "protocol_tags" {
   type        = map(string)
-  description = "Current protocol tags read from ARM; absent on a new VM."
+  description = "Current protocol tags and sf-maintenance-until read from ARM; absent on a new VM."
   default     = {}
 }
 
@@ -101,7 +101,7 @@ resource "terraform_data" "invariants" {
       error_message = "rg_managed_by must be trust or host."
     }
     precondition {
-      condition     = alltrue([for key in keys(var.protocol_tags) : contains(["sf-approved-sha", "sf-recovery-sha", "sf-recovery-until", "sf-delivery-recipient"], key)]) && length(setintersection(toset(keys(var.tags)), toset(["sf-approved-sha", "sf-recovery-sha", "sf-recovery-until", "sf-delivery-recipient", "expires"]))) == 0
+      condition     = alltrue([for key in keys(var.protocol_tags) : contains(["sf-approved-sha", "sf-recovery-sha", "sf-recovery-until", "sf-delivery-recipient", "sf-maintenance-until"], key)]) && length(setintersection(toset(keys(var.tags)), toset(["sf-approved-sha", "sf-recovery-sha", "sf-recovery-until", "sf-delivery-recipient", "sf-maintenance-until", "expires"]))) == 0
       error_message = "Protocol tags must come only from the current ARM pass-through, never ordinary tags."
     }
     precondition {

@@ -53,7 +53,7 @@ class PolicyTests(unittest.TestCase):
         for section in ("grants", "acls", "ssh"):
             for member in ("autogroup:member", "autogroup:members", "autogroup:internet"):
                 with self.subTest(section=section, member=member):
-                    p = {"hosts": {"members": member}, "groups": {"group:members": ["members"]}, section: [{
+                    p = {"grants": [], "hosts": {"members": member}, "groups": {"group:members": ["members"]}, section: [{
                         "src": ["group:members"], "dst": ["tag:unrelated:443" if section == "acls" else "tag:unrelated"],
                         "ip": ["tcp:443"], "action": "accept", "users": ["admin"],
                     }]}
@@ -63,13 +63,14 @@ class PolicyTests(unittest.TestCase):
 
     def test_member_destination_does_not_cover_tagged_pilot(self):
         for section in ("grants", "acls", "ssh"):
-            p = {section: [{"src": ["another@" + "example.com"], "dst": ["autogroup:member:443" if section == "acls" else "autogroup:member"]}]}
+            p = {"grants": [], section: [{"src": ["another@" + "example.com"], "dst": ["autogroup:member:443" if section == "acls" else "autogroup:member"]}]}
             self.assertFalse(policy.findings(p, "operator@example.com"))
 
     def test_tailnet_cidr_overlap_sources_and_destinations(self):
         overlapping = ("100.64.0.0/10", "100.0.0.0/8", "100.100.0.0/16", "100.64.0.1/32",
-                       "fd7a:115c:a1e0::/48", "fd7a:115c::/32", "fd7a:115c:a1e0:1::/64", "fd7a:115c:a1e0::1/128")
-        unrelated = ("100.0.0.0/10", "100.128.0.0/10", "10.0.0.0/8", "fd7a:115c:a1df::/48", "fd7a:115c:a1e1::/48")
+                       "fd7a:115c:a1e0::/48", "fd7a:115c::/32", "fd7a:115c:a1e0:1::/64", "fd7a:115c:a1e0::1/128",
+                       "::ffff:100.64.0.1/128", "::ffff:0:0/96")
+        unrelated = ("100.0.0.0/10", "100.128.0.0/10", "10.0.0.0/8", "fd7a:115c:a1df::/48", "fd7a:115c:a1e1::/48", "::ffff:10.0.0.1/128")
         for section in ("grants", "acls"):
             for cidr in (*overlapping, *unrelated):
                 for side in ("src", "dst"):
@@ -190,7 +191,7 @@ class PlanTests(unittest.TestCase):
             self.assertTrue(plan.guard(fixture(f"plan-custom-data-{name}.json"), True))
 
     def test_all_protocol_tags_changes_removals_and_unknown(self):
-        for tag in plan.PROTOCOL:
+        for tag in plan.LIVE_TAGS:
             for new, unknown in (("candidate", {}), (None, {}), ("previous", {"tags": {tag: True}}), ("previous", {"tags": True})):
                 p = fixture("plan-safe.json")
                 change = p["resource_changes"][0]["change"]

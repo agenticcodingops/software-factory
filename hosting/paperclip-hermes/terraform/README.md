@@ -44,7 +44,7 @@ Tailscale 0.30.0 exposes `https_enabled`; this is managed rather than left to a 
 
 Initialize each root with private `-backend-config` files. The backend always enables OIDC and
 Entra data-plane authentication; trust apply uses the operator login with `-backend-config=use_oidc=false`.
-The bootstrap-created state account, `tfstate` container and deletion lock are explicitly imported
+The bootstrap-created vault RG, state account, `tfstate` container and deletion lock are explicitly imported
 by `stacks/trust/main.tf` using AzAPI, which does not persist account keys.
 The `tfstate` container, soft delete, versioning, Shared Key prohibition and deletion lock are managed.
 No SAS, password or SSH private key is created by these modules.
@@ -76,11 +76,22 @@ keep vault grants. Twins live in a separate owner-controlled `rg-<prefix>-trust`
 Contributor boundary. More than one foreign tenant requires an operator-reviewed root composition
 with an explicit alias per tenant; Terraform cannot select provider aliases dynamically. Do not apply
 separate copies of the vault resources to independent states.
+AzureRM's automatic registration is explicitly `none`, and AzAPI's registration is skipped on every
+root/generated alias. The Owner bootstrap must register the required namespaces in each subscription
+before trust/host initialization. Read-only plans and RG-scoped workflow identities cannot perform
+subscription-level provider registration as a side effect of provider setup.
 
 `rg_managed_by=trust` references the existing workload RG; `host` creates it for subscription scope.
-Before the first host apply in subscription scope, the operator must establish the RG-scoped grants
-and verify creation authorization through bootstrap. No workflow gets Owner or unrestricted RBAC.
-Deploy can assign only `SF VM Deallocator` to service principals; its ABAC condition constrains both
+For a new host-owned RG, the Owner must initialize its host-state RG before full trust apply:
+first apply only `module.trust.azurerm_role_definition.target` in the rendered trust root, record its
+`deallocator_role_id` in private host inputs, then apply only `module.host.module.workload_rg` in the
+host root with the Owner login. Review both saved plans. Now run the full trust apply and the ordinary
+approved host apply. These limited initialization applies create neither a VM nor a second RG owner.
+The subscription-specific trust composition reads host-owned RGs and waits for them before RG-scoped
+grants; a missing group fails the read. This avoids granting subscription-wide Contributor merely to
+create the group. No workflow gets Owner or unrestricted RBAC.
+Custom role display names include the instance prefix (for example, `<prefix> SF VM Deallocator`);
+assignments and ABAC use their resource IDs. Deploy can assign only that deallocator role to service principals; its ABAC condition constrains both
 assignment creation and deletion. Ops gets Cost Management Reader on every target subscription,
 never cost writes. Live subscription usage/forecast and denied-write probes remain deployment gates.
 
@@ -118,10 +129,15 @@ baseline needs only the three live imports and creates no local generation marke
 The `reviewed_fragment` output is a patch for the next operator-reviewed hardening PR; Terraform
 does not silently replace or narrow the imported policy. It renders tag owners, the operator grant,
 SSH check mode, operator accept tests, pilot outbound denies and another-user denies.
+Set `non_operator_login` to a real second tailnet login distinct from the operator. If there is no
+second user, leave it null and the module omits that deny test. An autogroup cannot be a test source.
 `isolation_destinations` must sample every other tag/user/host:port in the actual imported policy.
 
 Run `tools/policy-lint.py POLICY --operator LOGIN` before any hardening or later plan/apply.
 It parses HuJSON, expands groups and host aliases, checks every ACL/grant and protects SSH check mode.
+It normalizes tag case, covers IPv4/IPv6 tailnet ranges and `autogroup:danger-all`, and rejects IP-set
+references and unknown selector types until they can be resolved safely. Reserved selectors cannot
+be shadowed by host aliases. Omitting both grants and ACLs fails because it inherits allow-all.
 The sole report-only exception requires `--baseline-plan PLAN.json --live-policy LIVE.hujson` and
 `--operation plan`: exact live policy bytes, no policy/settings resource diff, no unrelated changes.
 It lists unsafe findings without authorizing apply or join. Live reads and the no-diff plan must come
@@ -133,12 +149,21 @@ VM replacements do not. Keys are single-use and expire after 3,600 seconds, and 
 
 ## Upgrade and disk contracts
 
-Pass the four current protocol tags from ARM and the original bootstrap `custom_data` from the receipt.
-A new VM has no protocol tags. The `expires` tag uses `time_static` plus a 30-day `time_offset`.
+Pass the four current protocol tags **and the live `sf-maintenance-until` deadline** from ARM in
+`protocol_tags`, plus the original bootstrap `custom_data` from the receipt. Read ARM after setting
+maintenance and before planning; preserve the exact existing deadline, without generating a new one
+in Terraform. For example, select these five keys from `az vm show --ids "$vm_id" --query tags` into
+the private `protocol_tags` map, omitting absent keys. Hold the target's workflow lock through read,
+plan and apply so another protocol writer cannot invalidate that snapshot. A new VM uses an empty
+map and receives no protocol or maintenance tags. Ordinary `tags` cannot supply these keys.
+The `expires` tag uses `time_static` plus a 30-day `time_offset`.
 Shutdown defaults to 22:00 and backup to 21:15; invalid times or a smaller gap fail planning.
 `tools/plan-guard.py PLAN.json` rejects protected deletions/replacements and retention/lifecycle changes.
 `--override-replace` authorizes delete-only VM changes, which have no successor to preserve.
-Updates and replacements still reject protocol tag changes and changed/unknown existing VM bootstrap data.
+Updates and replacements still reject protocol/maintenance tag changes and changed/unknown existing VM bootstrap data.
+RG/subscription deletion, replacement or forgetting is also protected: deleting a parent can cascade
+to a disk even when that disk's own plan is no-op. VM data-disk attachments must retain `Detach`;
+changing them to `Delete` cannot bypass disk protection with a later VM-only deletion.
 AVM 0.22.1 stores cloud-init in a write-only field; the guard also checks its first replacement
 fingerprint, covering changes invisible in ordinary `custom_data` JSON.
 
@@ -163,8 +188,12 @@ until they pass; ordinary deploy/ops must never invoke the destroy renderer.
 Backups use versioning and 30-day version WORM, Unlocked only before `pilot_end_date`, Locked afterwards.
 The optional container policy is enabled only by failed inheritance self-test 3. After `pilot_end_date`,
 the next approved trust apply explicitly locks that policy using Azure's `POST /lock` operation and
-its ETag, matching the account policy's lock transition. All storage accounts
-have Shared Key disabled, TLS 1.2, private containers and deletion locks. Data roles use container scopes;
+its ETag, matching the account policy's lock transition. Changing a default does not lock old versions;
+complete the pilot-closure procedure below as well. All storage accounts use explicit `Standard_GRS`,
+public network access and an Allow network rule so hosted runners and operator devices can reach their
+Entra endpoints. Shared Key is disabled, anonymous blob access is disabled, HTTPS/TLS 1.2 is required,
+and containers are private with account deletion locks. A private-endpoint deployment requires
+network-connected runners and operator access and is outside this ADR's default. Data roles use container scopes;
 user-delegation roles use the backup account for ops and the staging account for restore. Deploy has no backup/key rights. Operator custody
 grants no workflow any key access; vault custody grants only restore the read-only Key Vault Secrets User.
 
@@ -182,11 +211,12 @@ upload path must be migrated to that object prefix by the runtime package before
 Mock plan inspection verifies both actions and both prefix filters.
 
 RG budgets are `max(5, min(cap, headroom))`, with the approved override using the cap. Alerts are
-50% actual email, 80% actual deallocation, 100% forecast email. The credit budget uses 70/85/100;
+50% actual email, 80% and 100% actual deallocation, 100% forecast email. The credit budget uses
+70% actual email, 85% and 100% actual deallocation, and 100% forecast email;
 `billing_month_verified=false` selects Monthly and **email only** until self-test 7 passes.
 Email and deallocation action groups are separate, so email thresholds cannot stop a VM.
 The Consumption Logic App and its SF VM Deallocator assignment are in the target RG and its POST
-URI names only the pilot VM. It checks budget thresholds and the maintenance tag before deallocating;
+URI names only the pilot VM. Budgets wait for its role assignment before alerting. It checks budget thresholds and the maintenance tag before deallocating;
 100% is the emergency hard threshold. The
 [monetary notification payload](https://learn.microsoft.com/en-us/azure/azure-monitor/alerts/alerts-non-common-schema-definitions#budget-alerts)
 expresses `NotificationThresholdAmount` and `Budget` as amounts; all three comparisons use their
@@ -198,6 +228,55 @@ Its unsigned runtime invoke URL comes from Azure
 `properties.accessEndpoint`; no `listCallbackUrl` call or signed URL enters state. Live webhook delivery, payloads, maintenance behavior and forecast notifications
 must pass self-test before budgets authorize deallocation. The authoritative real-billing-period cost
 workflow remains a later package. Code never changes the subscription's spending limit.
+
+The race mitigation is a **second ARM GET and maintenance check immediately before the deallocate
+POST**, with no automatic POST retries. A failed recheck cannot reach the POST. The 100% actual
+notification still overrides maintenance, with the same subscription billing-month gate. This is
+not an atomic exclusion: maintenance written after the second GET and before Azure accepts the POST
+can still lose the race. No shared lease is implemented. Live acceptance must exercise this residual
+window and operators must account for it; this implementation does not claim race-free maintenance.
+
+### Pilot closure (operator, at `pilot_end_date`)
+
+1. Pause backup uploads and state-changing instance workflows under the instance lock. Keep uploads
+   paused until all following steps pass. Schedule this Owner run at pilot end; `ph-ops` alerts on
+   failure or an overdue closure, rather than treating a changed account default as success.
+2. Run the reviewed full trust apply with the real pilot end date, setting the default to Locked and
+   locking the fallback container policy if enabled. Azure only creates account policies in Unlocked
+   or Disabled state. If initializing a **new** backup account after the intended end date, first
+   initialize trust with a temporary future `pilot_end_date` while uploads remain paused, then restore
+   the intended date and apply again. Plan-guard rejects new accounts with a Locked creation policy.
+3. Temporarily grant the operator Storage Blob Data Owner at the **unlocked vault RG** using the
+   bootstrap assignment ledger, wait for propagation, and run:
+
+   ```sh
+   python3 hosting/paperclip-hermes/tools/lock-backup-versions.py \
+     --account "$backup_account" --pilot-end "$pilot_end_date"
+   python3 hosting/paperclip-hermes/tools/lock-backup-versions.py \
+     --account "$backup_account" --pilot-end "$pilot_end_date" --apply
+   ```
+
+   The first command counts candidates; the second uses the operator's `az` Entra session to enumerate
+   every page and version in the container, including older versions of current names. It locks each
+   unexpired Unlocked version with its exact version ID and unchanged retention-until date. Expired
+   policies need no lock; already Locked versions are skipped. It rereads all pages and fails if any
+   unexpired Unlocked version remains. It never extends expired backups or uses Shared Key/SAS.
+   This temporary operator grant reaches blob data across that RG; it is not a workflow grant.
+   Account-level `CanNotDelete` locks also block deletion of container-scoped RBAC assignments.
+   An assignment on the unlocked parent RG can be removed while all storage account locks remain
+   intact. Verify there is no inherited parent lock before creating the temporary assignment.
+4. Record the successful count and complete inventory verification in the private closure receipt.
+   Remove the temporary role on success or failure and verify removal. On partial failure, keep
+   uploads paused, alert, reacquire the temporary role and rerun; locking is idempotent. Resume only
+   after verified closure. Workflow identities receive no new immutability rights.
+
+The data-plane operation is [Set Blob Immutability Policy](https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-immutability-policy),
+using [version and immutability inventory](https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs).
+Offline tests cover pagination, versions, expiry preservation, expired/Locked skips, authorization
+failure, missing policy data, early invocation, partial closure and reruns. Live Azure acceptance
+and the future bootstrap/scheduler integration remain deployment gates.
+
+See the [review and self-audit record](review-audit.md) for pinned-source evidence and regression coverage.
 
 ## Local checks and static-analysis exceptions
 

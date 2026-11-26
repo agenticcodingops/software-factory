@@ -51,3 +51,13 @@ variable "isolation_destinations" {
     error_message = "Isolation tests must cover the imported policy's other destinations."
   }
 }
+
+variable "non_operator_login" {
+  type        = string
+  description = "Optional real tailnet login for the deny test; omit when no second user exists."
+  default     = null
+  validation {
+    condition     = var.non_operator_login == null ? true : (can(regex("^[^@ :*]+@[^@ :*]+$", var.non_operator_login)) && lower(var.non_operator_login) != lower(var.operator_login))
+    error_message = "The deny-test source must be a real non-operator login, never an autogroup."
+  }
+}

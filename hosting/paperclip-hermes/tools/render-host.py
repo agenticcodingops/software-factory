@@ -43,9 +43,9 @@ def render(source, destination, allow_disk_destroy=False, receipt=None, target=N
         authorize(receipt or {}, target, run_id)
     shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".terraform", "*.tfstate*", "*.tfplan", "*.tfvars*"), symlinks=True)
     path = destination / "modules/host/main.tf"
-    if path.is_symlink():
+    if path.is_symlink() or not path.resolve().is_relative_to(destination):
         shutil.rmtree(destination)
-        raise ValueError("protection template must be a regular file")
+        raise ValueError("protection template must be a regular file contained in the destination")
     text = path.read_text()
     if text.count("prevent_destroy = true") != 1 or text.count("disk_destroy_enabled = false") != 1:
         shutil.rmtree(destination)

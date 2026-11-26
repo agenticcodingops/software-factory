@@ -38,7 +38,20 @@ module "deallocator" {
         type       = "If"
         expression = "@and(equals(triggerBody()?['schemaId'], 'AIP Budget Notification'), equals(triggerBody()?['data']?['SubscriptionId'], '${split("/", var.subscription_resource_id)[2]}'), or(and(equals(triggerBody()?['data']?['BudgetName'], '${var.name}-rg'), greaterOrEquals(${local.threshold_ratio}, 0.8)), and(${var.billing_month_verified}, equals(triggerBody()?['data']?['BudgetName'], '${var.name}-subscription'), greaterOrEquals(${local.threshold_ratio}, 0.85))), or(empty(body('Read_VM')?['tags']?['sf-maintenance-until']), lessOrEquals(ticks(coalesce(body('Read_VM')?['tags']?['sf-maintenance-until'], '1970-01-01T00:00:00Z')), ticks(utcNow())), greaterOrEquals(${local.threshold_ratio}, 1)))"
         actions = {
-          Deallocate = { type = "Http", inputs = { method = "POST", uri = "https://management.azure.com${var.vm_resource_id}/deallocate?api-version=2024-07-01", authentication = { type = "ManagedServiceIdentity" } }, runAfter = {} }
+          Recheck_VM = {
+            type     = "Http"
+            inputs   = { method = "GET", uri = "https://management.azure.com${var.vm_resource_id}?api-version=2024-07-01", authentication = { type = "ManagedServiceIdentity" } }
+            runAfter = {}
+          }
+          Recheck_maintenance = {
+            type       = "If"
+            expression = "@or(empty(body('Recheck_VM')?['tags']?['sf-maintenance-until']), lessOrEquals(ticks(coalesce(body('Recheck_VM')?['tags']?['sf-maintenance-until'], '1970-01-01T00:00:00Z')), ticks(utcNow())), greaterOrEquals(${local.threshold_ratio}, 1))"
+            actions = {
+              Deallocate = { type = "Http", inputs = { method = "POST", uri = "https://management.azure.com${var.vm_resource_id}/deallocate?api-version=2024-07-01", authentication = { type = "ManagedServiceIdentity" }, retryPolicy = { type = "none" } }, runAfter = {} }
+            }
+            else     = { actions = {} }
+            runAfter = { Recheck_VM = ["Succeeded"] }
+          }
         }
         else     = { actions = {} }
         runAfter = { Read_VM = ["Succeeded"] }
@@ -75,13 +88,14 @@ module "action_group" {
   enable_telemetry = false
 }
 resource "azurerm_consumption_budget_resource_group" "pilot" {
+  depends_on        = [azurerm_role_assignment.deallocator]
   name              = "${var.name}-rg"
   resource_group_id = var.resource_group_id
   amount            = local.rg_budget
   time_grain        = "Monthly"
   time_period { start_date = var.budget_start }
   dynamic "notification" {
-    for_each = { actual50 = { threshold = 50, type = "Actual", action = "email" }, actual80 = { threshold = 80, type = "Actual", action = "deallocate" }, forecast100 = { threshold = 100, type = "Forecasted", action = "email" } }
+    for_each = { actual50 = { threshold = 50, type = "Actual", action = "email" }, actual80 = { threshold = 80, type = "Actual", action = "deallocate" }, actual100 = { threshold = 100, type = "Actual", action = "deallocate" }, forecast100 = { threshold = 100, type = "Forecasted", action = "email" } }
     content {
       enabled        = true
       threshold      = notification.value.threshold
@@ -92,13 +106,14 @@ resource "azurerm_consumption_budget_resource_group" "pilot" {
   }
 }
 resource "azurerm_consumption_budget_subscription" "credit" {
+  depends_on      = [azurerm_role_assignment.deallocator]
   name            = "${var.name}-subscription"
   subscription_id = var.subscription_resource_id
   amount          = var.monthly_credit
   time_grain      = var.billing_month_verified ? "BillingMonth" : "Monthly"
   time_period { start_date = var.budget_start }
   dynamic "notification" {
-    for_each = { actual70 = { threshold = 70, type = "Actual", action = "email" }, actual85 = { threshold = 85, type = "Actual", action = var.billing_month_verified ? "deallocate" : "email" }, forecast100 = { threshold = 100, type = "Forecasted", action = "email" } }
+    for_each = { actual70 = { threshold = 70, type = "Actual", action = "email" }, actual85 = { threshold = 85, type = "Actual", action = var.billing_month_verified ? "deallocate" : "email" }, actual100 = { threshold = 100, type = "Actual", action = var.billing_month_verified ? "deallocate" : "email" }, forecast100 = { threshold = 100, type = "Forecasted", action = "email" } }
     content {
       enabled        = true
       threshold      = notification.value.threshold

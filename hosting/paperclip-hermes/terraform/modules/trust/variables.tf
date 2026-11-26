@@ -83,5 +83,5 @@ variable "container_retention_fallback" {
 
 variable "workload_resource_group_ids" {
   type        = map(string)
-  description = "Trust-owned workload RG IDs from subscription-specific root modules."
+  description = "Created or read workload RG IDs from subscription-specific root modules."
 }

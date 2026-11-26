@@ -3,6 +3,7 @@ mock_provider "tailscale" {}
 variables {
   policy                 = "{\"grants\": []}"
   operator_login         = "operator@example.com"
+  non_operator_login     = "user@example.com"
   isolation_destinations = ["tag:other:22", "operator@example.com:22", "sample-host:443"]
   settings               = { acls_externally_managed_on = false, https_enabled = false }
 }
@@ -21,7 +22,7 @@ run "hardened_tailnet" {
     error_message = "Join key must be single-use, preauthorized and one-hour, never automatically reminted."
   }
   assert {
-    condition     = length(output.reviewed_fragment.tests[2].deny) == 3 && output.reviewed_fragment.ssh[0].action == "check" && output.reviewed_fragment.sshTests[0].check[0] == "admin" && output.reviewed_fragment.sshTests[0].dst[0] == "tag:pcpilot"
+    condition     = output.reviewed_fragment.tests[1].src == var.non_operator_login && output.reviewed_fragment.tests[0].src == var.operator_login && length(output.reviewed_fragment.tests[2].deny) == 3 && output.reviewed_fragment.ssh[0].action == "check" && output.reviewed_fragment.sshTests[0].check[0] == "admin" && output.reviewed_fragment.sshTests[0].dst[0] == "tag:pcpilot"
     error_message = "Render operator accept, other-user deny, outbound deny and SSH check tests."
   }
 }
@@ -53,4 +54,28 @@ run "baseline_no_diff" {
     condition     = length(output.invariants.keys) == 0
     error_message = "The imported baseline must not create a join key."
   }
+}
+
+run "no_second_user_omits_deny_source" {
+  command = plan
+  variables { non_operator_login = null }
+  assert {
+    condition     = length(output.reviewed_fragment.tests) == 2 && output.reviewed_fragment.tests[0].src == var.operator_login && output.reviewed_fragment.tests[1].src == "tag:pcpilot"
+    error_message = "Single-user tailnets must omit the non-operator test, never use an autogroup."
+  }
+}
+run "reject_operator_as_deny_source" {
+  command = plan
+  variables { non_operator_login = "operator@example.com" }
+  expect_failures = [var.non_operator_login]
+}
+run "reject_autogroup_as_deny_source" {
+  command = plan
+  variables { non_operator_login = "autogroup:member" }
+  expect_failures = [var.non_operator_login]
+}
+run "reject_wildcard_as_deny_source" {
+  command = plan
+  variables { non_operator_login = join("@", ["*", "example.com"]) }
+  expect_failures = [var.non_operator_login]
 }

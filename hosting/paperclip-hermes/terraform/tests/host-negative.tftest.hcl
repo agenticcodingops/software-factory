@@ -74,3 +74,10 @@ run "protected_parked_disk" {
     error_message = "A parked disk retains protection."
   }
 }
+
+run "reject_maintenance_from_ordinary_tags" {
+  command = plan
+  module { source = "../../modules/host" }
+  variables { tags = { sf-maintenance-until = "2026-11-26T14:00:00Z" } }
+  expect_failures = [terraform_data.invariants]
+}
