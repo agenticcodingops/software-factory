@@ -11,7 +11,7 @@ from repo_files import files
 
 GUID = re.compile(r"(?<![a-f0-9])[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?![a-f0-9])", re.I)
 EMAIL = re.compile(r"[a-z0-9][a-z0-9.!#$%&'*+=?^_`{|}~-]*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}", re.I)
-TAILNET = re.compile(r"(?<![a-z0-9_.-])(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+ts\.net\b", re.I)
+TAILNET = re.compile(r"(?<![a-z0-9])(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+ts\.net\b", re.I)
 TOKEN = re.compile(r"[A-Za-z0-9_@.+-]+")
 
 

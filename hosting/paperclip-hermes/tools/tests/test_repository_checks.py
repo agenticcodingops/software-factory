@@ -67,6 +67,18 @@ class RepositoryChecks(unittest.TestCase):
         self.assertIn("wildcard.txt:1: denied tailnet", result.stdout)
         self.assertNotIn(value, result.stdout + result.stderr)
 
+    def test_tailnet_after_punctuation_is_rejected(self):
+        for name, value in (("dot", "NO_PROXY=.tail123abc" + ".ts.net"),
+                            ("underscore", "_acme-challenge.host.tail123abc" + ".ts.net"),
+                            ("hyphen", "x-host.tail123abc" + ".ts.net")):
+            with self.subTest(name):
+                path = self.root / f"{name}.txt"
+                path.write_text(value)
+                result = self.run_check("deny-list.py", 1)
+                self.assertIn(f"{name}.txt:1: denied tailnet", result.stdout)
+                self.assertNotIn(value, result.stdout + result.stderr)
+                path.unlink()
+
     def test_utf16le_tailnet_is_rejected(self):
         self.check_encoded_tailnet("utf-16-le")
 
