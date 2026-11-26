@@ -191,6 +191,20 @@ flowchart LR
 
 If the vault and the target are in different tenants, the `trust` stack creates a twin of each target-facing identity in the target tenant, with the same GitHub subject. The per-target configuration file names which client ID to use in each tenant. Terraform's `azurerm` backend authenticates with the vault-tenant identity (`use_oidc = true`, `use_azuread_auth = true`).
 
+**WP4 release-blocking authorization amendment (issue #5 review).** The environment-only subjects
+below are insufficient for unattended ops: release-controlled workflow code could add an `ops` job.
+WP4 therefore creates no environment-only federated credentials. GitHub's generally available
+custom subject template uses `["repo", "context", "job_workflow_ref"]`; each credential includes an
+Owner-authorized exact reusable workflow path and full SHA in its subject, including tenant twins.
+No preview flexible credential is used. The Owner must update this allowlist through `trust` until
+a separately trusted controller implements automatic per-target handoff and approval-bound minting.
+Candidate release jobs cannot authorize their own SHA. Bootstrap must configure and read back that
+subject template before enabling federation. The offline mock-plan adversarial test verifies the
+exact matching boundary; a live candidate-release token/run-command denial remains release-blocking
+for the later instance/workflow package. See the [WP4 contracts](../../hosting/paperclip-hermes/terraform/README.md).
+This amendment supersedes the environment-only subject statements in this revision, not the required
+production/restore approvals, target-tag checks, recovery limits or minimum identity privileges.
+
 **Identities.** Each identity has one federated credential per tenant, bound to its environment subject `<sub_claim_prefix>:environment:<env>`. That is 4 per tenant, well under the limit of 20.
 
 | Identity | Env | Target-plane rights | Vault-plane rights | Worst case if its workflow is compromised |

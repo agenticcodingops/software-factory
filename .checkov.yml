@@ -1,0 +1,4 @@
+# Downloaded provider/module examples are upstream code, not this deployment.
+# The committed modules and their resolved resource plans are checked separately.
+skip-path:
+  - '\.terraform/'

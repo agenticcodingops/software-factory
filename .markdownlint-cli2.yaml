@@ -1,4 +1,5 @@
 ignores:
+  - "**/.terraform/**"
   - node_modules/** # Installed third-party packages are not the public source tree.
   - .venv/**
 config:
@@ -14,3 +15,5 @@ overrides:
       MD033:
         allowed_elements: [id, name] # Upstream API placeholders, not rendered HTML.
       MD037: false # The source contract quotes literal wildcard paths with underscores.
+
+# Downloaded Terraform modules include upstream documentation/examples.

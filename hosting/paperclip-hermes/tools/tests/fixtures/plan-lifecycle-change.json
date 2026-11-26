@@ -1,0 +1,32 @@
+{
+  "format_version": "1.2",
+  "complete": true,
+  "resource_changes": [
+    {
+      "address": "azurerm_storage_management_policy.fixture",
+      "type": "azurerm_storage_management_policy",
+      "change": {
+        "actions": [
+          "update"
+        ],
+        "before": {
+          "rule": [
+            {
+              "name": "expire-backups",
+              "days": 45
+            }
+          ]
+        },
+        "after": {
+          "rule": [
+            {
+              "name": "expire-backups",
+              "days": 1
+            }
+          ]
+        },
+        "after_unknown": {}
+      }
+    }
+  ]
+}

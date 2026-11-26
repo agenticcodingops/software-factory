@@ -1,0 +1,1 @@
+../../../tests/trust.tftest.hcl

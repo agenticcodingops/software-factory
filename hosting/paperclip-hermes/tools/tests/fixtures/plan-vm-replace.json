@@ -1,0 +1,25 @@
+{
+  "format_version": "1.2",
+  "complete": true,
+  "resource_changes": [
+    {
+      "address": "azurerm_linux_virtual_machine.fixture",
+      "type": "azurerm_linux_virtual_machine",
+      "change": {
+        "actions": [
+          "delete",
+          "create"
+        ],
+        "before": {
+          "custom_data": "original",
+          "tags": {}
+        },
+        "after": {
+          "custom_data": "original",
+          "tags": {}
+        },
+        "after_unknown": {}
+      }
+    }
+  ]
+}

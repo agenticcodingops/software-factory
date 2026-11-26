@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Downloaded dependencies and tool environments; committed source is always scanned"
+paths = [
+  '''(?:^|/)\.terraform/''',
+  '''(?:^|/)\.venv/''',
+  '''(?:^|/)node_modules/''',
+]

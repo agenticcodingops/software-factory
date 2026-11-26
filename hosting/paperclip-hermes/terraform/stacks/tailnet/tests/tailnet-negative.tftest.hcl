@@ -1,0 +1,1 @@
+../../../tests/tailnet-negative.tftest.hcl

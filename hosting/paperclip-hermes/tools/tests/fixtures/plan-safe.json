@@ -1,0 +1,28 @@
+{
+  "format_version": "1.2",
+  "complete": true,
+  "resource_changes": [
+    {
+      "address": "azurerm_linux_virtual_machine.fixture",
+      "type": "azurerm_linux_virtual_machine",
+      "change": {
+        "actions": [
+          "update"
+        ],
+        "before": {
+          "custom_data": "original",
+          "tags": {
+            "sf-approved-sha": "previous"
+          }
+        },
+        "after": {
+          "custom_data": "original",
+          "tags": {
+            "sf-approved-sha": "previous"
+          }
+        },
+        "after_unknown": {}
+      }
+    }
+  ]
+}

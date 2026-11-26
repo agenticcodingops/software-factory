@@ -4,12 +4,17 @@ setup() {
   script="$BATS_TEST_DIRNAME/../check-terraform.sh"
   cd "$BATS_TEST_TMPDIR" || return
   git init -q
-  mkdir -p bin
+  mkdir -p bin hosting/paperclip-hermes/tools
+  cp "$BATS_TEST_DIRNAME/../../hosting/paperclip-hermes/tools/check-mock-plans.py" hosting/paperclip-hermes/tools/
   export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
   export CALLS="$BATS_TEST_TMPDIR/calls"
   cat > bin/terraform <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "$CALLS"
+if [[ "$*" == *'test -json -verbose'* ]]; then
+  echo '{"type":"test_plan","test_plan":{"resource_changes":[]}}'
+  echo '{"type":"test_summary","@message":"Success! Mock test fixture."}'
+fi
 if [[ "$*" == *'providers lock'* && "${DRIFT:-}" == yes ]]; then
   echo 'new platform hash' >> hosting/paperclip-hermes/terraform/stacks/host/.terraform.lock.hcl
 fi

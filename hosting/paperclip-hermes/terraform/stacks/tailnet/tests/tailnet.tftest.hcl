@@ -1,0 +1,1 @@
+../../../tests/tailnet.tftest.hcl
