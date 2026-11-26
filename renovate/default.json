@@ -6,7 +6,8 @@
     "dockerfile",
     "terraform",
     "github-actions",
-    "custom.regex"
+    "custom.regex",
+    "npm"
   ],
   "semanticCommits": "enabled",
   "semanticCommitScope": "deps",
@@ -14,21 +15,6 @@
   "pinDigests": true,
   "rangeStrategy": "replace",
   "prHourlyLimit": 2,
-  "docker-compose": {
-    "managerFilePatterns": [
-      "/^hosting/paperclip-hermes/kit/(?:.*\\/)?(?:docker-)?compose[^/]*\\.ya?ml$/"
-    ]
-  },
-  "dockerfile": {
-    "managerFilePatterns": [
-      "/^hosting/paperclip-hermes/kit/(?:.*\\/)?Dockerfile[^/]*$/"
-    ]
-  },
-  "terraform": {
-    "managerFilePatterns": [
-      "/^hosting/paperclip-hermes/terraform/.*\\.tf$/"
-    ]
-  },
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": [
@@ -126,6 +112,15 @@
       ],
       "addLabels": [
         "agent-merge"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest",
+        "patch",
+        "minor"
+      ],
+      "matchPackageNames": [
+        "!googleapis/release-please-action"
       ]
     },
     {
@@ -211,6 +206,93 @@
       "addLabels": [
         "agent-merge"
       ]
+    },
+    {
+      "description": "Major Actions updates require the operator.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "addLabels": [
+        "needs-operator"
+      ]
+    },
+    {
+      "description": "Only the kit image sources belong to the image policy.",
+      "matchManagers": [
+        "docker-compose",
+        "dockerfile"
+      ],
+      "matchFileNames": [
+        "!hosting/paperclip-hermes/kit/**"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Only the deployment Terraform tree belongs to the provider policy.",
+      "matchManagers": [
+        "terraform"
+      ],
+      "matchFileNames": [
+        "!hosting/paperclip-hermes/terraform/**"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "npm"
+      ],
+      "semanticCommitType": "chore"
+    },
+    {
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "!{package.json,package-lock.json}"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Review validator and release tooling together, including the release action.",
+      "matchPackageNames": [
+        "renovate",
+        "release-please",
+        "nock",
+        "googleapis/release-please-action"
+      ],
+      "matchManagers": [
+        "npm",
+        "github-actions"
+      ],
+      "groupName": "Renovate validators and release tooling",
+      "groupSlug": "validator-release-tooling",
+      "separateMajorMinor": false,
+      "addLabels": [
+        "needs-operator"
+      ],
+      "semanticCommitType": "chore",
+      "prBodyNotes": [
+        "Verify the release-please library and release action together; grouping does not guarantee identical bundled library versions."
+      ]
+    },
+    {
+      "description": "Provider majors may exceed reusable-module bounds; update those bounds in the same PR.",
+      "matchManagers": [
+        "terraform"
+      ],
+      "matchDepTypes": [
+        "required_provider",
+        "provider"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "prBodyNotes": [
+        "Raise reusable-module provider compatibility bounds in this PR if the new major exceeds them; regenerate stack locks."
+      ]
     }
   ],
   "customDatasources": {
@@ -226,5 +308,9 @@
         "{\"releases\": $reduce($, function($acc, $v) { $append($acc, $map($v.metadata.container.tags, function($tag) { {\"version\": $tag, \"digest\": $v.name, \"releaseTimestamp\": $v.created_at} })) }, []), \"sourceUrl\": \"https://github.com/paperclipai/paperclip\"}"
       ]
     }
-  }
+  },
+  "schedule": [
+    "* 0-5 * * 1"
+  ],
+  "timezone": "Etc/UTC"
 }

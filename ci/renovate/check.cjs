@@ -21,7 +21,7 @@ function cliRun(dir, name, preset) {
   // Promote only the final branch plans; full trace logs repeat the entire Terraform tree.
   const log = path.join(temporary, `${name}.jsonl`);
   const network = path.join(temporary, `${name}-network.json`);
-  write(dir, 'renovate.json', JSON.stringify({extends:[`http://preset.test/${preset}.json`],
+  write(dir, 'renovate.json', JSON.stringify({extends:[`github>agenticcodingops/software-factory//renovate/${preset}.json#v1.2.3`],
     logLevelRemap:[{matchMessage:'/^branches$/',newLogLevel:'debug'}]}));
   run('git', ['init','-q'], dir);
   run('git', ['add','.'], dir);
@@ -53,7 +53,7 @@ function assertPublic(events, scenario) {
   assert.ok(plans.length > 0);
   assert.ok(plans.every(b => b.automerge === false), 'agents, not Renovate, perform merges');
   assert.ok(deps.every(d => !(d.warnings || []).length), 'dependency lookup warning');
-  const paper = deps.find(d => d.depName === 'ghcr.io/paperclipai/paperclip');
+  const paper = deps.find(d => d.depName === 'ghcr.io/paperclipai/paperclip' && d.packageFile.startsWith('hosting/'));
   const prefix = scenario === 'prefixed' ? 'v' : '';
   const update = paper.updates.find(u => u.newValue === `${prefix}2026.1124.0`);
   assert.ok(update, 'Paperclip CalVer update must be proposed');
@@ -61,10 +61,10 @@ function assertPublic(events, scenario) {
   assert.equal(Boolean(update.pendingChecks), ['young','missing'].includes(scenario));
   assert.ok(paper.updates.every(u => !/nightly|cloud|beta/.test(u.newValue)));
   if (scenario === 'mature') {
-    const hermes = deps.find(d => d.depName === 'nousresearch/hermes-agent');
+    const hermes = deps.find(d => d.depName === 'nousresearch/hermes-agent' && d.packageFile.startsWith('hosting/'));
     assert.ok(hermes.updates.some(u => u.newValue === 'v0.23.5'));
     assert.ok(hermes.updates.every(u => !/2026|canary|rc|desktop/.test(u.newValue)));
-    const postgres = deps.find(d => d.depName === 'postgres');
+    const postgres = deps.find(d => d.depName === 'postgres' && d.packageFile.startsWith('hosting/'));
     assert.ok(postgres.updates.length);
     assert.ok(postgres.updates.every(u => /^17(?:\.|$)/.test(u.newValue)));
     const imagePlans = plans.filter(b => ['docker-compose','dockerfile'].includes(b.manager));
@@ -92,6 +92,32 @@ function assertPublic(events, scenario) {
     assert.equal(runtime.upgrades.length,4, 'customManager plus three exact stack requirements');
     assert.ok(runtime.upgrades.some(u => u.manager === 'regex' && u.packageFile === '.terraform-version'));
     assert.ok(runtime.upgrades.every(u => u.newVersion === '1.17.3'));
+    const outside = deps.filter(d => d.packageFile.startsWith('docs/example/'));
+    assert.ok(outside.some(d => d.manager === 'docker-compose'));
+    assert.ok(outside.some(d => d.manager === 'dockerfile'));
+    assert.ok(outside.some(d => d.manager === 'terraform'));
+    assert.ok(outside.some(d => d.manager === 'npm'));
+    assert.ok(outside.every(d => d.updates.length === 0));
+    assert.ok(outside.filter(d => d.currentValue).every(d => d.skipReason === 'disabled'));
+    assert.ok(plans.every(b => b.upgrades.every(u => !u.packageFile.startsWith('docs/example/'))));
+    const tailscale = plans.find(b => b.depName === 'tailscale' && b.updateType === 'minor');
+    assert.ok(tailscale.addLabels.includes('needs-operator'));
+    assert.ok(!tailscale.addLabels.includes('agent-merge'));
+    const range = deps.find(d => d.depName === 'tailscale' && d.packageFile.includes('/modules/'));
+    const {api: versioning} = require('renovate/dist/modules/versioning/hashicorp/index.js');
+    assert.ok(versioning.matches(tailscale.upgrades[0].newVersion, range.currentValue));
+    const tooling = plans.find(b => b.groupSlug === 'validator-release-tooling');
+    assert.ok(tooling, 'validator and release action updates must be proposed');
+    for (const name of ['renovate', 'nock', 'release-please', 'googleapis/release-please-action']) {
+      assert.ok(tooling.upgrades.some(u => u.depName === name), `${name} must share the tooling group`);
+    }
+    assert.ok(tooling.addLabels.includes('needs-operator'));
+    assert.ok(!tooling.addLabels.includes('agent-merge'));
+    assert.match(tooling.commitMessage, /^chore\(deps\): /);
+    for (const b of plans.filter(b => !b.isLockFileMaintenance && b.upgrades.some(u => ['docker-compose', 'dockerfile', 'terraform', 'regex'].includes(u.manager)))) {
+      assert.deepEqual(b.schedule, ['* 0-5 * * 1']);
+    }
+    console.log('PASS file scope, weekly schedule, compatible Tailscale minor and grouped validator/release tooling updates');
     const digest = imagePlans.find(b => b.depName === 'postgres' && b.updateType === 'digest');
     fs.writeFileSync(path.join(temporary,'digest-branch.json'), JSON.stringify(digest));
     console.log('PASS Paperclip CalVer + digest after 3 days; Hermes v2026.9.24/canary/rc/desktop rejected');
@@ -104,7 +130,10 @@ function assertPublic(events, scenario) {
 }
 function assertInstance(events) {
   const deps = extracted(events);
-  const workflows = deps.filter(d => d.depType === 'workflow');
+  const native = deps.filter(d => d.manager === 'github-actions' && d.packageName === 'agenticcodingops/software-factory');
+  assert.equal(native.length, 14);
+  assert.ok(native.every(d => d.skipReason === 'disabled' && d.updates.length === 0));
+  const workflows = deps.filter(d => d.manager === 'regex' && d.depType === 'workflow');
   assert.equal(workflows.length,14);
   const prod = workflows.filter(d => d.updates.length);
   assert.equal(prod.length,6);
@@ -114,17 +143,34 @@ function assertInstance(events) {
   assert.ok(ops.every(d => d.skipReason === 'disabled' && d.updates.length === 0));
   const plans = branches(events);
   const grouped = plans.filter(b => b.groupName === 'software-factory production workflows');
-  assert.equal(grouped.length,1);
-  assert.equal(grouped[0].upgrades.length,6);
-  assert.ok(grouped[0].upgrades.every(u => u.newDigest === 'b'.repeat(40) && u.newValue === 'v0.2.0'));
-  assert.match(grouped[0].commitMessage,/^chore\(deps\): /);
-  const action = plans.find(b => b.depName === 'actions/checkout');
+  assert.equal(grouped.length,2);
+  const major = grouped.find(b => b.updateType === 'major');
+  assert.ok(major.addLabels.includes('needs-operator'));
+  assert.ok(!major.addLabels.includes('agent-merge'));
+  assert.ok(major.upgrades.every(u => u.newValue === 'v1.0.0'));
+  const minor = grouped.find(b => b.updateType === 'minor');
+  assert.ok(minor.addLabels.includes('agent-merge'));
+  assert.ok(!minor.addLabels.includes('needs-operator'));
+  assert.equal(minor.upgrades.length,6);
+  assert.ok(minor.upgrades.every(u => u.newDigest === 'b'.repeat(40) && u.newValue === 'v0.2.0'));
+  assert.match(minor.commitMessage,/^chore\(deps\): /);
+  const action = plans.find(b => b.depName === 'actions/checkout' && b.updateType === 'patch');
   assert.ok(action.addLabels.includes('agent-merge'));
   assert.equal(action.newDigest,'b'.repeat(40));
-  console.log('PASS production workflow SHAs: one group, six callers; eight per-target ops callers excluded');
+  const actionMajor = plans.find(b => b.depName === 'actions/checkout' && b.updateType === 'major');
+  assert.ok(actionMajor.addLabels.includes('needs-operator'));
+  assert.ok(!actionMajor.addLabels.includes('agent-merge'));
+  console.log('PASS Actions and instance workflow majors require operator; patch/minor allow agent merge');
+  console.log('PASS production workflow SHAs: six callers per update stream; eight per-target ops callers excluded');
   console.log('PASS SHA-pinned GitHub Actions remain chore(deps), agent-merge');
 }
 try {
+  const defaults = JSON.parse(fs.readFileSync(path.join(root, 'renovate/default.json')));
+  const {cronMatches} = require('renovate/dist/workers/repository/update/branch/schedule.js');
+  const {DateTime} = require('luxon');
+  for (const [time, expected] of [['2026-11-23T05:59:00Z', true], ['2026-11-23T06:00:00Z', false], ['2026-11-24T02:00:00Z', false]]) {
+    assert.equal(defaults.schedule.some(cron => cronMatches(cron, DateTime.fromISO(time), defaults.timezone)), expected, `weekly schedule at ${time}`);
+  }
   for (const scenario of ['mature', 'young', 'missing', 'prefixed']) {
     const dir = path.join(temporary,scenario); fs.mkdirSync(dir);
     for (const file of ['hosting/paperclip-hermes/kit/compose.yaml','hosting/paperclip-hermes/kit/Dockerfile.hermes','.terraform-version']) {
@@ -135,6 +181,17 @@ try {
     fs.cpSync(path.join(root,'hosting/paperclip-hermes/terraform'),path.join(dir,'hosting/paperclip-hermes/terraform'), {
       recursive:true, filter: p => !p.split(path.sep).includes('.terraform'),
     });
+    if (scenario === 'mature') {
+      for (const [file, source] of Object.entries({
+        'docs/example/compose.yaml': 'hosting/paperclip-hermes/kit/compose.yaml',
+        'docs/example/Dockerfile.hermes': 'hosting/paperclip-hermes/kit/Dockerfile.hermes',
+        'docs/example/versions.tf': 'hosting/paperclip-hermes/terraform/stacks/tailnet/versions.tf',
+        'package.json': 'package.json',
+        'package-lock.json': 'package-lock.json',
+        'docs/example/package.json': 'package.json',
+        '.github/workflows/release.yml': '.github/workflows/release.yml',
+      })) write(dir, file, fs.readFileSync(path.join(root, source), 'utf8'));
+    }
     const events = cliRun(dir,scenario,'default');
     assertPublic(events, scenario);
   }

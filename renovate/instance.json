@@ -2,7 +2,7 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": "Instance workflow callers: only production-plane release refs are proposed by Renovate.",
   "extends": [
-    "github>agenticcodingops/software-factory//renovate/default.json"
+    "./default"
   ],
   "enabledManagers": [
     "github-actions",
@@ -10,7 +10,7 @@
   ],
   "packageRules": [
     {
-      "description": "Renovate 42 calls reusable workflows actions; the workflow customManager owns factory refs.",
+      "description": "The workflow customManager owns canonical factory SHA/comment refs; disable native duplicates.",
       "matchManagers": [
         "github-actions"
       ],
@@ -48,9 +48,6 @@
       "groupSlug": "software-factory-production",
       "pinDigests": true,
       "semanticCommitType": "chore",
-      "addLabels": [
-        "agent-merge"
-      ],
       "commitMessageTopic": "software-factory production workflows"
     },
     {
@@ -66,6 +63,43 @@
         ".github/workflows/ph-backup-verify*.yml"
       ],
       "enabled": false
+    },
+    {
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepTypes": [
+        "workflow"
+      ],
+      "matchPackageNames": [
+        "agenticcodingops/software-factory"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest",
+        "patch",
+        "minor"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ]
+    },
+    {
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepTypes": [
+        "workflow"
+      ],
+      "matchPackageNames": [
+        "agenticcodingops/software-factory"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "addLabels": [
+        "needs-operator"
+      ]
     }
   ],
   "customManagers": [
