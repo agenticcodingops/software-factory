@@ -1,4 +1,4 @@
-"""The trusted-base notes gate fails closed and labels the current PR head."""
+"""The trusted-default-branch notes gate fails closed and labels the current PR head."""
 
 import copy
 from contextlib import redirect_stdout
@@ -22,24 +22,36 @@ def release(tag="v2026.1124.0", body="Routine fixes."):
 
 
 class FakeAPI:
-    def __init__(self, body="Routine fixes."):
+    def __init__(self, body="Routine fixes.", image="paperclip"):
         self.body = body
+        self.image = image
+        self.files = []
+        self.base_sha = "a" * 40
         self.calls = []
-        self.pr = {"user": {"login": "renovate[bot]"}, "base": {"sha": "a" * 40},
+        self.pr = {"user": {"login": "renovate[bot]"}, "base": {"sha": "d" * 40, "ref": "main"},
                    "head": {"sha": "b" * 40, "repo": {"full_name": "fixture/repo"}}}
 
     def contents(self, repo, sha, path):
         image = next(image for image, (_, _, file) in gate.IMAGES.items() if file == path)
         tag = "2026.1117.0" if sha == "a" * 40 else "2026.1124.0"
         if "Dockerfile" in path:
-            tag = "v0.23.4"
+            tag = "v0.23.4" if sha == self.base_sha or self.image != "hermes" else "v0.23.5"
+        elif self.image != "paperclip":
+            tag = "2026.1117.0"
         return f"{image}:{tag}@sha256:{'c' * 64}"
 
     def releases(self, repo):
-        return [release(body=self.body)]
+        return [release("v0.23.5" if self.image == "hermes" else "v2026.1124.0", self.body)]
+
+    workflow_changes = gate.GitHub.workflow_changes
 
     def request(self, path, payload=None):
         self.calls.append((path, copy.deepcopy(payload)))
+        if "/files?" in path:
+            page = int(path.rsplit("=", 1)[1])
+            return self.files[(page - 1) * 100:page * 100]
+        if "/git/ref/heads/" in path:
+            return {"object": {"sha": self.base_sha}}
         return copy.deepcopy(self.pr) if "/pulls/" in path else {}
 
 
@@ -62,10 +74,10 @@ class NotesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             gate.notes_findings("v0.23.4", "v2026.9.24", [], r"v0\.\d+\.\d+")
 
-    def invoke(self, api):
+    def invoke(self, api, base="main"):
         with tempfile.TemporaryDirectory() as temp:
             event = Path(temp) / "event.json"
-            event.write_text(json.dumps({"number": 7}))
+            event.write_text(json.dumps({"number": 7, "repository": {"default_branch": "main"}, "pull_request": {"base": {"ref": base}}}))
             with patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event), "GITHUB_REPOSITORY": "fixture/repo", "GH_TOKEN": "fixture"}), patch.object(gate, "GitHub", return_value=api), redirect_stdout(StringIO()):
                 return gate.main()
 
@@ -93,7 +105,78 @@ class NotesTests(unittest.TestCase):
         api = FakeAPI()
         before = api.contents
         with patch.object(api, "contents", side_effect=lambda repo, sha, file: before(repo, "a" * 40, file)), patch.object(api, "releases", side_effect=AssertionError("digest must not need notes")):
-            self.assertEqual(gate.evaluate(api, "fixture/repo", api.pr), [])
+            self.assertEqual(gate.evaluate(api, "fixture/repo", api.pr, api.base_sha), [])
+
+    def test_any_author_and_both_images_are_checked_against_current_main(self):
+        for author in ("renovate[bot]", "agent", "operator"):
+            for image in ("paperclip", "hermes"):
+                with self.subTest(author=author, image=image):
+                    api = FakeAPI("migration", image)
+                    api.pr["user"]["login"] = author
+                    with patch.object(api, "contents", wraps=api.contents) as contents:
+                        self.assertEqual(self.invoke(api), 1)
+                    before = [call.args[1] for call in contents.call_args_list[::2]]
+                    self.assertEqual(before, [api.base_sha] * 2)
+                    self.assertNotIn(api.pr["base"]["sha"], before)
+
+    def test_nondefault_target_posts_nothing(self):
+        api = FakeAPI()
+        self.assertEqual(self.invoke(api, base="side"), 0)
+        self.assertEqual(api.calls, [])
+        api.pr["base"]["ref"] = "side"
+        self.assertEqual(self.invoke(api), 0)
+        self.assertTrue(all(payload is None for _, payload in api.calls))
+
+    def test_workflow_changes_fail_including_deletions_and_renames(self):
+        for file in ({"filename": ".github/workflows/forged.yml", "status": "added"},
+                     {"filename": ".github/workflows/old.yml", "status": "removed"},
+                     {"filename": "docs/old.yml", "previous_filename": ".github/workflows/old.yml"}):
+            api = FakeAPI()
+            api.files = [{"filename": f"docs/{i}.md"} for i in range(100)] + [file]
+            self.assertEqual(self.invoke(api), 1)
+            self.assertEqual(api.calls[-1][1]["state"], "failure")
+
+    def test_truncated_diff_fails_closed(self):
+        api = FakeAPI()
+        api.files = [{"filename": "docs/file.md"}] * 3000
+        self.assertEqual(self.invoke(api), 1)
+        self.assertEqual(api.calls[-1][1]["state"], "failure")
+
+    def test_main_change_fails_closed(self):
+        api = FakeAPI()
+        request = api.request
+
+        def changed(path, payload=None):
+            result = request(path, payload)
+            if "/git/ref/heads/" in path and sum("/git/ref/heads/" in p for p, _ in api.calls) == 2:
+                result["object"]["sha"] = "e" * 40
+            return result
+
+        with patch.object(api, "request", side_effect=changed):
+            self.assertEqual(self.invoke(api), 1)
+        self.assertEqual(api.calls[-1][1]["state"], "failure")
+
+    def test_retarget_during_run_posts_no_result(self):
+        api = FakeAPI()
+        request = api.request
+
+        def changed(path, payload=None):
+            result = request(path, payload)
+            if path.endswith("/pulls/7") and sum(p.endswith("/pulls/7") for p, _ in api.calls) == 2:
+                result["base"]["ref"] = "side"
+            return result
+
+        with patch.object(api, "request", side_effect=changed):
+            self.assertEqual(self.invoke(api), 0)
+        self.assertEqual([p["state"] for _, p in api.calls if p and "state" in p], ["pending"])
+
+    def test_workflow_uses_default_branch_code_only(self):
+        import yaml
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[2] / ".github/workflows/release-notes-gate.yml").read_text())
+        self.assertEqual(workflow[True]["pull_request_target"]["branches"], ["main"])
+        checkout = workflow["jobs"]["notes"]["steps"][0]
+        self.assertEqual(checkout["with"]["ref"], "${{ github.sha }}")
+        self.assertFalse(checkout["with"]["persist-credentials"])
 
     def test_pagination_checks_intermediate_page(self):
         api = gate.GitHub("fixture")
@@ -108,7 +191,7 @@ class NotesTests(unittest.TestCase):
 
         def changed(path, payload=None):
             result = request(path, payload)
-            if sum("/pulls/" in p for p, _ in api.calls) == 2:
+            if path.endswith("/pulls/7") and sum(p.endswith("/pulls/7") for p, _ in api.calls) == 2:
                 result["head"]["sha"] = "c" * 40
             return result
 
