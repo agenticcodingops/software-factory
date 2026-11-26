@@ -3,7 +3,7 @@ name: paperclip-hermes
 x-runtime: &runtime
   restart: unless-stopped
   security_opt: [no-new-privileges:true]
-  cap_drop: [NET_RAW]
+  cap_drop: [ALL]
   logging:
     driver: local
     options:
@@ -12,12 +12,15 @@ x-runtime: &runtime
 
 services:
   postgres:
+    profiles: [paperclip]
     <<: *runtime
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     image: postgres:17@sha256:87c8b42f423b45d5247e6aa8fdb2e7762fec164c68a50fe3eb07e7bfcaf4dbcf
     environment:
       POSTGRES_USER: paperclip
       POSTGRES_DB: paperclip
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
     volumes:
       - postgres:/var/lib/postgresql/data
     networks: [database]
@@ -28,7 +31,9 @@ services:
       retries: 30
 
   paperclip:
+    profiles: [paperclip]
     <<: *runtime
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, KILL]
     image: ghcr.io/paperclipai/paperclip:2026.1117.0@sha256:bdf38d10544dc6c831e16dc027f23ad586353ef3be1a1b2c6979e63b956aceb1
     entrypoint: [/usr/bin/tini, -s, --, /bin/sh, /kit/paperclip-entrypoint.sh]
     command: [node, server/dist-runtime/index.mjs]
@@ -36,7 +41,6 @@ services:
     stop_grace_period: 90s
     ports: ["127.0.0.1:3100:3100"]
     environment:
-      DATABASE_URL: postgres://paperclip:${POSTGRES_PASSWORD:-}@postgres:5432/paperclip
       PAPERCLIP_HOME: /paperclip
       PAPERCLIP_INSTANCE_ID: default
       PAPERCLIP_BIND: custom
@@ -51,13 +55,9 @@ services:
       PAPERCLIP_AUTH_BASE_URL_MODE: explicit
       PAPERCLIP_AUTH_PUBLIC_BASE_URL: https://${TAILSCALE_HOSTNAME:-pilot.tailnet.example}
       PAPERCLIP_ALLOWED_HOSTNAMES: ${TAILSCALE_HOSTNAME:-pilot.tailnet.example}
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-}
-      PAPERCLIP_AGENT_JWT_SECRET: ${PAPERCLIP_AGENT_JWT_SECRET:-}
-      PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: ${PAPERCLIP_TOOL_ACTION_SIGNING_SECRET:-}
-      PAPERCLIP_SECRETS_MASTER_KEY: ${PAPERCLIP_SECRETS_MASTER_KEY:-}
       NODE_EXTRA_CA_CERTS: /caddy-ca/root.crt
       FIXTURE_REPOSITORY: ${FIXTURE_REPOSITORY:-owner/fixture-repository}
-    secrets: [fixture_github_token]
+    secrets: [fixture_github_token, postgres_password, better_auth_secret, paperclip_agent_jwt_secret, paperclip_tool_action_signing_secret, paperclip_secrets_master_key]
     tmpfs: [/run/kit:mode=0755]
     volumes:
       - paperclip:/paperclip
@@ -81,7 +81,10 @@ services:
       start_period: 30s
 
   hermes:
+    image: software-factory-hermes:${KIT_IMAGE_TAG:-local}
+    profiles: [hermes]
     <<: *runtime
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, KILL]
     build:
       context: .
       dockerfile: Dockerfile.hermes
@@ -97,16 +100,12 @@ services:
       API_SERVER_ENABLED: "true"
       API_SERVER_HOST: 0.0.0.0
       API_SERVER_PORT: "8642"
-      API_SERVER_KEY: ${HERMES_GATEWAY_KEY:-}
       HERMES_DASHBOARD: "1"
       HERMES_DASHBOARD_HOST: 0.0.0.0
       HERMES_DASHBOARD_PORT: "9119"
       HERMES_DASHBOARD_PUBLIC_URL: https://${TAILSCALE_HOSTNAME:-pilot.tailnet.example}:9443
       HERMES_DASHBOARD_BASIC_AUTH_USERNAME: operator
-      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:-}
-      HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${HERMES_DASHBOARD_BASIC_AUTH_SECRET:-}
       HERMES_MODEL: ${HERMES_MODEL:-gpt-5-mini}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       DASHBOARD_GATEWAY: ${DASHBOARD_GATEWAY:-172.30.99.1}
       TERMINAL_ENV: ssh
       TERMINAL_SSH_HOST: sandbox
@@ -116,7 +115,7 @@ services:
       FIXTURE_REPOSITORY: ${FIXTURE_REPOSITORY:-owner/fixture-repository}
       # Set by restore: configure-hermes.py switches every messaging platform off.
       KIT_MESSAGING_OFF: ${KIT_MESSAGING_OFF:-}
-    secrets: [fixture_github_token, sandbox_ssh_key]
+    secrets: [fixture_github_token, sandbox_ssh_key, hermes_gateway_key, hermes_dashboard_basic_auth_password, hermes_dashboard_basic_auth_secret, openai_api_key]
     tmpfs: [/run/kit:mode=0755]
     volumes:
       - hermes:/opt/data
@@ -144,7 +143,10 @@ services:
   # An SSH execution sandbox, deliberately without the Hermes home, provider
   # environment, host directories or Docker socket. Only fixture Git access.
   sandbox:
+    image: software-factory-sandbox:${KIT_IMAGE_TAG:-local}
+    profiles: [hermes]
     <<: *runtime
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SYS_CHROOT]
     build:
       context: .
       dockerfile: Dockerfile.hermes
@@ -171,15 +173,21 @@ services:
 
   caddy:
     <<: *runtime
+    cap_add: [NET_BIND_SERVICE]
     image: caddy:2-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
     entrypoint: [/bin/sh, /kit/caddy-entrypoint.sh]
+    environment:
+      TAILSCALE_HOSTNAME: ${TAILSCALE_HOSTNAME:-pilot.tailnet.example}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./container:/kit:ro
       - caddy_data:/data
       - caddy_config:/config
       - public_ca:/public-ca
-    networks: [tls, gateway]
+    networks:
+      tls:
+        aliases: [paperclip.caddy]
+      gateway: {}
     healthcheck:
       test: [CMD-SHELL, "test -s /public-ca/root.crt && wget -q -O /dev/null http://127.0.0.1:2019/config/"]
       interval: 5s
@@ -190,6 +198,15 @@ secrets:
   fixture_github_token: {file: ./.secrets/github-token}
   sandbox_ssh_key: {file: ./.secrets/sandbox_ed25519}
   sandbox_ssh_public_key: {file: ./.secrets/sandbox_ed25519.pub}
+  postgres_password: {file: ./.secrets/postgres-password}
+  better_auth_secret: {file: ./.secrets/better-auth-secret}
+  paperclip_agent_jwt_secret: {file: ./.secrets/paperclip-agent-jwt-secret}
+  paperclip_tool_action_signing_secret: {file: ./.secrets/paperclip-tool-action-signing-secret}
+  paperclip_secrets_master_key: {file: ./.secrets/paperclip-secrets-master-key}
+  hermes_gateway_key: {file: ./.secrets/hermes-gateway-key}
+  hermes_dashboard_basic_auth_password: {file: ./.secrets/hermes-dashboard-basic-auth-password}
+  hermes_dashboard_basic_auth_secret: {file: ./.secrets/hermes-dashboard-basic-auth-secret}
+  openai_api_key: {file: ./.secrets/openai-api-key}
 
 networks:
   database: {internal: true}

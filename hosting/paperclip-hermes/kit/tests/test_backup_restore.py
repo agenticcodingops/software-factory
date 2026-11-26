@@ -3,6 +3,7 @@
 Run: python3 -B -m unittest discover -s tests
 All credential-like fixture values are generated at test time.
 """
+from datetime import datetime, timezone, timedelta
 import argparse
 import contextlib
 import http.client
@@ -21,6 +22,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 import urllib.error
+import urllib.parse
 
 spec = importlib.util.spec_from_file_location('recovery', Path(__file__).parents[1] / 'backup-restore.py')
 recovery = importlib.util.module_from_spec(spec)
@@ -32,10 +34,15 @@ def public_key():
 
 
 def signed_url(**changes):
-    query = {'sv': '2023-11-03', 'sr': 'c', 'si': 'nightly', 'spr': 'https',
-             'sig': secrets.token_hex(32)}
+    query = {'sv': '2023-11-03', 'sr': 'c', 'sp': 'cw', 'spr': 'https',
+             'skoid': str(__import__('uuid').uuid4()), 'sktid': str(__import__('uuid').uuid4()),
+             'skt': (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+             'ske': (datetime.now(timezone.utc) + timedelta(days=6)).isoformat(),
+             'se': (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(),
+             'sks': 'b', 'skv': '2023-11-03',
+             'sig': __import__('base64').b64encode(secrets.token_bytes(32)).decode()}
     query.update(changes)
-    return 'https://storage.example.test/recovery?' + '&'.join(key + '=' + value for key, value in query.items())
+    return 'https://storage.example.test/recovery?' + urllib.parse.urlencode(query)
 
 
 class ArgumentTests(unittest.TestCase):
@@ -64,15 +71,15 @@ class ArgumentTests(unittest.TestCase):
 
 
 class SasTests(unittest.TestCase):
-    def test_policy_sas_and_explicit_cw_use_unique_blob_path(self):
-        for extra in ({}, {'sp': 'cw'}):
+    def test_delegation_sas_cw_uses_unique_blob_path(self):
+        for extra in ({'sp': 'cw'},):
             container = recovery.sas_url(signed_url(**extra))
             result = recovery.blob_url(container, 'unique.tar.age')
             self.assertIn('/recovery/unique.tar.age?', result)
             self.assertEqual(result.split('?', 1)[1], container.query)
 
     def test_rejects_broad_permissions_malformed_or_non_container_urls(self):
-        bad = [signed_url(sp='r'), signed_url(sp='rcwl'), signed_url(sp=''), signed_url(si=''),
+        bad = [signed_url(sp='c'), signed_url(sp='r'), signed_url(sp='rcwl'), signed_url(sp=''), signed_url(si=''),
                signed_url(sr='b'), signed_url(spr='https,http'), signed_url().replace('https:', 'http:'),
                signed_url().replace('/recovery?', '/recovery/blob?'), signed_url() + '&sp=cw&sp=cw',
                signed_url().replace('storage.example.test', 'user:password@storage.example.test')]
@@ -462,7 +469,8 @@ class BundleTests(unittest.TestCase):
         # manifest must fail in unpack_bundle, before anything is created.
         changes = [('completed_at', None), ('completed_at', 7), ('started_at', None),
                    ('completed_at', '2026-11-26T00:15:00+00:00\x1b]0;x\x07'),
-                   ('completed_at', 'yesterday'), ('paperclip_schema', ['applied']),
+                   ('completed_at', 'yesterday'), ('completed_at', '2026-99-01T00:00:00+00:00'),
+                   ('completed_at', '2000-01-01T00:00:00+00:00'), ('paperclip_schema', ['applied']),
                    ('files', ['database.dump']), ('images', None)]
         for key, value in changes:
             with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as directory:
@@ -519,7 +527,7 @@ class BackupFailureTests(unittest.TestCase):
                 injected.append(message)
                 raise recovery.RecoveryError(message)
             def compose(*args, **kwargs):
-                if args[0] == 'start':
+                if args[0] == 'up' and '--no-recreate' in args:
                     staged_at_restart.extend(path for path in work.rglob('*') if path.is_file())
                 if args[:3] == ('ps', '--services', '--status'):
                     return '\n'.join(('postgres', *recovery.SERVICES))
@@ -591,11 +599,11 @@ class BackupFailureTests(unittest.TestCase):
                     self.assertIn('hermes.zip', staged_at_removal[0])
                 calls = fake.mock_calls
                 self.assertLess(calls.index(unittest.mock.call.remove_containers(True)),
-                                calls.index(unittest.mock.call('start', '--wait', '--wait-timeout', '300',
+                                calls.index(unittest.mock.call('up', '-d', '--no-recreate', '--no-build', '--pull', 'never', '--no-deps', '--wait', '--wait-timeout', '300',
                                                                *recovery.SERVICES)))
             self.assertEqual(list(work.iterdir()), [])
             self.assertEqual(list(upload.iterdir()), [])
-            self.assertIn(unittest.mock.call('start', '--wait', '--wait-timeout', '300', *recovery.SERVICES), fake.call_args_list)
+            self.assertIn(unittest.mock.call('up', '-d', '--no-recreate', '--no-build', '--pull', 'never', '--no-deps', '--wait', '--wait-timeout', '300', *recovery.SERVICES), fake.call_args_list)
             if failure in ('dump', 'tar', 'hermes'):
                 # Plaintext is deleted before waiting on the service restart.
                 self.assertEqual(staged_at_restart, [])
@@ -760,7 +768,7 @@ class ReportFailureTests(unittest.TestCase):
              patch.object(recovery.os, 'O_NOFOLLOW', 0, create=True), \
              patch.object(recovery.os, 'O_CLOEXEC', 0, create=True):
             lines = recovery.report_failure(self.caught(job))
-        self.assertEqual(lines, ['Another backup or restore is running'])
+        self.assertEqual(lines, ['Another host operation is running'])
 
     def test_an_existing_nonempty_restore_target_is_one_line(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -781,9 +789,10 @@ class ReportFailureTests(unittest.TestCase):
 
 class RestoreFlowTests(unittest.TestCase):
     RECORD = {'completed_at': '2026-11-26T00:15:02.123456+00:00', 'kit_commit': 'unknown',
+              'images': {s: {} for s in ('postgres', *recovery.SERVICES)},
               'image_pins': ['fixture-pin'], 'paperclip_schema': {'applied': [{'id': 1}]}}
 
-    def restore(self, fail_at=None, purge_error=False, import_error=None):
+    def restore(self, fail_at=None, purge_error=False, import_error=None, completion_error=False):
         # Drive restore() with Docker, age and the kit checks stubbed; fail_at
         # names the Compose command that fails, import_error the error the
         # Hermes import raises. Returns what cleanup saw.
@@ -810,6 +819,8 @@ class RestoreFlowTests(unittest.TestCase):
                 raise recovery.RecoveryError(fail_at + ' failed')
             return ''
         compose = MagicMock(side_effect=compose_call)
+        compose.kit, compose.name = target, 'fixture'
+        compose.services.return_value = ['postgres', *recovery.SERVICES]
         compose.mount.return_value = volume
         events = seen['events'] = []
         compose.hermes.side_effect = import_error
@@ -823,7 +834,13 @@ class RestoreFlowTests(unittest.TestCase):
             purge(stage, keep)
             raise OSError('purge failed')
         args = SimpleNamespace(fenced=True, identity=root / 'identity', archive=root / 'backup.age',
-                               target=target, project='fixture', hostname=None, work_dir=work)
+                               target=target, project='fixture', hostname=None, work_dir=work,
+                               command='restore', _track_service_operation=completion_error)
+        atomic_json = recovery.atomic_json
+        def write_journal(path, record):
+            if completion_error and path.name == 'service-op.json' and record['phase'] == 'complete':
+                raise OSError('completion write failed')
+            return atomic_json(path, record)
         output = io.StringIO()
         with patch.object(recovery, 'private_file'), patch.object(recovery, 'run', side_effect=run), \
              patch.object(recovery, 'restore_target', return_value=target), \
@@ -839,6 +856,8 @@ class RestoreFlowTests(unittest.TestCase):
              patch.object(recovery, 'purge', side_effect=failing_purge if purge_error else purge), \
              patch.object(recovery.os, 'chown', create=True), \
              patch.object(recovery.signal, 'signal'), \
+             patch.object(recovery, 'STATE_DIR', root / 'state'), \
+             patch.object(recovery, 'atomic_json', side_effect=write_journal), \
              contextlib.redirect_stdout(output):
             try:
                 recovery.restore(args)
@@ -849,6 +868,7 @@ class RestoreFlowTests(unittest.TestCase):
                     volume=volume,
                     target=sorted(path.name for path in target.iterdir()), work=list(work.iterdir()))
         seen['settings'] = (target / '.secrets/compose.env').read_text() if seen['target'] else None
+        seen['journal'] = json.loads((root / 'state/service-op.json').read_text()) if completion_error else None
         return seen
 
     def test_success_turns_messaging_off_and_prints_the_checked_recovery_point(self):
@@ -862,6 +882,37 @@ class RestoreFlowTests(unittest.TestCase):
         check = [call.args for call in seen['compose'] if '/kit/validate-hermes-config.py' in call.args]
         self.assertEqual(len(check), 1)
         self.assertEqual(check[0][-2:], ('/kit/validate-hermes-config.py', '/kit-config.yaml'))
+
+    def test_hermes_restore_seeds_with_file_secrets_without_service_entrypoint(self):
+        seen = self.restore()
+        self.assertIsNone(seen['error'])
+        seeds = [call.args for call in seen['compose']
+                 if any('/kit/configure-hermes.py' in str(arg) for arg in call.args)]
+        self.assertEqual(len(seeds), 1)
+        self.assertEqual(seeds[0][1:8], ('--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', 'hermes', '-ec'))
+        self.assertEqual(seeds[0][-1], '. /kit/hermes-secrets.sh; exec ' + recovery.PYTHON + ' /kit/configure-hermes.py')
+
+    def test_completion_write_failure_fences_after_successful_startup(self):
+        seen = self.restore(completion_error=True)
+        self.assertEqual(str(seen['error']), 'completion write failed')
+        self.assertIn(('up', '-d', '--wait', '--wait-timeout', '300'),
+                      [call.args for call in seen['compose']])
+        self.assertEqual(seen['abandoned'], 1)
+        self.assertEqual([event[0] for event in seen['events']],
+                         ['remove import undo', 'remove containers', 'abandon', 'remove import undo'])
+        self.assertNotIn('Restore complete', seen['output'])
+        self.assertEqual(seen['work'], [])
+        self.assertEqual(seen['journal']['phase'], 'running')
+
+    def test_failed_database_restore_never_starts_applications(self):
+        seen = self.restore(fail_at='exec')
+        self.assertEqual(str(seen['error']), 'exec failed')
+        starts = [call.args for call in seen['compose'] if call.args[0] == 'up']
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][-1], 'postgres')
+        self.assertIn('--no-deps', starts[0])
+        self.assertEqual(seen['abandoned'], 1)
+        self.assertEqual([event[0] for event in seen['events']], ['remove containers', 'abandon'])
 
     def test_late_failure_keeps_only_the_override_until_the_project_is_down(self):
         seen = self.restore(fail_at='create')
@@ -1064,10 +1115,12 @@ class RootPathTests(unittest.TestCase):
         os.chmod(shared, 0o755)
         link = parent / 'link'
         link.symlink_to(parent / 'elsewhere')
-        with tempfile.TemporaryDirectory() as world:  # under /tmp, mode 1777 parent
-            for target in (nonempty, shared, link, Path(world) / 'restored'):
-                with self.subTest(target=target.name), self.assertRaises(recovery.RecoveryError):
-                    recovery.restore_target(target)
+        world = parent / 'world'
+        world.mkdir(mode=0o700)
+        world.chmod(0o777)
+        for target in (nonempty, shared, link, world / 'restored'):
+            with self.subTest(target=target.name), self.assertRaises(recovery.RecoveryError):
+                recovery.restore_target(target)
         self.assertFalse((parent / 'elsewhere').exists())
 
     def test_lock_is_root_only_and_refuses_links_and_overlap(self):
@@ -1078,8 +1131,8 @@ class RootPathTests(unittest.TestCase):
                 with self.assertRaisesRegex(recovery.RecoveryError, 'Another'):
                     with recovery.locked():
                         pass
-            (parent / 'run/recovery.lock').unlink()
-            (parent / 'run/recovery.lock').symlink_to(parent / 'victim')
+            (parent / 'run/op.lock').unlink()
+            (parent / 'run/op.lock').symlink_to(parent / 'victim')
             with self.assertRaises(OSError):
                 with recovery.locked():
                     pass
@@ -1113,13 +1166,14 @@ class RestoreGuardTests(unittest.TestCase):
             if args[:3] == ['docker', 'container', 'ls']:
                 return 'oneoff-import\nservice-hermes\n'
             return ''
+        compose = recovery.Compose(Path('/kit'), 'fixture')
         with patch.object(recovery, 'run', side_effect=run):
-            recovery.abandon(recovery.Compose(Path('/kit'), 'fixture'))
+            recovery.abandon(compose)
         self.assertEqual(commands[0], ['docker', 'container', 'ls', '--all', '--quiet', '--filter',
                                        'label=com.docker.compose.project=fixture'])
         self.assertEqual(commands[1], ['docker', 'rm', '--force', '--volumes', 'oneoff-import', 'service-hermes'])
         env_file = '.secrets/compose.env'
-        actions = [command[command.index(env_file) + 1] if env_file in command else command[1]
+        actions = [command[command.index(env_file) + 5] if env_file in command else command[1]
                    for command in commands]
         self.assertEqual(actions, ['container', 'rm', 'rm', 'down'])
 
@@ -1136,8 +1190,9 @@ class RestoreGuardTests(unittest.TestCase):
 
 class ComposeTests(unittest.TestCase):
     def test_every_compose_operation_uses_private_env_file(self):
+        compose = recovery.Compose(Path('/kit'), 'fixture')
         with patch.object(recovery, 'run', return_value='') as command:
-            recovery.Compose(Path('/kit'), 'fixture')('ps')
+            compose('ps')
         args = command.call_args.args[0]
         self.assertEqual(args[args.index('--env-file') + 1], '.secrets/compose.env')
         self.assertEqual(args[args.index('--project-name') + 1], 'fixture')
@@ -1152,18 +1207,20 @@ class ComposeTests(unittest.TestCase):
     def test_boot_health_wait_does_not_start_services(self):
         compose = MagicMock(return_value='\n'.join(('postgres', *recovery.SERVICES)))
         compose.container.return_value = 'container'
+        compose.services.return_value = ['postgres', *recovery.SERVICES]
         with patch.object(recovery, 'run', return_value='healthy\n'), patch.object(recovery.time, 'sleep') as sleep:
             self.assertEqual(set(recovery.wait_stack(compose)), {'postgres', *recovery.SERVICES})
         self.assertEqual(compose.call_args_list, [unittest.mock.call('ps', '--services', '--status', 'running')])
         sleep.assert_not_called()
 
     def test_one_off_removal_filters_by_project_and_one_off_label(self):
+        compose = recovery.Compose(Path('/kit'), 'fixture')
         commands = []
         def run(args, **kwargs):
             commands.append(list(args))
             return 'oneoff-backup\n' if args[1] == 'container' else ''
         with patch.object(recovery, 'run', side_effect=run):
-            recovery.Compose(Path('/kit'), 'fixture').remove_containers(one_off_only=True)
+            compose.remove_containers(one_off_only=True)
         self.assertEqual(commands, [
             ['docker', 'container', 'ls', '--all', '--quiet',
              '--filter', 'label=com.docker.compose.project=fixture',
@@ -1171,7 +1228,7 @@ class ComposeTests(unittest.TestCase):
             ['docker', 'rm', '--force', '--volumes', 'oneoff-backup']])
         commands.clear()
         with patch.object(recovery, 'run', return_value='') as command:
-            recovery.Compose(Path('/kit'), 'fixture').remove_containers()
+            compose.remove_containers()
         self.assertEqual(command.call_count, 1)  # nothing to remove: no docker rm
 
     def test_kit_modified_looks_only_at_the_kit(self):
@@ -1185,8 +1242,9 @@ class ComposeTests(unittest.TestCase):
             self.assertTrue(recovery.kit_modified())
 
     def test_hermes_cli_bypasses_s6_and_uses_private_helper(self):
+        compose = recovery.Compose(Path('/kit'), 'fixture')
         with patch.object(recovery, 'run', return_value='') as command:
-            recovery.Compose(Path('/kit'), 'fixture').hermes(Path('/stage'), 'import',
+            compose.hermes(Path('/stage'), 'import',
                 '/recovery/hermes.zip', '--force', '--keep-host', '--messaging-off')
         args = command.call_args.args[0]
         self.assertIn('/kit/recovery-hermes.py', args)
@@ -1197,3 +1255,21 @@ class ComposeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RestoredProvenanceTests(unittest.TestCase):
+    def test_restore_records_trusted_commit_and_detects_local_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = kit_archive(root / 'config.tar')
+            target = root / 'restored'
+            target.mkdir()
+            trusted = recovery.kit_commit()
+            recovery.restore_config(archive, target, 'f' * 40)
+            with patch.object(recovery, 'KIT', target), patch.object(recovery, 'private_stat'):
+                self.assertEqual(recovery.kit_commit(), trusted)
+                self.assertFalse(recovery.kit_modified())
+                (target / 'compose.yaml').write_text('local edit')
+                self.assertEqual(recovery.kit_commit(), 'unknown')
+                self.assertTrue(recovery.kit_modified())
+            self.assertEqual((target / '.kit-provenance.json').stat().st_mode & 0o777, 0o600)

@@ -1,23 +1,16 @@
-// Standalone, minimal example. Replace BOTH placeholders before applying.
-// Grants are additive: retaining an existing allow-all rule defeats isolation.
+// DOCUMENTED FRAGMENT ONLY: the tailnet module renders these entries into
+// the privately imported whole policy after an operator-reviewed hardening PR.
+// Never replace an existing policy with this fragment. Expand aliases and
+// remove/narrow additive allow-all grants before enforcing lint and apply.
+// Both policy tests and sshTests must be rendered for the real operator and
+// representative denied users/tags/hosts; no host may join from a baseline.
 {
-  "tagOwners": {
-    "tag:pcpilot": ["operator@example.com"],
-  },
+  "tagOwners": {"tag:pcpilot": ["tag:pc-deployer"]},
   "grants": [
-    {
-      "src": ["operator@example.com"],
-      "dst": ["tag:pcpilot"],
-      "ip": ["*"],
-    },
+    {"src": ["OPERATOR_LOGIN"], "dst": ["tag:pcpilot"], "ip": ["tcp:22", "tcp:443", "tcp:9443"]},
   ],
-  // No grants originate from tag:pcpilot. Unmatched traffic is denied.
+  // No grants or ACL sources cover tag:pcpilot, including via wildcards.
   "ssh": [
-    {
-      "action": "check",
-      "src": ["operator@example.com"],
-      "dst": ["tag:pcpilot"],
-      "users": ["admin"], // Replace with the host's admin user.
-    },
+    {"action": "check", "src": ["OPERATOR_LOGIN"], "dst": ["tag:pcpilot"], "users": ["admin"]},
   ],
 }

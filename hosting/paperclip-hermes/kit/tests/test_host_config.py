@@ -115,6 +115,15 @@ class InputTests(unittest.TestCase):
     def test_accepts_literal_independent_inputs(self):
         self.validate(self.valid_values())
 
+    def test_accepts_generated_kit_image_tag_and_rejects_other_references(self):
+        values = self.valid_values()
+        values['KIT_IMAGE_TAG'] = 'a' * 64
+        self.validate(values)
+        for value in ('local', '', '../candidate', 'A' * 64):
+            values['KIT_IMAGE_TAG'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(SystemExit, 'KIT_IMAGE_TAG'):
+                self.validate(values)
+
     def test_rejects_reused_or_empty_secret(self):
         for value in ['', self.valid_values()['PAPERCLIP_AGENT_JWT_SECRET']]:
             values = self.valid_values()

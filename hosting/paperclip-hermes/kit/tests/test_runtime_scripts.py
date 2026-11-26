@@ -26,6 +26,28 @@ except ImportError:
 
 
 @unittest.skipUnless(POSIX, 'requires a POSIX shell and python3')
+class HermesSecretTests(unittest.TestCase):
+    def test_shared_loader_exports_file_secrets_for_one_shot_configurator(self):
+        with tempfile.TemporaryDirectory(prefix='secret paths ') as directory:
+            root = Path(directory)
+            mapping = {'API_SERVER_KEY': 'hermes_gateway_key',
+                       **{key: key.lower() for key in ('OPENAI_API_KEY',
+                          'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD', 'HERMES_DASHBOARD_BASIC_AUTH_SECRET')}}
+            for key, filename in mapping.items():
+                (root / filename).write_text('fixture-' + key)
+            loader = root / 'loader.sh'
+            loader.write_text((KIT / 'container/hermes-secrets.sh').read_text().replace('/run/secrets', '$SECRET_ROOT'))
+            command = '. "$1"; exec python3 -c \'import os,json; print(json.dumps(dict(os.environ)))\''
+            env = {'PATH': os.environ['PATH'], 'SECRET_ROOT': str(root)}
+            result = subprocess.run(['sh', '-ec', command, 'configure', str(loader)],
+                                    env=env, text=True, capture_output=True, check=True)
+            exported = json.loads(result.stdout)
+            for key in mapping:
+                self.assertEqual(exported[key], 'fixture-' + key)
+            self.assertIn('. /kit/hermes-secrets.sh', (KIT / 'container/hermes-entrypoint.sh').read_text())
+
+
+@unittest.skipUnless(POSIX, 'requires a POSIX shell and python3')
 class GhTests(unittest.TestCase):
     def invoke(self, inherited, token_exists=True, launcher_active=False, github_token=None):
         with tempfile.TemporaryDirectory() as directory:
@@ -37,9 +59,11 @@ class GhTests(unittest.TestCase):
             real_gh.write_text('#!/bin/sh\nprintf "%s\\n" "$GH_TOKEN" "$@"\n')
             real_gh.chmod(0o755)
             script = (KIT / 'container/gh.sh').read_text()
-            script = script.replace('/run/kit/github-token', str(token))
-            script = script.replace('/usr/bin/gh', str(real_gh))
+            script = script.replace('/run/kit/github-token', '$FIXTURE_TOKEN')
+            script = script.replace('/usr/bin/gh', '"$FIXTURE_GH"')
             env = os.environ.copy()
+            env['FIXTURE_GH'] = str(real_gh)
+            env['FIXTURE_TOKEN'] = str(token)
             env.pop('GH_TOKEN', None)
             env.pop('PAPERCLIP_GITHUB_OPERATION_ACTIVE', None)
             env.pop('GITHUB_TOKEN', None)
