@@ -115,6 +115,10 @@ run "trust_storage_and_authorization" {
     condition     = !contains(output.authorization.roles.host_operator.actions, "Microsoft.Compute/virtualMachines/write") && !contains(output.authorization.roles.host_operator.actions, "Microsoft.Resources/tags/write") && strcontains(output.authorization.condition, "@Request[") && strcontains(output.authorization.condition, "@Resource[")
     error_message = "Ops cannot write tags/VMs; both role assignment write and delete need ABAC."
   }
+  assert {
+    condition     = output.authorization.migration_writer_name == "${var.prefix} SF Backup Migration Writer" && length(output.authorization.migration_writer[0].actions) == 0 && toset(output.authorization.migration_writer[0].data_actions) == toset(["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"])
+    error_message = "The temporary migration writer can only read/add/write blob data; it cannot delete or change WORM/Shared Key."
+  }
 }
 run "vault_custody" {
   command = plan

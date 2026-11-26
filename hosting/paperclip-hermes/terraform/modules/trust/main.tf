@@ -167,3 +167,16 @@ resource "terraform_data" "trust_home" {
   }
   lifecycle { prevent_destroy = true }
 }
+
+resource "azurerm_role_definition" "migration_writer" {
+  name  = "${var.prefix} SF Backup Migration Writer"
+  scope = "/subscriptions/${var.vault_subscription_id}"
+  permissions {
+    actions = []
+    data_actions = [
+      "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+      "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action",
+      "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
+    ]
+  }
+}
