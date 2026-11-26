@@ -5,8 +5,17 @@ umask 077
 die() { printf '%s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die 'Run as root with sudo.'
 prepare_only=no
-if [[ ${1:-} == --prepare-only ]]; then prepare_only=yes; shift; fi
-[[ $# -eq 1 ]] || die 'Usage: sudo ./bootstrap.sh [--prepare-only] /absolute/data/mount'
+non_interactive=no
+while [[ ${1:-} == --* ]]; do
+    case "$1" in
+        --prepare-only) prepare_only=yes ;;
+        --non-interactive) non_interactive=yes ;;
+        *) die 'Unknown option' ;;
+    esac
+    shift
+done
+if [[ $non_interactive == yes ]]; then export DEBIAN_FRONTEND=noninteractive; fi
+[[ $# -eq 1 ]] || die 'Usage: sudo ./bootstrap.sh [--prepare-only] [--non-interactive] /absolute/data/mount'
 # Ubuntu 24.04 ships Python 3.12 (tomllib), flock and mountpoint.
 # shellcheck source=/dev/null
 source /etc/os-release
@@ -21,7 +30,10 @@ cd -- "$kit"
 install -d -m 0700 -o root -g root /run/paperclip-hermes
 exec 9>>/run/paperclip-hermes/bootstrap.lock
 flock -n 9 || die 'Another bootstrap is running.'
-if [[ $prepare_only == no ]]; then python3 host-config.py validate-env; fi
+if [[ $prepare_only == no ]]; then
+    python3 kit-control.py prepare-config
+    python3 host-config.py validate-env
+fi
 if [[ -f .secrets/bootstrap-mount ]]; then
     [[ $(cat .secrets/bootstrap-mount) == "$mount" ]] || die 'Data mount changed; migrate deliberately before bootstrapping.'
 fi
@@ -38,9 +50,9 @@ install_changed() {
 }
 
 # Install the firewall hook BEFORE the package can auto-start the daemon.
-if ! command -v iptables >/dev/null || ! command -v rsync >/dev/null || ! command -v curl >/dev/null || ! command -v ssh-keygen >/dev/null; then
+if ! command -v iptables >/dev/null || ! command -v rsync >/dev/null || ! command -v curl >/dev/null || ! command -v ssh-keygen >/dev/null || ! command -v gpg >/dev/null; then
     apt-get update
-    apt-get install -y ca-certificates curl iptables rsync openssh-client
+    apt-get install -y ca-certificates curl iptables rsync openssh-client gnupg age
 fi
 restart=no
 reload=no
@@ -98,8 +110,12 @@ fi
 install -d -m 0755 /etc/apt/keyrings
 if [[ ! -s /etc/apt/keyrings/docker.asc ]]; then
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o "$temp/docker.asc"
+    fingerprint=$(gpg --show-keys --with-colons "$temp/docker.asc" | awk -F: '$1=="fpr" {print $10; exit}')
+    [[ $fingerprint == 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 ]] || die 'Docker apt signing key fingerprint mismatch.'
     install -m 0644 "$temp/docker.asc" /etc/apt/keyrings/docker.asc
 fi
+fingerprint=$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc | awk -F: '$1=="fpr" {print $10; exit}')
+[[ $fingerprint == 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 ]] || die 'Installed Docker apt signing key fingerprint mismatch.'
 cat >"$temp/docker.sources" <<EOF
 Types: deb
 URIs: https://download.docker.com/linux/ubuntu
@@ -129,6 +145,18 @@ systemctl enable --now containerd.service docker.service >/dev/null
 /usr/local/sbin/paperclip-hermes-block-metadata
 [[ $(docker info --format '{{.DockerRootDir}}') == "$mount/docker" ]] || die 'Docker data root does not match.'
 
+install -d -m 0700 -o root -g root /etc/paperclip-hermes
+if [[ ! -f /etc/paperclip-hermes/delivery.key ]]; then
+    command -v age-keygen >/dev/null || { apt-get update; apt-get install -y age; }
+    age-keygen -o /etc/paperclip-hermes/delivery.key
+    chmod 0600 /etc/paperclip-hermes/delivery.key
+fi
+if [[ $prepare_only == yes ]]; then
+    python3 kit-control.py configure-host --prepare-only
+else
+    python3 kit-control.py configure-host
+fi
+
 # A recovery host needs the daemon/firewall prepared without ever starting
 # a scheduler or requiring replacement application credentials.
 if [[ $prepare_only == yes ]]; then
@@ -155,4 +183,4 @@ chmod 0644 .secrets/sandbox_ed25519.pub
 if [[ ! -f .secrets/bootstrap-mount ]]; then printf '%s\n' "$mount" > .secrets/bootstrap-mount; fi
 docker compose --env-file .secrets/compose.env config -q
 docker compose --env-file .secrets/compose.env up -d --build --wait --wait-timeout 300
-printf '%s\n' 'Stack started. Complete Tailscale Serve and operator sign-in steps in README.md.'
+printf '%s\n' 'Stack started. Use the approval-gated workflows and sfctl for operator sign-ins.'

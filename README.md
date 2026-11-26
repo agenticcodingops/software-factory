@@ -47,7 +47,9 @@ then regenerates provider checksums for **linux_amd64 and windows_amd64** and re
 Root providers and registry modules must use exact version pins; Git modules must pin a full commit.
 Reusable modules follow the ADR's bounded provider-range convention. Mock provider tests, the policy,
 plan and ref-bump tools and their tests join CI when their work packages add them.
-Container e2e, Azure and GitHub settings checks require later packages and operator infrastructure.
+The `kit-e2e` workflow exercises container upgrade rollback and cross-version restore.
+Azure and GitHub settings checks require later packages and operator infrastructure.
+Install Docker Compose v2 or later for the unit-test profile matrix (no daemon needed).
 The kit unit tests use sudo when needed to exercise root-only ownership protections.
 
 ## Releases and protection

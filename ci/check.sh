@@ -18,7 +18,7 @@ zizmor --offline --strict-collection .
 gitleaks dir . --redact --no-banner
 npm run lint:markdown
 
-mapfile -d '' scripts < <(git ls-files -z --cached --others --exclude-standard -- '*.sh' '*.bats' | sort -zu)
+mapfile -d '' scripts < <(git ls-files -z --cached --others --exclude-standard -- '*.sh' '*.bats' 'hosting/paperclip-hermes/kit/sfctl' | sort -zu)
 shellcheck "${scripts[@]}"
 bats ci/tests
 bash ci/check-terraform.sh
@@ -34,4 +34,4 @@ else
   npm run validate:renovate -- "$fixture"
   echo 'Renovate presets: none yet (WP1); validator smoke check passed.'
 fi
-echo 'All WP1 checks passed.'
+echo 'All repository checks passed.'

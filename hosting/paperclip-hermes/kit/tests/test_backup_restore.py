@@ -3,6 +3,7 @@
 Run: python3 -B -m unittest discover -s tests
 All credential-like fixture values are generated at test time.
 """
+from datetime import datetime, timezone, timedelta
 import argparse
 import contextlib
 import http.client
@@ -21,6 +22,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 import urllib.error
+import urllib.parse
 
 spec = importlib.util.spec_from_file_location('recovery', Path(__file__).parents[1] / 'backup-restore.py')
 recovery = importlib.util.module_from_spec(spec)
@@ -32,10 +34,15 @@ def public_key():
 
 
 def signed_url(**changes):
-    query = {'sv': '2023-11-03', 'sr': 'c', 'si': 'nightly', 'spr': 'https',
+    query = {'sv': '2023-11-03', 'sr': 'c', 'sp': 'cw', 'spr': 'https',
+             'skoid': secrets.token_hex(16), 'sktid': secrets.token_hex(16),
+             'skt': (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+             'ske': (datetime.now(timezone.utc) + timedelta(days=6)).isoformat(),
+             'se': (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(),
+             'sks': 'b', 'skv': '2023-11-03',
              'sig': secrets.token_hex(32)}
     query.update(changes)
-    return 'https://storage.example.test/recovery?' + '&'.join(key + '=' + value for key, value in query.items())
+    return 'https://storage.example.test/recovery?' + urllib.parse.urlencode(query)
 
 
 class ArgumentTests(unittest.TestCase):
@@ -64,8 +71,8 @@ class ArgumentTests(unittest.TestCase):
 
 
 class SasTests(unittest.TestCase):
-    def test_policy_sas_and_explicit_cw_use_unique_blob_path(self):
-        for extra in ({}, {'sp': 'cw'}):
+    def test_delegation_sas_c_and_cw_use_unique_blob_path(self):
+        for extra in ({'sp': 'c'}, {'sp': 'cw'}):
             container = recovery.sas_url(signed_url(**extra))
             result = recovery.blob_url(container, 'unique.tar.age')
             self.assertIn('/recovery/unique.tar.age?', result)
@@ -760,7 +767,7 @@ class ReportFailureTests(unittest.TestCase):
              patch.object(recovery.os, 'O_NOFOLLOW', 0, create=True), \
              patch.object(recovery.os, 'O_CLOEXEC', 0, create=True):
             lines = recovery.report_failure(self.caught(job))
-        self.assertEqual(lines, ['Another backup or restore is running'])
+        self.assertEqual(lines, ['Another host operation is running'])
 
     def test_an_existing_nonempty_restore_target_is_one_line(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -781,6 +788,7 @@ class ReportFailureTests(unittest.TestCase):
 
 class RestoreFlowTests(unittest.TestCase):
     RECORD = {'completed_at': '2026-11-26T00:15:02.123456+00:00', 'kit_commit': 'unknown',
+              'images': {s: {} for s in ('postgres', *recovery.SERVICES)},
               'image_pins': ['fixture-pin'], 'paperclip_schema': {'applied': [{'id': 1}]}}
 
     def restore(self, fail_at=None, purge_error=False, import_error=None):
@@ -810,6 +818,7 @@ class RestoreFlowTests(unittest.TestCase):
                 raise recovery.RecoveryError(fail_at + ' failed')
             return ''
         compose = MagicMock(side_effect=compose_call)
+        compose.services.return_value = ['postgres', *recovery.SERVICES]
         compose.mount.return_value = volume
         events = seen['events'] = []
         compose.hermes.side_effect = import_error
@@ -1078,8 +1087,8 @@ class RootPathTests(unittest.TestCase):
                 with self.assertRaisesRegex(recovery.RecoveryError, 'Another'):
                     with recovery.locked():
                         pass
-            (parent / 'run/recovery.lock').unlink()
-            (parent / 'run/recovery.lock').symlink_to(parent / 'victim')
+            (parent / 'run/op.lock').unlink()
+            (parent / 'run/op.lock').symlink_to(parent / 'victim')
             with self.assertRaises(OSError):
                 with recovery.locked():
                     pass
@@ -1119,7 +1128,7 @@ class RestoreGuardTests(unittest.TestCase):
                                        'label=com.docker.compose.project=fixture'])
         self.assertEqual(commands[1], ['docker', 'rm', '--force', '--volumes', 'oneoff-import', 'service-hermes'])
         env_file = '.secrets/compose.env'
-        actions = [command[command.index(env_file) + 1] if env_file in command else command[1]
+        actions = [command[command.index(env_file) + 5] if env_file in command else command[1]
                    for command in commands]
         self.assertEqual(actions, ['container', 'rm', 'rm', 'down'])
 
@@ -1152,6 +1161,7 @@ class ComposeTests(unittest.TestCase):
     def test_boot_health_wait_does_not_start_services(self):
         compose = MagicMock(return_value='\n'.join(('postgres', *recovery.SERVICES)))
         compose.container.return_value = 'container'
+        compose.services.return_value = ['postgres', *recovery.SERVICES]
         with patch.object(recovery, 'run', return_value='healthy\n'), patch.object(recovery.time, 'sleep') as sleep:
             self.assertEqual(set(recovery.wait_stack(compose)), {'postgres', *recovery.SERVICES})
         self.assertEqual(compose.call_args_list, [unittest.mock.call('ps', '--services', '--status', 'running')])

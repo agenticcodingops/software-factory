@@ -8,3 +8,10 @@ https://caddy {
 		flush_interval -1
 	}
 }
+
+https://paperclip.caddy {
+	tls internal
+	reverse_proxy paperclip:3100 {
+		header_up Host {$TAILSCALE_HOSTNAME}
+	}
+}

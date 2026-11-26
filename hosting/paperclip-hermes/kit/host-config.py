@@ -37,7 +37,7 @@ def validate_env():
     ]
     allowed = set(secrets) | {'OPENAI_API_KEY', 'TAILSCALE_HOSTNAME',
         'FIXTURE_REPOSITORY', 'HERMES_MODEL', 'DASHBOARD_SUBNET', 'DASHBOARD_GATEWAY',
-        'KIT_MESSAGING_OFF'}
+        'KIT_MESSAGING_OFF', 'COMPOSE_PROFILES'}
     values = {}
     for line in ENV_FILE.read_text().splitlines():
         line = line.strip()
@@ -54,11 +54,21 @@ def validate_env():
             fail(f'{name}: use a literal value without whitespace or quotes')
         values[name] = value
     for name in secrets:
+        secret_path = Path('.secrets') / name.lower().replace('_', '-')
+        if name == 'HERMES_GATEWAY_KEY':
+            secret_path = Path('.secrets/hermes-gateway-key')
+        if secret_path.exists():
+            private_file(secret_path)
+            values[name] = secret_path.read_text().strip()
         if not re.fullmatch(r'[a-fA-F0-9]{64}', values.get(name, '')):
             fail(f'{name}: supply an independently generated 32-byte hex value')
     if len({values[name] for name in secrets}) != len(secrets):
         fail('Every signing key, password and master key must be different')
-    if not values.get('OPENAI_API_KEY'):
+    api_file = Path('.secrets/openai-api-key')
+    if api_file.exists() and 'hermes' in values.get('COMPOSE_PROFILES', 'paperclip,hermes').split(','):
+        private_file(api_file)
+        values['OPENAI_API_KEY'] = api_file.read_text().strip()
+    if not values.get('OPENAI_API_KEY') and 'hermes' in values.get('COMPOSE_PROFILES', 'paperclip,hermes').split(','):
         fail('OPENAI_API_KEY is required; API project key only')
     host = values.get('TAILSCALE_HOSTNAME', '')
     if not re.fullmatch(r'[a-z0-9-]+\.[a-z0-9.-]+\.ts\.net', host):
@@ -73,6 +83,8 @@ def validate_env():
         fail('KIT_MESSAGING_OFF: use KIT_MESSAGING_OFF=1 or remove the line')
     if not values.get('HERMES_MODEL'):
         fail('Set HERMES_MODEL to a model available to the API project')
+    if ('DASHBOARD_SUBNET' in values) != ('DASHBOARD_GATEWAY' in values):
+        fail('Override DASHBOARD_SUBNET and DASHBOARD_GATEWAY together')
     subnet = ipaddress.ip_network(values.get('DASHBOARD_SUBNET', '172.30.99.0/24'))
     gateway = ipaddress.ip_address(values.get('DASHBOARD_GATEWAY', '172.30.99.1'))
     if subnet.version != 4 or gateway not in subnet or gateway in (subnet.network_address, subnet.broadcast_address):
@@ -110,7 +122,9 @@ def desired(mount):
         fail('Disable live restore before relocating Docker state')
     if config.get('iptables') is False or config.get('firewall-backend', 'iptables') != 'iptables':
         fail('This kit requires Docker iptables and the DOCKER-USER chain')
-    config.update({'data-root': mount + '/docker', 'log-driver': 'local',
+    if config.get('ipv6'):
+        fail('Docker IPv6 must stay off: metadata firewall uses IPv4')
+    config.update({'ipv6': False, 'data-root': mount + '/docker', 'log-driver': 'local',
                    'log-opts': {'max-size': '10m', 'max-file': '3'},
                    'iptables': True, 'firewall-backend': 'iptables'})
     text, _ = containerd_config()

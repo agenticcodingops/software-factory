@@ -1,0 +1,40 @@
+name: kit-e2e
+
+on:
+  pull_request:
+    paths:
+      - 'hosting/paperclip-hermes/kit/**'
+      - 'ci/kit-e2e.sh'
+      - '.github/workflows/kit-e2e.yml'
+  push:
+    branches: [main]
+  schedule:
+    - cron: '25 4 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: kit-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kit-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y age
+          python3 -m pip install -r ci/requirements.txt
+      - name: Exercise upgrade rollback, dump failure and cross-version restore
+        run: sudo env "PATH=$PATH" bash ci/kit-e2e.sh

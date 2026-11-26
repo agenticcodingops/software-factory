@@ -3,12 +3,12 @@ FROM nousresearch/hermes-agent:v0.23.4@sha256:ef0650d523ee1b5ab32c779acabc446d99
 USER root
 # The upstream image has git and SSH client; shell gh needs the CLI as well.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gh \
+    && apt-get install -y --no-install-recommends gh=2.46.0-3 \
     && rm -rf /var/lib/apt/lists/*
 
 FROM runtime AS sandbox
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-server \
+    && apt-get install -y --no-install-recommends openssh-server=1:10.0p1-7+deb13u4 \
     && rm -rf /var/lib/apt/lists/* \
     && usermod -s /bin/bash hermes \
     && passwd -d hermes
