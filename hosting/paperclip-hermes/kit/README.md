@@ -922,9 +922,12 @@ Tailscale Serve to the new host as in the setup section, and redo sign-ins.
 
 Restore decrypts and validates the complete bundle before creating application
 volumes. It refuses an existing project or nonempty destination volume, restores
-the database in one transaction, imports Hermes with --force --keep-host
+the database with stop-on-error checks, imports Hermes with --force --keep-host
 --messaging-off and starts the stack only after the journal matches. Hermes's
 best-effort post-import service revival is suppressed in its one-shot container.
+Database restore commits statements separately to stay within PostgreSQL's
+lock budget for Paperclip's schema. A failed restore leaves applications stopped;
+partial data is never started.
 The temporary rollback ZIP made by --keep-host is removed on success or failure.
 The root config.yaml is rewritten from this kit's hermes-config.yaml at every
 start, so no archived setting reaches it. That alone would not keep messaging

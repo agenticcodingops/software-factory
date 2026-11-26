@@ -1119,8 +1119,10 @@ def restore(args):
             # in any one-shot container: entrypoint is explicitly overridden.
             if 'postgres' in installed:
                 compose('up', '-d', '--no-deps', '--wait', '--wait-timeout', '180', 'postgres')
+                # Commit restore statements separately to bound schema locks.
+                # Applications start only after a successful, checked restore.
                 with open(stage / 'database.dump', 'rb') as stream:
-                    compose('exec', '-T', 'postgres', 'pg_restore', '--exit-on-error', '--single-transaction',
+                    compose('exec', '-T', 'postgres', 'pg_restore', '--exit-on-error',
                             '--no-owner', '--no-acl', '-U', 'paperclip', '-d', 'paperclip', input_file=stream)
                 if schema_state(compose) != record['paperclip_schema']:
                     fail('Restored migration journal differs from the backup')
@@ -1136,7 +1138,8 @@ def restore(args):
                 os.chown(home, 10000, 10000)
                 os.chmod(home, 0o700)
                 # Seed the kit policy before --keep-host merges the portable state.
-                compose('run', '--rm', '--no-deps', '-T', '--entrypoint', PYTHON, 'hermes', '/kit/configure-hermes.py')
+                compose('run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', 'hermes',
+                        '-ec', '. /kit/hermes-secrets.sh; exec ' + PYTHON + ' /kit/configure-hermes.py')
                 try:
                     compose.hermes(hermes_stage, 'import', '/recovery/hermes.zip', '--force', '--keep-host', '--messaging-off')
                 finally:

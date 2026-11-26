@@ -26,6 +26,28 @@ except ImportError:
 
 
 @unittest.skipUnless(POSIX, 'requires a POSIX shell and python3')
+class HermesSecretTests(unittest.TestCase):
+    def test_shared_loader_exports_file_secrets_for_one_shot_configurator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mapping = {'API_SERVER_KEY': 'hermes_gateway_key',
+                       **{key: key.lower() for key in ('OPENAI_API_KEY',
+                          'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD', 'HERMES_DASHBOARD_BASIC_AUTH_SECRET')}}
+            for key, filename in mapping.items():
+                (root / filename).write_text('fixture-' + key)
+            loader = root / 'loader.sh'
+            loader.write_text((KIT / 'container/hermes-secrets.sh').read_text().replace('/run/secrets', str(root)))
+            command = '. "$1"; exec python3 -c \'import os,json; print(json.dumps(dict(os.environ)))\''
+            env = {'PATH': os.environ['PATH']}
+            result = subprocess.run(['sh', '-ec', command, 'configure', str(loader)],
+                                    env=env, text=True, capture_output=True, check=True)
+            exported = json.loads(result.stdout)
+            for key in mapping:
+                self.assertEqual(exported[key], 'fixture-' + key)
+            self.assertIn('. /kit/hermes-secrets.sh', (KIT / 'container/hermes-entrypoint.sh').read_text())
+
+
+@unittest.skipUnless(POSIX, 'requires a POSIX shell and python3')
 class GhTests(unittest.TestCase):
     def invoke(self, inherited, token_exists=True, launcher_active=False, github_token=None):
         with tempfile.TemporaryDirectory() as directory:

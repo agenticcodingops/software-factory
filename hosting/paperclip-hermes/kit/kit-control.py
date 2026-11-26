@@ -129,10 +129,12 @@ def rollback_point(action, path, compose):
     if any(r.digest(path / name) != value for name, value in record['files'].items()):
         r.fail('Rollback checksum mismatch')
     current = volume_map(compose)
-    if set(current) != set(record['volumes']):
+    if not set(record['volumes']) <= set(current):
         r.fail('Rollback volume inventory changed')
     compose('stop', '--timeout', '90')
-    for name, destination in current.items():
+    # Candidate-only volumes are outside the recorded recovery inventory.
+    for name in record['volumes']:
+        destination = current[name]
         for entry in destination.iterdir():
             if entry.is_dir() and not entry.is_symlink():
                 shutil.rmtree(entry)
@@ -143,13 +145,25 @@ def rollback_point(action, path, compose):
                '--numeric-owner', '--same-owner', '--acls', '--xattrs'])
     if 'database.dump' in record['files']:
         compose('up', '-d', '--no-deps', '--wait', '--wait-timeout', '180', 'postgres')
+        # Paperclip's schema exceeds PostgreSQL's default lock budget when
+        # cleaned and recreated in one transaction. Writers stay stopped;
+        # any restore error leaves the stack stopped for operator recovery.
         with (path / 'database.dump').open('rb') as dump:
             compose('exec', '-T', 'postgres', 'pg_restore', '--clean', '--if-exists',
-                    '--exit-on-error', '--single-transaction', '--no-owner', '--no-acl',
+                    '--exit-on-error', '--no-owner', '--no-acl',
                     '-U', 'paperclip', '-d', 'paperclip', input_file=dump)
     if record['running']:
         compose('up', '-d', '--build', '--wait', '--wait-timeout', '300', *record['running'])
     return record
+
+
+def fetch_checkout(temporary, sha):
+    r.run(['git', 'init', temporary])
+    r.run(['git', '-C', temporary, 'fetch', '--depth=1',
+           'https://github.com/agenticcodingops/software-factory.git', sha])
+    r.run(['git', '-C', temporary, 'checkout', '--detach', 'FETCH_HEAD'])
+    if r.run(['git', '-C', temporary, 'rev-parse', 'HEAD']).strip() != sha:
+        r.fail('Fetched kit SHA mismatch')
 
 
 def checkout(sha):
@@ -162,12 +176,13 @@ def checkout(sha):
     if not destination.exists():
         temporary = Path(tempfile.mkdtemp(prefix='.kit-', dir=INSTALL))
         try:
-            r.run(['git', 'init', temporary])
-            r.run(['git', '-C', temporary, 'fetch', '--depth=1',
-                   'https://github.com/agenticcodingops/software-factory.git', sha])
-            r.run(['git', '-C', temporary, 'checkout', '--detach', 'FETCH_HEAD'])
-            if r.run(['git', '-C', temporary, 'rev-parse', 'HEAD']).strip() != sha:
-                r.fail('Fetched kit SHA mismatch')
+            # Code is bind-mounted into containers with unprivileged users.
+            # Keep the host's private umask for secrets and operation state.
+            private_umask = os.umask(0o022)
+            try:
+                fetch_checkout(temporary, sha)
+            finally:
+                os.umask(private_umask)
             os.chmod(temporary, 0o755)
             os.rename(temporary, destination)
         finally:
@@ -260,9 +275,10 @@ def health():
                 'fetch("https://paperclip.caddy/api/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))') == ''
             checks['migration_journal'] = bool(r.schema_state(compose).get('applied'))
         if 'hermes' in installed:
-            status = compose('exec', '-T', 'caddy', 'sh', '-c',
-                             'wget --ca-certificate=/public-ca/root.crt --server-response -O /dev/null https://caddy/health/detailed 2>&1 || true')
-            checks['hermes_tls_401'] = bool(re.search(r'HTTP/[0-9.]+ 401', status))
+            status = compose('exec', '-T', 'caddy', 'curl', '--silent', '--show-error',
+                             '--cacert', '/public-ca/root.crt', '--output', '/dev/null',
+                             '--write-out', '%{http_code}', 'https://caddy/health/detailed')
+            checks['hermes_tls_401'] = status.strip() == '401'
     except (r.RecoveryError, ValueError, KeyError):
         checks['application'] = False
     counters = probe(['iptables', '-w', '-L', 'DOCKER-USER', '-v', '-n', '-x'])

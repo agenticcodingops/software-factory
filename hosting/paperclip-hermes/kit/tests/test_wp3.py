@@ -114,7 +114,7 @@ class Stack:
             path.mkdir()
             (path/'state').write_text('old-data')
             self.volumes[name] = path
-        self.fail_dump = self.fail_restart = False
+        self.fail_dump = self.fail_restart = self.fail_restore = False
 
     def images(self):
         return {service: {'image_id': 'fixture'} for service in self.installed}
@@ -135,6 +135,8 @@ class Stack:
         if 'pg_restore' in args:
             assert self.running == {'postgres'}
             assert kwargs['input_file'].read() == b'database dump'
+            if self.fail_restore:
+                raise r.RecoveryError('restore failed')
         if 'pg_dump' in args:
             assert 'postgres' in self.running
             assert not set(r.SERVICES) & self.running
@@ -315,8 +317,11 @@ def test_bootstrap_key_pin_and_package_pins():
     assert 'Persistent=true' not in (KIT/'systemd/paperclip-hermes-backup.timer').read_text()
 
 
-def test_upgrade_failed_health_restores_previous_code_and_data(tmp_path):
+@pytest.mark.parametrize('restore_fails', [False, True])
+def test_upgrade_failed_health_restores_previous_code_and_data(tmp_path, restore_fails):
     stack=Stack(tmp_path)
+    stack.fail_restore = restore_fails
+    error = 'restore failed' if restore_fails else 'previous kit and data restored'
     previous='a'*40
     candidate_sha='b'*40
     candidate=tmp_path/'candidate';candidate.mkdir()
@@ -341,12 +346,12 @@ def test_upgrade_failed_health_restores_previous_code_and_data(tmp_path):
          patch.object(c,'ROLLBACK_ROOT',tmp_path/'points'),patch.object(c.r,'kit_commit',return_value=previous), \
          patch.object(c,'volume_map',return_value=stack.volumes),patch.object(c,'required_space',return_value=0), \
          patch.object(c.r,'Compose',side_effect=compose_factory),patch.object(c,'checkout',side_effect=lambda sha: old if sha==previous else candidate), \
-         patch.object(c.r,'run',side_effect=execute),pytest.raises(r.RecoveryError,match='previous kit and data restored'):
+         patch.object(c.r,'run',side_effect=execute),pytest.raises(r.RecoveryError,match=error):
         c.upgrade(candidate_sha,'upgrade-1',0)
     assert events==['previous-activated-before-restore']
     assert all((v/'state').read_text()=='old-data' for v in stack.volumes.values())
-    assert stack.running==set(stack.installed)
-    assert json.loads((tmp_path/'status/last-op.json').read_text())['phase']=='rolled-back'
+    assert stack.running == (set() if restore_fails else set(stack.installed))
+    assert json.loads((tmp_path/'status/last-op.json').read_text())['phase'] == ('rollback-failed' if restore_fails else 'rolled-back')
 
 
 def test_upgrade_handoff_journal_blocks_another_candidate(tmp_path):
@@ -457,9 +462,10 @@ def test_health_checks_tls_authenticated_endpoint_and_drop_counters(tmp_path,cap
         if args[0]=='ps':
             return json.dumps([dict(Health='healthy') for _ in range(5)])
         if args[2]=='caddy':
-            assert '--ca-certificate=/public-ca/root.crt' in args[-1]
+            assert args[3] == 'curl'
+            assert args[args.index('--cacert')+1] == '/public-ca/root.crt'
             assert 'https://caddy/health/detailed' in args[-1]
-            return '  HTTP/1.1 401 Unauthorized\n'
+            return '401'
         return ''
     compose.side_effect=command
     def probe(args):
@@ -544,3 +550,100 @@ def test_verify_staging_refuses_kit_directory():
     with patch.object(r,'private_file'),patch.object(r,'run') as run,pytest.raises(r.RecoveryError,match='outside the kit'):
         r.restore(args)
     run.assert_not_called()
+
+
+@pytest.mark.parametrize('missing', [False, True])
+def test_rollback_inventory_allows_candidate_volumes_but_requires_originals(tmp_path, missing):
+    stack = Stack(tmp_path)
+    point = tmp_path / 'rollback'
+    with patch.object(c, 'volume_map', return_value=stack.volumes):
+        c.rollback_point('create', point, stack)
+        original = dict(stack.volumes)
+        added = tmp_path / 'candidate_only'
+        added.mkdir()
+        (added / 'state').write_text('candidate-only data')
+        stack.volumes['candidate_only'] = added
+        for volume in original.values():
+            (volume / 'state').write_text('candidate migration')
+        if missing:
+            del stack.volumes['postgres']
+            with pytest.raises(r.RecoveryError, match='volume inventory changed'):
+                c.rollback_point('restore', point, stack)
+            assert all((v / 'state').read_text() == 'candidate migration' for v in original.values())
+        else:
+            c.rollback_point('restore', point, stack)
+            assert all((v / 'state').read_text() == 'old-data' for v in original.values())
+        assert (added / 'state').read_text() == 'candidate-only data'
+
+
+@pytest.mark.parametrize('tls_status', ['401', '200', '502', None])
+def test_hermes_health_uses_verified_curl_status(tmp_path, capsys, tls_status):
+    compose = MagicMock()
+    compose.services.return_value = ['hermes', 'sandbox', 'caddy']
+    def call(*args):
+        if args[0] == 'ps':
+            return json.dumps([{'Health': 'healthy'}] * 3)
+        assert args[:4] == ('exec', '-T', 'caddy', 'curl')
+        assert args[args.index('--cacert') + 1] == '/public-ca/root.crt'
+        assert args[-1] == 'https://caddy/health/detailed'
+        assert '--insecure' not in args and '-k' not in args
+        if tls_status is None:
+            raise r.RecoveryError('TLS verification failed')
+        return tls_status
+    compose.side_effect = call
+    with patch.object(r, 'Compose', return_value=compose), patch.object(c, 'probe', return_value=None):
+        assert not c.health()  # Host controls are deliberately absent here.
+    checks = json.loads(capsys.readouterr().out)['checks']
+    assert checks.get('hermes_tls_401', False) == (tls_status == '401')
+
+
+def test_checkout_under_private_umask_is_container_readable(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    subprocess.run(['git', 'init', str(source)], check=True, capture_output=True)
+    container = source / 'hosting/paperclip-hermes/kit/container'
+    container.mkdir(parents=True)
+    (container / 'gitconfig').write_text('[credential]\n')
+    (container / 'gh.sh').write_text('#!/bin/sh\nexit 0\n')
+    (container / 'gh.sh').chmod(0o755)
+    subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
+    # Reuse the repository identity without changing any Git configuration.
+    identity = subprocess.check_output(['git', '-C', str(KIT), 'log', '-1', '--format=%an%n%ae'], text=True).splitlines()
+    env = {**os.environ, 'GIT_AUTHOR_NAME': identity[0], 'GIT_AUTHOR_EMAIL': identity[1],
+           'GIT_COMMITTER_NAME': identity[0], 'GIT_COMMITTER_EMAIL': identity[1]}
+    subprocess.run(['git', '-C', str(source), 'commit', '-m', 'test: checkout fixture'], env=env, check=True, capture_output=True)
+    sha = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+    original = r.run
+    def local_fetch(args, **kwargs):
+        args = [str(a) for a in args]
+        if 'fetch' in args:
+            args[args.index('fetch') + 2] = str(source)
+        return original(args, **kwargs)
+    mask = os.umask(0o077)
+    try:
+        with patch.object(c, 'INSTALL', tmp_path / 'install'), patch.object(r, 'run', side_effect=local_fetch):
+            kit = c.checkout(sha)
+            assert c.checkout(sha) == kit  # Cached rollback checkout too.
+            assert os.umask(0o077) == 0o077
+            c.atomic_secret(kit / '.secrets/key', b'fixture')
+        for path in (kit, *kit.rglob('*')):
+            if '.secrets' in path.parts:
+                continue
+            expected = 0o755 if path.is_dir() or path.name == 'gh.sh' else 0o644
+            assert path.stat().st_mode & 0o777 == expected
+        assert (kit / '.secrets').stat().st_mode & 0o777 == 0o700
+        assert (kit / '.secrets/key').stat().st_mode & 0o777 == 0o600
+    finally:
+        os.umask(mask)
+
+
+def test_checkout_failure_restores_private_umask(tmp_path):
+    mask = os.umask(0o077)
+    try:
+        with patch.object(c, 'INSTALL', tmp_path / 'install'), patch.object(c, 'fetch_checkout', side_effect=r.RecoveryError('fetch failed')):
+            with pytest.raises(r.RecoveryError, match='fetch failed'):
+                c.checkout('a' * 40)
+        assert os.umask(0o077) == 0o077
+        assert not list((tmp_path / 'install').iterdir())
+    finally:
+        os.umask(mask)

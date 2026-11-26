@@ -872,6 +872,25 @@ class RestoreFlowTests(unittest.TestCase):
         self.assertEqual(len(check), 1)
         self.assertEqual(check[0][-2:], ('/kit/validate-hermes-config.py', '/kit-config.yaml'))
 
+    def test_hermes_restore_seeds_with_file_secrets_without_service_entrypoint(self):
+        seen = self.restore()
+        self.assertIsNone(seen['error'])
+        seeds = [call.args for call in seen['compose']
+                 if any('/kit/configure-hermes.py' in str(arg) for arg in call.args)]
+        self.assertEqual(len(seeds), 1)
+        self.assertEqual(seeds[0][1:8], ('--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', 'hermes', '-ec'))
+        self.assertEqual(seeds[0][-1], '. /kit/hermes-secrets.sh; exec ' + recovery.PYTHON + ' /kit/configure-hermes.py')
+
+    def test_failed_database_restore_never_starts_applications(self):
+        seen = self.restore(fail_at='exec')
+        self.assertEqual(str(seen['error']), 'exec failed')
+        starts = [call.args for call in seen['compose'] if call.args[0] == 'up']
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][-1], 'postgres')
+        self.assertIn('--no-deps', starts[0])
+        self.assertEqual(seen['abandoned'], 1)
+        self.assertEqual([event[0] for event in seen['events']], ['remove containers', 'abandon'])
+
     def test_late_failure_keeps_only_the_override_until_the_project_is_down(self):
         seen = self.restore(fail_at='create')
         self.assertEqual(str(seen['error']), 'create failed')
