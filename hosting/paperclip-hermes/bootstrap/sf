@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set +x
+set -euo pipefail
+case "${1:-}" in
+  age-key|restore-assist) exec bash "$(dirname -- "${BASH_SOURCE[0]}")/sf-bootstrap.sh" "$@" ;;
+  *) echo 'Usage: sf age-key|restore-assist [options]; dry-run unless --apply' >&2; exit 2 ;;
+esac

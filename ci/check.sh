@@ -20,7 +20,9 @@ npm run lint:markdown
 
 mapfile -d '' scripts < <(git ls-files -z --cached --others --exclude-standard -- '*.sh' '*.bats' | sort -zu)
 shellcheck "${scripts[@]}"
+shellcheck hosting/paperclip-hermes/bootstrap/sf
 bats ci/tests
+bats hosting/paperclip-hermes/bootstrap/tests
 bash ci/check-terraform.sh
 
 mapfile -d '' configs < <(git ls-files -z --cached --others --exclude-standard -- 'renovate.json' 'renovate.json5' '.renovaterc*' 'renovate/*.json' 'renovate/*.json5' | sort -zu)
@@ -34,4 +36,4 @@ else
   npm run validate:renovate -- "$fixture"
   echo 'Renovate presets: none yet (WP1); validator smoke check passed.'
 fi
-echo 'All repository checks passed (WP1 + WP4).'
+echo 'All repository checks passed (WP1 + WP4 + WP5).'

@@ -1,0 +1,57 @@
+name: Environment OIDC probe
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      probe_only:
+        type: boolean
+        required: true
+      nonce:
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  claims:
+    if: inputs.probe_only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+    steps:
+      - name: Record public claims from a real environment token
+        env:
+          SF_ENVIRONMENT: ${{ inputs.environment }}
+          SF_NONCE: ${{ inputs.nonce }}
+        shell: bash
+        run: |
+          set +x
+          ulimit -c 0
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.request
+          env = os.environ["SF_ENVIRONMENT"]
+          if env not in ("plan", "production", "ops", "restore"):
+              raise SystemExit("Invalid probe environment")
+          try:
+              request = urllib.request.Request(
+                  os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=api%3A%2F%2FAzureADTokenExchange",
+                  headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  token = json.load(response)["value"]
+              payload = token.split(".")[1]
+              claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+              result = {key: claims[key] for key in ("iss", "aud", "sub", "job_workflow_ref")}
+              result.update(environment=env, nonce=os.environ["SF_NONCE"])
+              print("SF_OIDC_CLAIMS=" + json.dumps(result, separators=(",", ":")))
+          except Exception:
+              raise SystemExit("OIDC probe failed; token diagnostics suppressed") from None
+          PY
