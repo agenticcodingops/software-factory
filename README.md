@@ -32,19 +32,22 @@ The same entry point runs in CI on every push and PR, including fork PRs, with r
 repository access and no secrets. It checks line endings and JSON, immutable action refs with
 version comments, job permissions, [the deny-list](deny-list/README.md) and its planted-value tests,
 the kit's unit tests, actionlint (including both existing Claude workflows), zizmor, gitleaks,
-Markdown, every shell script, Bats, Terraform formatting, TFLint, Checkov and the Renovate validator.
+Markdown, every shell script, Bats, Terraform formatting, TFLint, Checkov, the strict Renovate validator,
+and the offline Renovate/release-please acceptance fixtures.
 Gitleaks excludes downloaded `.terraform`, `.venv` and `node_modules` dependencies through
 [.gitleaks.toml](.gitleaks.toml); committed deployment source and fixtures are scanned.
-The sole zizmor exception is documented in [zizmor.yml](zizmor.yml): the unchanged mention workflow
-keeps checkout credentials but uploads no checkout artifacts. No workflow is excluded from actionlint.
+The mention workflow exception is documented in [zizmor.yml](zizmor.yml). The release-notes gate
+locally suppresses `dangerous-triggers`: it uses `pull_request_target` to label PRs and publish a
+status on their exact head, runs only trusted base code, and reads PR files as API data. No workflow
+is excluded from actionlint or zizmor.
 Markdown line length is off; the config documents compatibility settings for the existing docs.
 After regenerating the npm lock file, run `python3 ci/normalize-npm-lock.py` to remove optional
 registry deprecation messages that include upstream maintainers' personal e-mail addresses.
 Package versions, integrity hashes and dependency resolution are preserved.
 
 WP4 adds the [Terraform modules and three stacks](hosting/paperclip-hermes/terraform/README.md), mock-provider
-invariants, policy-lint and plan-guard fixtures. Renovate presets remain future work and their validator
-runs against an empty fixture. For each stack, CI requires a tracked
+invariants, policy-lint and plan-guard fixtures. WP7 adds the [Renovate presets and acceptance
+proofs](renovate/README.md). For each stack, CI requires a tracked
 `.terraform.lock.hcl`, initializes without a backend or lock changes, validates and runs `terraform test`,
 then regenerates provider checksums for **linux_amd64 and windows_amd64** and rejects drift.
 Root providers and registry modules must use exact version pins; Git modules must pin a full commit.

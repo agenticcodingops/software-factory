@@ -1,0 +1,32 @@
+name: Release notes gate
+
+on:
+  # Trusted base checkout only; PR source is read as data, never checked out or executed.
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: release-notes-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  notes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      statuses: write
+      pull-requests: read
+    steps:
+      # Only trusted base code runs with the labeling/status token. PR files are API data.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Publish the gate on the current PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/renovate/release-notes-gate.py

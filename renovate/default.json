@@ -1,0 +1,230 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Software Factory dependency policy; agents merge only after required checks and review.",
+  "enabledManagers": [
+    "docker-compose",
+    "dockerfile",
+    "terraform",
+    "github-actions",
+    "custom.regex"
+  ],
+  "semanticCommits": "enabled",
+  "semanticCommitScope": "deps",
+  "automerge": false,
+  "pinDigests": true,
+  "rangeStrategy": "replace",
+  "prHourlyLimit": 2,
+  "docker-compose": {
+    "managerFilePatterns": [
+      "/^hosting/paperclip-hermes/kit/(?:.*\\/)?(?:docker-)?compose[^/]*\\.ya?ml$/"
+    ]
+  },
+  "dockerfile": {
+    "managerFilePatterns": [
+      "/^hosting/paperclip-hermes/kit/(?:.*\\/)?Dockerfile[^/]*$/"
+    ]
+  },
+  "terraform": {
+    "managerFilePatterns": [
+      "/^hosting/paperclip-hermes/terraform/.*\\.tf$/"
+    ]
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 4am on the first day of the month"
+    ],
+    "semanticCommitType": "fix",
+    "addLabels": [
+      "needs-operator"
+    ],
+    "automerge": false
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.terraform-version$/"
+      ],
+      "matchStrings": [
+        "^(?<currentValue>\\d+\\.\\d+\\.\\d+)\\s*$"
+      ],
+      "depNameTemplate": "hashicorp/terraform",
+      "datasourceTemplate": "custom.hashicorp",
+      "versioningTemplate": "hashicorp"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Images and Terraform changes must trigger Release Please.",
+      "matchManagers": [
+        "docker-compose",
+        "dockerfile",
+        "terraform",
+        "custom.regex"
+      ],
+      "semanticCommitType": "fix"
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "semanticCommitType": "chore"
+    },
+    {
+      "description": "Missing timestamps cannot bypass the image soak period.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "minimumReleaseAge": "3 days",
+      "minimumReleaseAgeBehaviour": "timestamp-required"
+    },
+    {
+      "description": "Paperclip stable CalVer, preserving a leading v when present.",
+      "matchPackageNames": [
+        "ghcr.io/paperclipai/paperclip"
+      ],
+      "versioning": "regex:^v?(?<major>\\d{4})\\.(?<minor>\\d{3,4})\\.(?<patch>\\d+)$",
+      "allowedVersions": "/^v?\\d{4}\\.\\d{3,4}\\.\\d+$/",
+      "sourceUrl": "https://github.com/paperclipai/paperclip",
+      "overrideDatasource": "custom.paperclip-ghcr",
+      "registryUrls": [],
+      "minimumReleaseAge": "3 days",
+      "minimumReleaseAgeBehaviour": "timestamp-required"
+    },
+    {
+      "matchPackageNames": [
+        "nousresearch/hermes-agent"
+      ],
+      "versioning": "semver",
+      "allowedVersions": "/^v0\\.\\d+\\.\\d+$/",
+      "sourceUrl": "https://github.com/NousResearch/hermes-agent"
+    },
+    {
+      "matchPackageNames": [
+        "postgres"
+      ],
+      "allowedVersions": "/^17(?:\\.|$)/"
+    },
+    {
+      "description": "Agents may merge these only after the required checks and two current-head reviews.",
+      "matchManagers": [
+        "docker-compose",
+        "dockerfile"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "patch"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ]
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ]
+    },
+    {
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchPackageNames": [
+        "hashicorp/terraform"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ]
+    },
+    {
+      "description": "All provider bumps require the operator, including patch releases.",
+      "matchManagers": [
+        "terraform"
+      ],
+      "matchDepTypes": [
+        "required_provider",
+        "provider"
+      ],
+      "addLabels": [
+        "needs-operator"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "AVM 0.x minor releases have major-change risk; operator review is mandatory.",
+      "matchDatasources": [
+        "terraform-module"
+      ],
+      "matchPackageNames": [
+        "/^Azure/avm-/"
+      ],
+      "matchCurrentVersion": "/^0\\./",
+      "matchUpdateTypes": [
+        "minor",
+        "major"
+      ],
+      "addLabels": [
+        "needs-operator"
+      ],
+      "automerge": false,
+      "prPriority": 10,
+      "prBodyNotes": [
+        "AVM 0.x minor bumps are treated as major changes. Operator review is required."
+      ]
+    },
+    {
+      "description": "The runtime file and exact stack requirements advance together.",
+      "matchPackageNames": [
+        "hashicorp/terraform"
+      ],
+      "overrideDatasource": "custom.hashicorp",
+      "groupName": "Terraform runtime",
+      "extractVersion": "^(?<version>.*)$"
+    },
+    {
+      "description": "Reusable modules keep the ADR bounded compatibility ranges; exact root pins drive upgrades.",
+      "matchManagers": [
+        "terraform"
+      ],
+      "matchFileNames": [
+        "hosting/paperclip-hermes/terraform/modules/**/versions.tf"
+      ],
+      "matchDepTypes": [
+        "required_provider",
+        "required_version"
+      ],
+      "enabled": false
+    },
+    {
+      "matchPackageNames": [
+        "hashicorp/terraform"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ]
+    }
+  ],
+  "customDatasources": {
+    "hashicorp": {
+      "defaultRegistryUrlTemplate": "https://releases.hashicorp.com/terraform/index.json",
+      "transformTemplates": [
+        "{\"releases\": [$each(versions, function($v, $k) { {\"version\": $k} })], \"sourceUrl\": \"https://github.com/hashicorp/terraform\"}"
+      ]
+    },
+    "paperclip-ghcr": {
+      "defaultRegistryUrlTemplate": "https://api.github.com/orgs/paperclipai/packages/container/paperclip/versions?per_page=100",
+      "transformTemplates": [
+        "{\"releases\": $reduce($, function($acc, $v) { $append($acc, $map($v.metadata.container.tags, function($tag) { {\"version\": $tag, \"digest\": $v.name, \"releaseTimestamp\": $v.created_at} })) }, []), \"sourceUrl\": \"https://github.com/paperclipai/paperclip\"}"
+      ]
+    }
+  }
+}

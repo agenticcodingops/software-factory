@@ -24,14 +24,6 @@ bats ci/tests
 bash ci/check-terraform.sh
 
 mapfile -d '' configs < <(git ls-files -z --cached --others --exclude-standard -- 'renovate.json' 'renovate.json5' '.renovaterc*' 'renovate/*.json' 'renovate/*.json5' | sort -zu)
-if (( ${#configs[@]} )); then
-  npm run validate:renovate -- "${configs[@]}"
-else
-  # Exercise the installed validator even before WP12 adds the real presets.
-  fixture=$(mktemp --suffix=.json)
-  trap 'rm -f "$fixture"' EXIT
-  echo '{}' > "$fixture"
-  npm run validate:renovate -- "$fixture"
-  echo 'Renovate presets: none yet (WP1); validator smoke check passed.'
-fi
-echo 'All repository checks passed (WP1 + WP4).'
+npm run validate:renovate -- "${configs[@]}"
+npm run test:renovate
+echo 'All repository checks passed (WP1 + WP4 + WP7).'
