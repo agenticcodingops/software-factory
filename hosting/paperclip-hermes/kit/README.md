@@ -65,8 +65,13 @@ local builds use the distribution's package repository; retain the built image
 IDs if byte-identical rebuilds are needed.
 
 Caddy issues internal certificates for `caddy` and `paperclip.caddy`. The latter
-proxies to `paperclip:3100` with the configured MagicDNS Host header for health
-checks; the operator still reaches Paperclip through Serve. Caddy's startup copies
+proxies to `paperclip:3100` with the configured MagicDNS Host and forwarded Host
+headers for health
+checks; the operator still reaches Paperclip through Serve. Both sites bind only
+to the `tls` network address (the `paperclip.caddy` alias) and loopback. Neither
+site listens on `gateway`, even when a client forges SNI or Host. Hermes and the
+sandbox cannot use these listeners. The local Hermes health probe resolves
+`caddy` to loopback while verifying its certificate. Caddy's startup copies
 only the public root certificate into `public_ca`; Paperclip mounts that volume read-only
 and uses `NODE_EXTRA_CA_CERTS=/caddy-ca/root.crt`. Caddy's private root key stays
 in `caddy_data`. No TLS verification bypass is configured. Keep that CA during
@@ -1040,6 +1045,9 @@ The deployment workflow must complete the fresh off-site backup and Terraform
 apply before calling `upgrade.sh <approved-workflow-sha> --run-id <id>`.
 `backup.sh`, `restore.sh`, `upgrade.sh` and all `sfctl` mutations share the root-only
 `/run/paperclip-hermes/op.lock`; contention refuses the operation.
+Run IDs must contain 1–255 ASCII letters, digits, underscores or hyphens. An
+existing rollback path (including a symlink) is rejected before changing the
+journal; use a fresh ID for every upgrade attempt, including after a rollback.
 
 The upgrade refuses unless available space is at least 2.2 times the sum of
 volume bytes and the database dump estimate. It then creates `/data/rollback/<run>`

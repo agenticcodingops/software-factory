@@ -254,14 +254,18 @@ def activate(kit):
 def upgrade(sha, run_id, lock_fd):
     if not re.fullmatch(r'[a-f0-9]{40}', sha):
         r.fail('Require a full candidate kit commit SHA')
-    if not re.fullmatch(r'[A-Za-z0-9_-]+', run_id):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,255}', run_id):
         r.fail('Invalid operation ID')
+    point = ROLLBACK_ROOT / run_id
+    # Retained snapshots belong to earlier operations, even after rollback.
+    # Check before replacing the journal; include dangling symlinks.
+    if os.path.lexists(point):
+        r.fail('Rollback path already exists; choose a new operation ID')
     if (STATE / 'last-op.json').exists():
         prior = json.loads(r.read_private(STATE / 'last-op.json'))
         if prior.get('operation') == 'upgrade' and prior.get('phase') not in RESOLVED_PHASES:
             r.fail('Resolve the previous upgrade/handoff before another upgrade')
     compose = r.Compose(KIT, 'paperclip-hermes')
-    point = ROLLBACK_ROOT / run_id
     point.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     if shutil.disk_usage(point.parent).free < required_space(compose):
         r.fail('Insufficient free space: require twice volumes plus dump estimate, plus 10 percent')
@@ -325,6 +329,7 @@ def health():
             checks['migration_journal'] = bool(r.schema_state(compose).get('applied'))
         if 'hermes' in installed:
             status = compose('exec', '-T', 'caddy', 'curl', '--silent', '--show-error',
+                             '--resolve', 'caddy:443:127.0.0.1',
                              '--cacert', '/public-ca/root.crt', '--output', '/dev/null',
                              '--write-out', '%{http_code}', 'https://caddy/health/detailed')
             checks['hermes_tls_401'] = status.strip() == '401'

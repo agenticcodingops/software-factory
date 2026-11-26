@@ -3,6 +3,8 @@
 }
 
 https://caddy {
+	# Only the Paperclip-facing network and Caddy's local health probe.
+	bind paperclip.caddy 127.0.0.1
 	tls internal
 	reverse_proxy hermes:8642 {
 		flush_interval -1
@@ -10,8 +12,10 @@ https://caddy {
 }
 
 https://paperclip.caddy {
+	bind paperclip.caddy 127.0.0.1
 	tls internal
 	reverse_proxy paperclip:3100 {
 		header_up Host {$TAILSCALE_HOSTNAME}
+		header_up X-Forwarded-Host {$TAILSCALE_HOSTNAME}
 	}
 }

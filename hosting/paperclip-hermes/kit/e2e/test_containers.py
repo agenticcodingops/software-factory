@@ -115,6 +115,7 @@ def test_caddy_tls_probe_supports_private_ca_and_rejects_untrusted_ca(installati
     root,old,candidate,previous,candidate_sha,c,compose=installation
     # Exercise the exact health() command in the pinned Alpine image.
     probe = ['exec', '-T', 'caddy', 'curl', '--silent', '--show-error',
+             '--resolve', 'caddy:443:127.0.0.1',
              '--cacert', '/public-ca/root.crt', '--output', '/dev/null',
              '--write-out', '%{http_code}', 'https://caddy/health/detailed']
     assert compose(*probe) == '401'
@@ -130,6 +131,63 @@ def test_caddy_tls_probe_supports_private_ca_and_rejects_untrusted_ca(installati
     probe[4:4] = ['--capath', '/tmp/empty-ca']
     with pytest.raises(c.r.RecoveryError):
         compose(*probe)
+
+
+def test_caddy_sites_reject_hermes_and_sandbox_sni_host_requests(installation):
+    root,old,candidate,previous,candidate_sha,c,compose=installation
+    # Build the real Hermes/sandbox images and retain their production networks,
+    # users and mounts. Idle entrypoints keep this network test off provider APIs.
+    override = root / 'containment.yaml'
+    override.write_text(yaml.safe_dump({'services': {
+        service: {'init': True, 'entrypoint': ['/bin/sleep', 'infinity'], 'command': [],
+                  'healthcheck': {'test': ['CMD', '/bin/true'], 'interval': '1s'}}
+        for service in ('hermes', 'sandbox')
+    }}))
+    c.atomic_secret(old / '.secrets/openai-api-key', secrets.token_hex(32).encode())
+    clients = c.r.Compose(old, compose.name)
+    clients.profiles = ['--profile', 'paperclip', '--profile', 'hermes']
+    clients.files = ['-f', 'compose.yaml', '-f', str(override)]
+    clients('up', '-d', '--build', '--wait', '--wait-timeout', '300', 'hermes', 'sandbox')
+    networks = json.loads(run('docker', 'inspect', '--format',
+                             '{{json .NetworkSettings.Networks}}', compose.container('caddy')))
+    assert set(networks) == {compose.name + '_tls', compose.name + '_gateway'}
+    # Intended Paperclip client: verify TLS for both sites, including the Host
+    # rewrite required by Paperclip's allowlist and the Hermes health auth boundary.
+    compose('exec', '-T', 'paperclip', 'node', '-e', '''
+        (async () => {
+            for (const [url, status] of [
+                ["https://paperclip.caddy/api/health", 200],
+                ["https://caddy/health/detailed", 401]
+            ]) {
+                const response = await fetch(url);
+                if (response.status !== status) throw Error(url + ": " + response.status);
+            }
+        })().catch(e => { console.error(e); process.exit(1); });
+    ''')
+    attack = '''
+import socket, ssl, sys
+ip, sni, host = sys.argv[1:]
+try:
+    with socket.create_connection((ip, 443), timeout=2) as connection:
+        with ssl._create_unverified_context().wrap_socket(connection, server_hostname=sni) as tls:
+            tls.sendall(("GET /api/health HTTP/1.1\\r\\nHost: " + host +
+                         "\\r\\nConnection: close\\r\\n\\r\\n").encode())
+            response = tls.recv(4096)
+except OSError:
+    print("blocked")
+else:
+    print("reachable: " + repr(response.split(b"\\r\\n", 1)[0]))
+'''
+    # Use explicit addresses: DNS failure must not masquerade as containment.
+    # Forge SNI and Host independently on every non-loopback Caddy interface.
+    for service in ('hermes', 'sandbox'):
+        for network in networks.values():
+            for sni in ('paperclip.caddy', 'caddy'):
+                for host in ('paperclip.caddy', 'caddy'):
+                    result = clients('exec', '-T', '--user', '10000:10000', service,
+                                     '/opt/hermes/.venv/bin/python', '-c', attack,
+                                     network['IPAddress'], sni, host).strip()
+                    assert result == 'blocked', (service, network['IPAddress'], sni, host, result)
 
 
 def test_upgrade_rollback(installation):
@@ -170,6 +228,13 @@ def test_upgrade_rollback(installation):
     assert dump<stop_db<archive
     compose('exec', '-T', 'postgres', 'psql', '-U', 'paperclip', '-d', 'paperclip', '-c',
             "UPDATE wp3_sentinel SET value='post-rollback-write';")
+    before = (root / 'state/last-op.json').read_bytes()
+    with patch.object(sys, 'argv', ['sfctl', 'upgrade', candidate_sha, '--run-id', 'e2e-upgrade']), \
+         patch.object(c.os, 'umask'), patch.object(c.r.signal, 'signal'), \
+         pytest.raises(c.r.RecoveryError, match='Rollback path already exists'):
+        c.main()
+    assert (root / 'state/last-op.json').read_bytes() == before
+    assert sentinel(compose) == 'post-rollback-write'
     for command in ('rollback', 'recover'):
         with patch.object(sys, 'argv', ['sfctl', command]), \
              patch.object(c.os, 'umask'), patch.object(c.r.signal, 'signal'), \

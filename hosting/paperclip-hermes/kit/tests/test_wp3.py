@@ -386,6 +386,47 @@ def test_upgrade_handoff_journal_blocks_another_candidate(tmp_path):
     compose.assert_not_called()
 
 
+@pytest.mark.parametrize('entry', ['directory', 'file', 'symlink', 'dangling-symlink'])
+def test_upgrade_reused_run_id_preserves_journal(tmp_path, entry):
+    state = tmp_path / 'state'
+    points = tmp_path / 'points'
+    points.mkdir()
+    point = points / 'used-run'
+    if entry == 'directory':
+        point.mkdir()
+        (point / 'rollback.json').write_text('{"old": "snapshot"}')
+    elif entry == 'file':
+        point.write_text('retained snapshot')
+    else:
+        target = tmp_path / 'target'
+        if entry == 'symlink':
+            target.mkdir()
+        point.symlink_to(target)
+    with patch.object(c, 'STATE', state), patch.object(c, 'ROLLBACK_ROOT', points), \
+         patch.object(r, 'Compose') as compose, patch.object(c, 'required_space', return_value=0), \
+         patch.object(r, 'kit_commit', return_value='a' * 40), \
+         patch.object(c, 'rollback_point', wraps=c.rollback_point) as snapshot:
+        compose.return_value.return_value = ''
+        c.journal('rolled-back', run_id='used-run', previous_sha='a' * 40)
+        before = (state / 'last-op.json').read_bytes()
+        with pytest.raises(r.RecoveryError, match='Rollback path already exists'):
+            c.upgrade('b' * 40, 'used-run', 0)
+        assert (state / 'last-op.json').read_bytes() == before
+        compose.assert_not_called()
+        snapshot.assert_not_called()
+
+
+@pytest.mark.parametrize('run_id', ['', '.', '..', '../escape', '/absolute', 'a/b', 'a b', 'a\n', 'x' * 256])
+def test_upgrade_invalid_run_id_preserves_journal(tmp_path, run_id):
+    with patch.object(c, 'STATE', tmp_path / 'state'), patch.object(r, 'Compose') as compose:
+        c.journal('rolled-back', run_id='previous')
+        before = (c.STATE / 'last-op.json').read_bytes()
+        with pytest.raises(r.RecoveryError, match='Invalid operation ID'):
+            c.upgrade('b' * 40, run_id, 0)
+        assert (c.STATE / 'last-op.json').read_bytes() == before
+        compose.assert_not_called()
+
+
 def test_prepare_config_generates_once_and_removes_legacy_env_secrets(tmp_path):
     directory=tmp_path/'.secrets';directory.mkdir(mode=0o700)
     original=secrets.token_hex(32)
