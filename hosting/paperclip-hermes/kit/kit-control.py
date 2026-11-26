@@ -26,6 +26,13 @@ STATE = r.STATE_DIR
 ROLLBACK_ROOT = Path('/data/rollback')
 UNITS = Path('/etc/systemd/system')
 DOCKER_DAEMON = Path('/etc/docker/daemon.json')
+RESOLVED_PHASES = ('complete', 'rolled-back', 'prepare-failed', 'restored-services-started')
+RECOVERY_PHASES = ('installing', 'healthy-awaiting-handoff', 'rollback-failed', 'creating-rollback-point')
+
+
+def operation_fields(record):
+    return {key: record[key] for key in
+            ('previous_sha', 'candidate_sha', 'rollback_point', 'run_id', 'previous_running') if key in record}
 
 
 def settings(kit=None):
@@ -90,12 +97,13 @@ def fence_project(compose):
         r.run(['docker', 'container', 'rm', *containers])
 
 
-def rollback_point(action, path, compose):
+def rollback_point(action, path, compose, operation=None):
     path = Path(path)
     if action == 'create':
         path.mkdir(mode=0o700, parents=True, exist_ok=False)
         r.private_directory(path)
-        running = compose('ps', '--services', '--status', 'running').split()
+        running = (operation['previous_running'] if operation is not None else
+                   compose('ps', '--services', '--status', 'running').split())
         installed = compose.services()
         writers = [s for s in r.SERVICES if s in installed]
         record = {'protocol': 1, 'kit_commit': r.kit_commit(), 'image_pins': r.image_pins(compose.kit),
@@ -121,15 +129,20 @@ def rollback_point(action, path, compose):
             r.atomic_json(path / 'rollback.json', record)
         except BaseException:
             # A failed dump or partial stop must restore availability of the old
-            # stack. Never let cleanup conceal that both operations failed.
+            # stack. Remove even a just-published point before writers restart:
+            # interrupted cleanup must never leave a replayable, stale point.
+            (path / 'rollback.json').unlink(missing_ok=True)
+            r.sync_directory(path)
+            shutil.rmtree(path)
+            r.sync_directory(path.parent)
             try:
                 if running:
                     r.restart_services(compose, running)
             except BaseException:
                 print('ops-alert: previous stack restart failed after rollback-point failure', file=sys.stderr)
                 raise
-            finally:
-                shutil.rmtree(path)
+            if operation is not None:
+                journal('prepare-failed', **operation_fields(operation))
             raise
         return record
     r.private_directory(path)
@@ -162,9 +175,28 @@ def rollback_point(action, path, compose):
             compose('exec', '-T', 'postgres', 'pg_restore', '--clean', '--if-exists',
                     '--exit-on-error', '--no-owner', '--no-acl',
                     '-U', 'paperclip', '-d', 'paperclip', input_file=dump)
+    if operation is not None:
+        # This is durable before application writers can accept new data. Even
+        # if the child/parent dies or health fails, never replay these archives.
+        journal('restored-services-started', **operation_fields(operation))
     if record['running']:
         compose('up', '-d', '--build', '--wait', '--wait-timeout', '300', *record['running'])
     return record
+
+
+def recover_point(point, compose):
+    operation = json.loads(r.read_private(STATE / 'last-op.json'))
+    if operation.get('operation') != 'upgrade' or operation.get('phase') not in RECOVERY_PHASES:
+        r.fail('Recovery requires an unresolved upgrade')
+    operation['rollback_point'] = str(point)
+    if operation['phase'] == 'creating-rollback-point' and not (Path(point) / 'rollback.json').exists():
+        if 'previous_running' not in operation:
+            r.fail('Interrupted preparation has no previous running-service inventory')
+        if operation['previous_running']:
+            r.restart_services(compose, operation['previous_running'])
+        journal('prepare-failed', **operation_fields(operation))
+        return
+    return rollback_point('restore', point, compose, operation=operation)
 
 
 def fetch_checkout(temporary, sha):
@@ -226,7 +258,7 @@ def upgrade(sha, run_id, lock_fd):
         r.fail('Invalid operation ID')
     if (STATE / 'last-op.json').exists():
         prior = json.loads(r.read_private(STATE / 'last-op.json'))
-        if prior.get('operation') == 'upgrade' and prior.get('phase') not in ('complete', 'rolled-back', 'prepare-failed'):
+        if prior.get('operation') == 'upgrade' and prior.get('phase') not in RESOLVED_PHASES:
             r.fail('Resolve the previous upgrade/handoff before another upgrade')
     compose = r.Compose(KIT, 'paperclip-hermes')
     point = ROLLBACK_ROOT / run_id
@@ -236,13 +268,10 @@ def upgrade(sha, run_id, lock_fd):
     previous = r.kit_commit()
     if previous == 'unknown':
         r.fail('Previous kit commit is unknown')
-    fields = {'previous_sha': previous, 'candidate_sha': sha, 'rollback_point': str(point), 'run_id': run_id}
+    fields = {'previous_sha': previous, 'candidate_sha': sha, 'rollback_point': str(point), 'run_id': run_id,
+              'previous_running': compose('ps', '--services', '--status', 'running').split()}
     journal('creating-rollback-point', **fields)
-    try:
-        rollback_point('create', point, compose)
-    except BaseException:
-        journal('prepare-failed', **fields)
-        raise
+    rollback_point('create', point, compose, operation=fields)
     journal('installing', **fields)
     try:
         candidate = checkout(sha)
@@ -263,9 +292,13 @@ def upgrade(sha, run_id, lock_fd):
             r.run(['python3', previous_kit / 'kit-control.py', 'recover-locked', '--point', point, '--lock-fd', str(lock_fd)], cwd=previous_kit, pass_fds=(lock_fd,))
             journal('rolled-back', **fields)
         except BaseException:
-            with suppress(Exception):
-                fence_project(compose)
-            journal('rollback-failed', **fields)
+            # A child can fail after restarting writers (including its health
+            # check). Preserve its durable barrier against replaying old data.
+            current = json.loads(r.read_private(STATE / 'last-op.json'))
+            if current.get('phase') not in RESOLVED_PHASES:
+                with suppress(Exception):
+                    fence_project(compose)
+                journal('rollback-failed', **fields)
             print('ops-alert: rollback failed; use the off-site blob in last-backup.json for approved ph-restore', file=sys.stderr)
             raise
         r.fail('Candidate failed health; previous kit and data restored')
@@ -484,8 +517,8 @@ def main():
         if (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino):
             r.fail('Recovery requires the inherited operation lock')
         fcntl.flock(args.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        rollback_point('restore', args.point, r.Compose(KIT, 'paperclip-hermes'))
-        if not health():
+        restored = recover_point(args.point, r.Compose(KIT, 'paperclip-hermes'))
+        if restored is not None and not health():
             r.fail('Restored stack is unhealthy')
         return 0
     with r.locked() as lock_fd:
@@ -499,8 +532,7 @@ def main():
             upgrade(args.sha, args.run_id, lock_fd)
         elif args.command in ('rollback', 'recover'):
             record = json.loads(r.read_private(STATE / 'last-op.json'))
-            if (record.get('operation') != 'upgrade' or record.get('phase') not in
-                    ('installing', 'healthy-awaiting-handoff', 'rollback-failed', 'creating-rollback-point')):
+            if record.get('operation') != 'upgrade' or record.get('phase') not in RECOVERY_PHASES:
                 r.fail('Recovery requires an unresolved upgrade')
             if args.point:
                 record['rollback_point'] = str(args.point)
@@ -508,7 +540,9 @@ def main():
             copy_secrets(KIT, previous)
             activate(previous)
             r.run(['python3', previous / 'kit-control.py', 'recover-locked', '--point', record['rollback_point'], '--lock-fd', str(lock_fd)], pass_fds=(lock_fd,))
-            journal('rolled-back', **{k: record[k] for k in ('previous_sha', 'candidate_sha', 'rollback_point', 'run_id')})
+            current = json.loads(r.read_private(STATE / 'last-op.json'))
+            if current.get('phase') != 'prepare-failed':
+                journal('rolled-back', **operation_fields(record))
         elif args.command == 'set-backup-credential':
             text = decrypt_input()
             # Validate before replacing an existing usable credential.

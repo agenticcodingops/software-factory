@@ -362,7 +362,7 @@ def test_upgrade_failed_health_restores_previous_code_and_data(tmp_path, restore
         if 'recover-locked' in args:
             assert (install/'current').resolve()==old
             events.append('previous-activated-before-restore')
-            c.rollback_point('restore',Path(args[args.index('--point')+1]),stack)
+            c.recover_point(Path(args[args.index('--point')+1]), stack)
             return ''
         return original(args,**kwargs)
     with patch.object(c,'KIT',old),patch.object(c,'INSTALL',install),patch.object(c,'STATE',tmp_path/'status'), \
@@ -717,7 +717,7 @@ def test_fence_project_includes_stopped_and_candidate_only_containers():
 
 
 @pytest.mark.parametrize('command', ['rollback', 'recover'])
-@pytest.mark.parametrize('phase', ['complete', 'rolled-back', 'prepare-failed', 'failed', None])
+@pytest.mark.parametrize('phase', ['complete', 'rolled-back', 'prepare-failed', 'restored-services-started', 'failed', None])
 def test_recovery_rejects_resolved_or_other_journals_before_checkout(tmp_path, command, phase):
     r.atomic_json(tmp_path / 'state/last-op.json', {'operation': 'upgrade', 'phase': phase})
     with patch.object(sys, 'argv', ['sfctl', command, '--point', str(tmp_path / 'point')]), \
@@ -771,3 +771,211 @@ def test_fencing_failure_prevents_volume_wipe(tmp_path):
              pytest.raises(r.RecoveryError, match='stop failed'):
             c.rollback_point('restore', point, stack)
     assert all((volume / 'state').read_text() == 'candidate data' for volume in stack.volumes.values())
+
+
+def run_until_crash(action):
+    # os._exit bypasses all exception/finally cleanup, like losing the process.
+    pid = os.fork()
+    if pid == 0:
+        try:
+            action()
+        except BaseException:
+            os._exit(74)
+        os._exit(75)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 73
+
+
+@pytest.mark.parametrize('interruption', ['before-services', 'after-services', 'before-parent-journal'])
+def test_interrupted_rollback_never_replays_after_writer_barrier(tmp_path, interruption):
+    stack = Stack(tmp_path)
+    point = tmp_path / 'point'
+    state = tmp_path / 'state'
+    fields = dict(previous_sha='a' * 40, candidate_sha='b' * 40,
+                  rollback_point=str(point), run_id='crash', previous_running=stack.installed)
+    original_journal = c.journal
+    original_compose = Stack.__call__
+    with patch.object(c, 'STATE', state), patch.object(r, 'private_stat'), \
+         patch.object(r, 'private_directory'), patch.object(c, 'volume_map', return_value=stack.volumes), \
+         patch.object(c, 'fence_project', side_effect=stack.fence):
+        c.rollback_point('create', point, stack)
+        c.journal('installing', **fields)
+
+        def journal(phase, **values):
+            if phase == 'rolled-back':
+                os._exit(73)
+            result = original_journal(phase, **values)
+            if phase == 'restored-services-started' and interruption == 'before-services':
+                os._exit(73)
+            return result
+
+        def compose(self, *args, **kwargs):
+            if args[:3] == ('up', '-d', '--build'):
+                assert json.loads((state / 'last-op.json').read_text())['phase'] == 'restored-services-started'
+            result = original_compose(self, *args, **kwargs)
+            if args[:3] == ('up', '-d', '--build'):
+                for volume in stack.volumes.values():
+                    (volume / 'state').write_text('acknowledged post-rollback write')
+                if interruption == 'after-services':
+                    os._exit(73)
+            return result
+
+        def crash():
+            with patch.object(c, 'journal', side_effect=journal), patch.object(Stack, '__call__', compose):
+                c.recover_point(point, stack)
+                assert json.loads((state / 'last-op.json').read_text())['phase'] == 'restored-services-started'
+                # The child has returned; the parent has not published its final phase.
+                c.journal('rolled-back', **fields)
+
+        run_until_crash(crash)
+        assert json.loads((state / 'last-op.json').read_text())['phase'] == 'restored-services-started'
+        expected = 'old-data' if interruption == 'before-services' else 'acknowledged post-rollback write'
+        stack.calls.clear()
+        for command in ('rollback', 'recover'):
+            with patch.object(sys, 'argv', ['sfctl', command]), \
+                 patch.object(r, 'locked', __import__('contextlib').nullcontext), \
+                 patch.object(r.signal, 'signal'), patch.object(c, 'checkout') as checkout, \
+                 pytest.raises(r.RecoveryError, match='unresolved upgrade'):
+                c.main()
+            checkout.assert_not_called()
+        with pytest.raises(r.RecoveryError, match='unresolved upgrade'):
+            c.recover_point(point, stack)
+        assert not stack.calls
+        assert all((volume / 'state').read_text() == expected for volume in stack.volumes.values())
+
+
+@pytest.mark.parametrize('interruption', ['after-postgres-stop', 'before-manifest', 'after-manifest', 'during-cleanup'])
+def test_interrupted_preparation_recovers_inventory_or_complete_point(tmp_path, interruption):
+    stack = Stack(tmp_path)
+    # Do not start services that were already stopped before the upgrade.
+    stack.running.remove('caddy')
+    previous_running = [service for service in stack.installed if service in stack.running]
+    point = tmp_path / 'points/crash'
+    state = tmp_path / 'state'
+    original_atomic = r.atomic_json
+    original_compose = Stack.__call__
+
+    def compose(self, *args, **kwargs):
+        if args[0] == 'stop':
+            inventory = json.loads((state / 'last-op.json').read_text())
+            assert inventory['previous_running'] == previous_running
+        return original_compose(self, *args, **kwargs)
+
+    def volumes(compose):
+        assert not stack.running
+        inventory = json.loads((state / 'last-op.json').read_text())
+        assert inventory['previous_running'] == previous_running
+        if interruption == 'after-postgres-stop':
+            os._exit(73)
+        return stack.volumes
+
+    def atomic(path, record):
+        if path.name == 'rollback.json' and interruption == 'before-manifest':
+            os._exit(73)
+        original_atomic(path, record)
+        if path.name == 'rollback.json' and interruption == 'after-manifest':
+            os._exit(73)
+        if path.name == 'rollback.json' and interruption == 'during-cleanup':
+            raise r.RecoveryError('failure after publishing manifest')
+
+    original_cleanup = shutil.rmtree
+
+    def cleanup(path):
+        if interruption == 'during-cleanup':
+            assert not (path / 'rollback.json').exists()
+            next(path.glob('*.tar')).unlink()
+            os._exit(73)
+        original_cleanup(path)
+
+    with patch.object(c, 'STATE', state), patch.object(c, 'ROLLBACK_ROOT', tmp_path / 'points'), \
+         patch.object(r, 'Compose', return_value=stack), patch.object(c, 'required_space', return_value=0), \
+         patch.object(r, 'kit_commit', return_value='a' * 40), patch.object(r, 'private_stat'), \
+         patch.object(r, 'private_directory'):
+        def crash():
+            with patch.object(c, 'volume_map', side_effect=volumes), \
+                 patch.object(r, 'atomic_json', side_effect=atomic), patch.object(Stack, '__call__', compose), \
+                 patch.object(shutil, 'rmtree', side_effect=cleanup):
+                c.upgrade('b' * 40, 'crash', 7)
+        run_until_crash(crash)
+        assert json.loads((state / 'last-op.json').read_text())['phase'] == 'creating-rollback-point'
+        assert (point / 'rollback.json').exists() == (interruption == 'after-manifest')
+        # Parent observes the stopped stack after the child abruptly exits.
+        stack.running.clear()
+        stack.calls.clear()
+        for volume in stack.volumes.values():
+            (volume / 'state').write_text('current data')
+        with patch.object(c, 'volume_map', return_value=stack.volumes) as mapped, \
+             patch.object(c, 'fence_project', side_effect=stack.fence) as fence:
+            c.recover_point(point, stack)
+        phase = json.loads((state / 'last-op.json').read_text())['phase']
+        if interruption == 'after-manifest':
+            assert phase == 'restored-services-started'
+            fence.assert_called_once()
+            expected = 'old-data'
+        else:
+            assert phase == 'prepare-failed'
+            mapped.assert_not_called()
+            fence.assert_not_called()
+            assert stack.calls == [('up', '-d', '--no-recreate', '--no-build', '--pull', 'never',
+                                    '--wait', '--wait-timeout', '300', *previous_running)]
+            expected = 'current data'
+        assert all((volume / 'state').read_text() == expected for volume in stack.volumes.values())
+
+
+@pytest.mark.parametrize('failure', ['child', 'parent-journal'])
+def test_upgrade_preserves_writer_barrier_when_recovery_completion_fails(tmp_path, failure):
+    stack = Stack(tmp_path)
+    original = r.run
+    original_journal = c.journal
+
+    def journal(phase, **fields):
+        result = original_journal(phase, **fields)
+        if phase == 'rolled-back' and failure == 'parent-journal':
+            raise r.RecoveryError('injected completion failure')
+        return result
+
+    def execute(args, **kwargs):
+        if args[0] == 'bash':
+            raise r.RecoveryError('candidate failed')
+        if 'recover-locked' in args:
+            c.recover_point(Path(args[args.index('--point') + 1]), stack)
+            for volume in stack.volumes.values():
+                (volume / 'state').write_text('acknowledged write')
+            if failure == 'child':
+                raise r.RecoveryError('injected completion failure')
+            return ''
+        return original(args, **kwargs)
+
+    with patch.object(c, 'STATE', tmp_path / 'state'), patch.object(c, 'ROLLBACK_ROOT', tmp_path / 'points'), \
+         patch.object(r, 'Compose', return_value=stack), patch.object(c, 'required_space', return_value=0), \
+         patch.object(r, 'kit_commit', return_value='a' * 40), patch.object(r, 'private_stat'), \
+         patch.object(r, 'private_directory'), patch.object(c, 'checkout', return_value=KIT), \
+         patch.object(c, 'activate'), patch.object(c, 'copy_secrets'), patch.object(r, 'run', side_effect=execute), \
+         patch.object(c, 'journal', side_effect=journal), \
+         patch.object(c, 'volume_map', return_value=stack.volumes), \
+         patch.object(c, 'fence_project', side_effect=stack.fence) as fence, \
+         pytest.raises(r.RecoveryError, match='injected completion failure'):
+        c.upgrade('b' * 40, 'crash', 7)
+    phase = 'restored-services-started' if failure == 'child' else 'rolled-back'
+    assert json.loads((tmp_path / 'state/last-op.json').read_text())['phase'] == phase
+    assert fence.call_count == 1
+    assert stack.running == set(stack.installed)
+    assert all((volume / 'state').read_text() == 'acknowledged write' for volume in stack.volumes.values())
+
+
+def test_incomplete_preparation_restart_failure_remains_recoverable(tmp_path):
+    stack = Stack(tmp_path)
+    point = tmp_path / 'incomplete'
+    fields = dict(previous_sha='a' * 40, candidate_sha='b' * 40,
+                  rollback_point=str(point), run_id='crash', previous_running=stack.installed)
+    with patch.object(c, 'STATE', tmp_path / 'state'), patch.object(r, 'private_stat'), \
+         patch.object(r, 'private_directory'), patch.object(c, 'rollback_point') as restore:
+        c.journal('creating-rollback-point', **fields)
+        stack.fail_restart = True
+        with pytest.raises(r.RecoveryError, match='restart failed'):
+            c.recover_point(point, stack)
+        assert json.loads((tmp_path / 'state/last-op.json').read_text())['phase'] == 'creating-rollback-point'
+        stack.fail_restart = False
+        c.recover_point(point, stack)
+        assert json.loads((tmp_path / 'state/last-op.json').read_text())['phase'] == 'prepare-failed'
+    restore.assert_not_called()

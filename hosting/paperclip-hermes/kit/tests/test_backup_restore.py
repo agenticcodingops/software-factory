@@ -1237,7 +1237,7 @@ class RestoredProvenanceTests(unittest.TestCase):
             target.mkdir()
             trusted = recovery.kit_commit()
             recovery.restore_config(archive, target, 'f' * 40)
-            with patch.object(recovery, 'KIT', target):
+            with patch.object(recovery, 'KIT', target), patch.object(recovery, 'private_stat'):
                 self.assertEqual(recovery.kit_commit(), trusted)
                 self.assertFalse(recovery.kit_modified())
                 (target / 'compose.yaml').write_text('local edit')

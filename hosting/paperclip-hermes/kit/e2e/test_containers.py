@@ -149,7 +149,7 @@ def test_upgrade_rollback(installation):
         if 'recover-locked' in args:
             # Invoke the previous checkout's actual restore implementation,
             # while the caller retains the real host operation lock.
-            c.rollback_point('restore',Path(args[args.index('--point')+1]),compose)
+            c.recover_point(Path(args[args.index('--point')+1]), compose)
             return ''
         return original(args,**kwargs)
     with patch.object(c,'checkout',side_effect=lambda sha: old if sha==previous else candidate), \
@@ -234,8 +234,9 @@ def test_cross_version_restore(installation):
             raise restored_control.r.RecoveryError('Injected restored candidate health failure')
         if 'recover-locked' in args:
             previous_control = load(rollback_kit)
-            previous_control.rollback_point('restore', Path(args[args.index('--point') + 1]),
-                                            compose_type(rollback_kit, 'sf-e2e-restored'))
+            with patch.object(previous_control, 'STATE', root / 'restored-state'):
+                previous_control.recover_point(Path(args[args.index('--point') + 1]),
+                                               compose_type(rollback_kit, 'sf-e2e-restored'))
             return ''
         return commands(args, **kwargs)
     with patch.object(restored_control, 'STATE', root / 'restored-state'), \
