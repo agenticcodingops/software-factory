@@ -11,13 +11,38 @@ from repo_files import files
 
 GUID = re.compile(r"(?<![a-f0-9])[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?![a-f0-9])", re.I)
 EMAIL = re.compile(r"[a-z0-9][a-z0-9.!#$%&'*+=?^_`{|}~-]*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}", re.I)
-TAILNET = re.compile(r"(?<![a-z0-9_.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+ts\.net\b", re.I)
+TAILNET = re.compile(r"(?<![a-z0-9_.-])(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+ts\.net\b", re.I)
 TOKEN = re.compile(r"[A-Za-z0-9_@.+-]+")
 
 
 def entries(path: Path) -> set[str]:
     return {line.strip().casefold() for line in path.read_text().splitlines()
             if line.strip() and not line.lstrip().startswith("#")}
+
+
+def decode_text(data: bytes) -> str:
+    # UTF-32 BOMs must be tested before their UTF-16 prefixes.
+    if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        encoding = "utf-32"
+    elif data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    elif b"\x00" in data:
+        if all(data[i::4] and data[i::4].count(0) > len(data[i::4]) / 2 for i in (1, 2, 3)):
+            encoding = "utf-32-le"
+        elif all(data[i::4] and data[i::4].count(0) > len(data[i::4]) / 2 for i in (0, 1, 2)):
+            encoding = "utf-32-be"
+        elif data[1::2].count(0) > len(data) / 4:
+            encoding = "utf-16-le"
+        elif data[::2].count(0) > len(data) / 4:
+            encoding = "utf-16-be"
+        else:
+            raise UnicodeError("unsupported NUL-interleaved text")
+    else:
+        encoding = "utf-8-sig"
+    text = data.decode(encoding)
+    if "\x00" in text:
+        raise UnicodeError("decoded text contains NULs")
+    return text
 
 
 def findings(text: str, allowed: set[str], private: set[str]):
@@ -54,7 +79,12 @@ def main() -> int:
             raise ValueError("private hash entries must be SHA-256 digests")
         count = 0
         for path in files(root):
-            content = os.readlink(path) if path.is_symlink() else path.read_bytes().decode("utf-8", errors="replace")
+            try:
+                content = os.readlink(path) if path.is_symlink() else decode_text(path.read_bytes())
+            except UnicodeError:
+                print(f"{path.relative_to(root)}: denied undecodable text")
+                count += 1
+                continue
             for line, kind in sorted(set(findings(content, allowed, private))):
                 print(f"{path.relative_to(root)}:{line}: denied {kind}")
                 count += 1

@@ -3,7 +3,9 @@
 Run `python3 hosting/paperclip-hermes/tools/deny-list.py` at the repository root.
 It scans all tracked and non-ignored untracked files, including dotfiles, without reading Git history. Findings print the file, line and category, never the matched value.
 
-The patterns reject GUIDs, e-mail addresses and hostnames ending in `.ts.net`.
+Files must decode as UTF-8 (with or without a BOM), BOM-marked UTF-16/UTF-32, or NUL-interleaved UTF-16/UTF-32 detected from byte patterns. Decoding is strict: unsupported, malformed or remaining NUL-containing content fails closed with a file-level finding. Convert such files to UTF-8 before committing them.
+
+The patterns reject GUIDs, e-mail addresses and hostnames ending in `.ts.net`, including wildcard-prefixed names.
 These public forms pass:
 
 - The organization name `agenticcodingops` and GitHub handles in CODEOWNERS.

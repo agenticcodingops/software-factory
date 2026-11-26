@@ -16,7 +16,7 @@ Repository paths follow the ADR: kit, Terraform, tools, bootstrap and rulesets l
 ## Local checks
 
 On Linux amd64, install Python 3.11, Node 22.23.5, Terraform at the version in
-[.terraform-version](.terraform-version), ShellCheck, Bats, curl, unzip and Git. Then:
+[.terraform-version](.terraform-version), ShellCheck, Bats, jq, curl, unzip and Git. Then:
 
 ```sh
 python3 -m venv .venv
@@ -55,10 +55,15 @@ The kit unit tests use sudo when needed to exercise root-only ownership protecti
 Use conventional commits such as `feat(ci): add checks` and `fix(deps): update a provider`.
 Release Please starts at `v0.1.0`, maintains a release PR and changelog, and creates `vX.Y.Z` tags
 when a release PR merges to `main`. The release workflow attaches a kit tarball and SHA-256 checksum.
-It requires an operator-provisioned **machine-user** `RELEASE_PLEASE_TOKEN` with repository contents
+Push runs also repair missing archive or checksum assets on the current version's existing release.
+To rebuild both assets, dispatch **Release** on `main`, optionally supplying an existing `vX.Y.Z` tag;
+the default is the current manifest version. Recovery checks out that tag and replaces both assets
+with `--clobber`, without invoking Release Please or requiring its machine-user token.
+
+Release Please requires an operator-provisioned **machine-user** `RELEASE_PLEASE_TOKEN` with repository contents
 and pull-request write access. A machine-user token lets the release PR trigger CI, as required by
 the ADR; no release PR is opened with `GITHUB_TOKEN`. Configure this secret before the first main push
-or dispatch. The workflow fails visibly if it is missing. Never put token values in the repository.
+that runs Release Please. The workflow fails visibly if it is missing. Never put token values in the repository.
 
 Review the [ruleset payloads and apply/readback procedure](hosting/paperclip-hermes/rulesets/README.md).
 Only the public payload is ready for operator application. The instance and org templates remain
