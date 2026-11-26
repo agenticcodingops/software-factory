@@ -1,0 +1,72 @@
+{
+  "tagOwners": {
+    "tag:pcpilot": [
+      "tag:pc-deployer"
+    ],
+    "tag:pc-deployer": [
+      "operator@example.com"
+    ]
+  },
+  "grants": [
+    {
+      "src": [
+        "operator@example.com"
+      ],
+      "dst": [
+        "tag:pcpilot"
+      ],
+      "ip": [
+        "tcp:22",
+        "tcp:443",
+        "tcp:9443"
+      ]
+    }
+  ],
+  "ssh": [
+    {
+      "action": "check",
+      "src": [
+        "operator@example.com"
+      ],
+      "dst": [
+        "tag:pcpilot"
+      ],
+      "users": [
+        "admin"
+      ]
+    }
+  ],
+  "tests": [
+    {
+      "src": "operator@example.com",
+      "accept": [
+        "tag:pcpilot:22",
+        "tag:pcpilot:443",
+        "tag:pcpilot:9443"
+      ]
+    },
+    {
+      "src": "tag:pcpilot",
+      "deny": [
+        "tag:other:22"
+      ]
+    },
+    {
+      "src": "autogroup:member",
+      "deny": [
+        "tag:pcpilot:22"
+      ]
+    }
+  ],
+  "sshTests": [
+    {
+      "src": "operator@example.com",
+      "dst": [
+        "tag:pcpilot"
+      ],
+      "check": [
+        "admin"
+      ]
+    }
+  ]
+}

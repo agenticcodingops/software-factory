@@ -33,6 +33,8 @@ repository access and no secrets. It checks line endings and JSON, immutable act
 version comments, job permissions, [the deny-list](deny-list/README.md) and its planted-value tests,
 the kit's unit tests, actionlint (including both existing Claude workflows), zizmor, gitleaks,
 Markdown, every shell script, Bats, Terraform formatting, TFLint, Checkov and the Renovate validator.
+Gitleaks excludes downloaded `.terraform`, `.venv` and `node_modules` dependencies through
+[.gitleaks.toml](.gitleaks.toml); committed deployment source and fixtures are scanned.
 The sole zizmor exception is documented in [zizmor.yml](zizmor.yml): the unchanged mention workflow
 keeps checkout credentials but uploads no checkout artifacts. No workflow is excluded from actionlint.
 Markdown line length is off; the config documents compatibility settings for the existing docs.
@@ -40,13 +42,16 @@ After regenerating the npm lock file, run `python3 ci/normalize-npm-lock.py` to 
 registry deprecation messages that include upstream maintainers' personal e-mail addresses.
 Package versions, integrity hashes and dependency resolution are preserved.
 
-Terraform stacks and Renovate presets are absent in WP1. Their checks pass on this empty scaffold,
-and the Renovate validator runs against an empty fixture. Once a stack exists, CI requires a tracked
+WP4 adds the [Terraform modules and three stacks](hosting/paperclip-hermes/terraform/README.md), mock-provider
+invariants, policy-lint and plan-guard fixtures. Renovate presets remain future work and their validator
+runs against an empty fixture. For each stack, CI requires a tracked
 `.terraform.lock.hcl`, initializes without a backend or lock changes, validates and runs `terraform test`,
 then regenerates provider checksums for **linux_amd64 and windows_amd64** and rejects drift.
 Root providers and registry modules must use exact version pins; Git modules must pin a full commit.
-Reusable modules follow the ADR's bounded provider-range convention. Mock provider tests, the policy,
-plan and ref-bump tools and their tests join CI when their work packages add them.
+Reusable modules follow the ADR's bounded provider-range convention. CI inspects every verbose mock
+plan for secret resources, private key material and network/storage controls. The ref-bump tool remains
+future work. Ops credentials require owner-authorized exact workflow identities; environment-only
+federation is unavailable. Live token-exchange and controller acceptance still block deployment release.
 Container e2e, Azure and GitHub settings checks require later packages and operator infrastructure.
 The kit unit tests use sudo when needed to exercise root-only ownership protections.
 

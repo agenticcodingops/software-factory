@@ -34,4 +34,4 @@ else
   npm run validate:renovate -- "$fixture"
   echo 'Renovate presets: none yet (WP1); validator smoke check passed.'
 fi
-echo 'All WP1 checks passed.'
+echo 'All repository checks passed (WP1 + WP4).'
