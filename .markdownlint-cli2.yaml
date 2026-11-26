@@ -1,0 +1,16 @@
+ignores:
+  - node_modules/** # Installed third-party packages are not the public source tree.
+  - .venv/**
+config:
+  MD013: false # Long ADR prose, source links and tables are intentionally unwrapped.
+  MD046:
+    style: fenced # The kit embeds examples inside lists; indented blocks are ambiguous.
+  MD048: false # The kit mixes backtick and tilde fences, including nested examples.
+  MD060: false # Existing ADR and kit tables use compact delimiter rows (|---|).
+overrides:
+  - filter: [hosting/paperclip-hermes/kit/recovery-sources.md]
+    combine: merge
+    config:
+      MD033:
+        allowed_elements: [id, name] # Upstream API placeholders, not rendered HTML.
+      MD037: false # The source contract quotes literal wildcard paths with underscores.

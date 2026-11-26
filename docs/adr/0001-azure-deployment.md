@@ -214,7 +214,7 @@ The operator's own user gets Blob Data Reader on `backups` and Blob Data Contrib
 
 **Proposed public `software-factory` layout** (MIT; absent paths below are work to implement):
 
-```
+```text
 LICENSE README.md SECURITY.md CODEOWNERS .terraform-version
 hosting/paperclip-hermes/
   kit/                                         # WP2: one import commit; message records private source repository and commit
@@ -238,7 +238,7 @@ Reusable workflows must sit directly in `.github/workflows`, which is why they c
 
 **Instance template** (`templates/instance/`, copied by `sf-bootstrap.sh init`):
 
-```
+```text
 config/instance.tfvars.json        # prefix, apps, daily_run_hours, shutdown_time, timezone,
                                    # billing_period_start_day, budgets, not_before, custody, vault_mode
                                    # pre_stop_backup_window_minutes=15, backup_runtime_threshold_hours=24
@@ -304,13 +304,13 @@ The ops-plane caller matrix is materialized as separate static jobs, one entry p
   - `managed_identities` is empty, and `generate_admin_password_or_ssh_key = false`.
   - The plan contains no `tls_private_key` or `random_password` resource.
   - All four current VM protocol tags pass through unchanged; they are absent on a new VM.
-   - An existing VM's `custom_data` stays byte-for-byte unchanged across release/workflow SHA bumps, contains no release SHA, and is independent of the candidate kit SHA; plan-guard tests reject changed or unknown `custom_data` even with `override_replace`.
+  - An existing VM's `custom_data` stays byte-for-byte unchanged across release/workflow SHA bumps, contains no release SHA, and is independent of the candidate kit SHA; plan-guard tests reject changed or unknown `custom_data` even with `override_replace`.
   - A shutdown schedule exists, set at least 45 minutes after the backup timer.
   - The data disk has `prevent_destroy` with `allow_disk_destroy=false`, including ordinary upgrades, moves before decommission and parked disks. The gated `true` configuration removes protection without deleting/replacing the disk during its preparatory apply; workflow acceptance tests enforce the authorization and backup checks in "Teardown".
   - Shared Key is off on the backup and state accounts.
   - Both lifecycle actions exist, with their prefix filters.
   - `id-sf-ops` and `id-sf-restore` hold the delegation role at account scope and their data roles at container scope.
-   - `id-sf-ops` (or its target-tenant twin) holds Cost Management Reader on every target subscription, including a newly added target; it receives no cost-write role.
+  - `id-sf-ops` (or its target-tenant twin) holds Cost Management Reader on every target subscription, including a newly added target; it receives no cost-write role.
   - The RG budget is at least £5.
 - **The policy invariant** runs against the instance's real policy, not a mock. `tools/policy-lint.py` runs before Terraform in `ph-plan` and `ph-deploy`. It runs in **enforcing mode** for the hardening PR, all later PRs, nightly drift and every deployment. The sole exception is the read-only baseline-import PR described under "Tailscale": `ph-plan` verifies that it preserves the live policy and settings with no resource diff, then runs the linter in **report-only mode**, listing findings without blocking on them. A label or caller input alone cannot select this exception; policy/settings edits or unrelated deployment changes disqualify it. There is no baseline apply or application of `tag:pcpilot` grants. Enforcing mode must pass before any host joins the tailnet. The linter expands every `grants` and `acls` entry and, in enforcing mode, fails when:
   - any `src` covers `tag:pcpilot` (the literal tag, `*`, `autogroup:tagged`, or a host alias resolving to it);

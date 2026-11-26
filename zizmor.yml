@@ -1,0 +1,6 @@
+rules:
+  artipacked:
+    ignore:
+      # Existing mention workflow must remain unchanged for WP1. It uploads no
+      # checkout artifacts. Remove this exception when persist-credentials is fixed.
+      - claude.yml:41

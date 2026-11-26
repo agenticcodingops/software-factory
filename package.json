@@ -1,0 +1,12 @@
+{
+  "name": "software-factory-checks",
+  "private": true,
+  "scripts": {
+    "lint:markdown": "markdownlint-cli2 '**/*.md'",
+    "validate:renovate": "renovate-config-validator --strict"
+  },
+  "devDependencies": {
+    "markdownlint-cli2": "0.24.2",
+    "renovate": "42.0.0"
+  }
+}
