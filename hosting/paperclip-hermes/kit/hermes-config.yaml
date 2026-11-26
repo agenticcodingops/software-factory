@@ -1,0 +1,16 @@
+# Startup reapplies this policy; set operator model choices (HERMES_MODEL) in the host .secrets/compose.env.
+model:
+  provider: openai
+  base_url: https://api.openai.com/v1
+  default: gpt-5-mini
+terminal:
+  backend: ssh
+  cwd: /workspace
+  ssh_host: sandbox
+  ssh_user: hermes
+  ssh_port: 2222
+  ssh_key: /run/kit/sandbox_ed25519
+  env_passthrough: []
+  client_env_passthrough: []
+dashboard:
+  trusted_proxies: []

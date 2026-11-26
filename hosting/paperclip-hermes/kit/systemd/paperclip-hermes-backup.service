@@ -1,0 +1,24 @@
+[Unit]
+Description=Encrypted Paperclip and Hermes host backup
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+# Install-time: replace /opt/paperclip-hermes with this dedicated kit checkout.
+WorkingDirectory=/opt/paperclip-hermes
+ExecStart=/bin/bash /opt/paperclip-hermes/backup.sh
+TimeoutStartSec=2h
+# Cleanup deletes staged plaintext, then waits up to 300 s for the services to
+# restart; allow that wait several times over before systemd sends SIGKILL.
+TimeoutStopSec=15min
+# Stop the host Python first so its cleanup can still invoke Docker to restart
+# the services. SIGKILL/power loss cannot run cleanup; see the recovery runbook.
+KillMode=mixed
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
