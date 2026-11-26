@@ -80,3 +80,8 @@ variable "container_retention_fallback" {
   description = "Enable only if self-test 3 shows account retention is not inherited."
   default     = false
 }
+
+variable "workload_resource_group_ids" {
+  type        = map(string)
+  description = "Trust-owned workload RG IDs from subscription-specific root modules."
+}

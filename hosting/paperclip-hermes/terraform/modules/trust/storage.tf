@@ -22,6 +22,8 @@ module "backups" {
   }
   containers = {
     backups = { name = "backups", immutable_storage_with_versioning = { enabled = true } }
+    # Retain the old container so upgrading does not try to delete locked staging blobs.
+    # All restore/operator grants now point to module.staging; no new uploads go here.
     staging = { name = "restore-staging" }
   }
   storage_management_policy_rule = {
@@ -34,6 +36,37 @@ module "backups" {
         version   = { delete_after_days_since_creation = 45 }
       }
     }
+    staging = {
+      name    = "expire-staging"
+      enabled = true
+      filters = { blob_types = ["blockBlob"], prefix_match = ["restore-staging/"] }
+      actions = {
+        base_blob = { delete_after_days_since_modification_greater_than = 1 }
+        version   = { delete_after_days_since_creation = 1 }
+      }
+    }
+  }
+  lock             = { kind = "CanNotDelete" }
+  enable_telemetry = false
+}
+# Restore ciphertext must age out after one day, outside the backup account's WORM default.
+module "staging" {
+  #checkov:skip=CKV_TF_1:ADR 0001 requires exact registry releases; test_terraform_contract.py verifies every source/version.
+  source                          = "Azure/avm-res-storage-storageaccount/azurerm"
+  version                         = "0.11.0"
+  name                            = "${var.prefix}staging"
+  parent_id                       = azurerm_resource_group.vault.id
+  location                        = var.location
+  account_replication_type        = "GRS"
+  shared_access_key_enabled       = false
+  default_to_oauth_authentication = true
+  min_tls_version                 = "TLS1_2"
+  allow_nested_items_to_be_public = false
+  blob_properties = {
+    versioning_enabled = true
+  }
+  containers = { staging = { name = "restore-staging" } }
+  storage_management_policy_rule = {
     staging = {
       name    = "expire-staging"
       enabled = true

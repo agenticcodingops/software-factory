@@ -1,6 +1,7 @@
 module "trust" {
   source                       = "../../modules/trust"
   providers                    = { azurerm = azurerm, azapi = azapi, azurerm.target = azurerm.target, azapi.target = azapi.target }
+  workload_resource_group_ids  = {}
   prefix                       = var.prefix
   location                     = var.location
   vault_subscription_id        = var.vault_subscription_id
@@ -42,4 +43,9 @@ import {
 import {
   to = module.trust.module.state.azapi_resource.lock[0]
   id = "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault/providers/Microsoft.Storage/storageAccounts/${var.state_account_name}/providers/Microsoft.Authorization/locks/state-cannot-delete"
+}
+
+output "workload_resource_groups" {
+  description = "Resolved workload RG resources from every subscription."
+  value       = {}
 }

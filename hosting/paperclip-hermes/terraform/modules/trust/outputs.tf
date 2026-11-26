@@ -16,6 +16,6 @@ output "authorization" {
 }
 output "storage" {
   description = "Actual storage inputs and state settings for mocked invariant checks."
-  value       = { backups = module.backups.resource, state = module.state.resource, key_vault = azurerm_key_vault.this }
+  value       = { backups = module.backups.resource, staging = module.staging.resource, state = module.state.resource, key_vault = azurerm_key_vault.this }
   sensitive   = true
 }

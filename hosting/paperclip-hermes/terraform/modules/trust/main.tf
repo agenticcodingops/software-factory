@@ -9,10 +9,11 @@ locals {
       subject  = "${var.sub_claim_prefix}:environment:${env}:job_workflow_ref:${ref}"
     }
   } }
-  backup_account_id = "${local.vault_rg_id}/providers/Microsoft.Storage/storageAccounts/${var.prefix}backups"
-  backups_scope     = "${local.backup_account_id}/blobServices/default/containers/backups"
-  staging_scope     = "${local.backup_account_id}/blobServices/default/containers/restore-staging"
-  state_scope       = "${local.vault_rg_id}/providers/Microsoft.Storage/storageAccounts/${var.state_account_name}/blobServices/default/containers/tfstate"
+  backup_account_id  = "${local.vault_rg_id}/providers/Microsoft.Storage/storageAccounts/${var.prefix}backups"
+  backups_scope      = "${local.backup_account_id}/blobServices/default/containers/backups"
+  staging_account_id = "${local.vault_rg_id}/providers/Microsoft.Storage/storageAccounts/${var.prefix}staging"
+  staging_scope      = "${local.staging_account_id}/blobServices/default/containers/restore-staging"
+  state_scope        = "${local.vault_rg_id}/providers/Microsoft.Storage/storageAccounts/${var.state_account_name}/blobServices/default/containers/tfstate"
   roles = {
     host_operator = { name = "SF Host Operator", actions = ["Microsoft.Compute/virtualMachines/read", "Microsoft.Compute/virtualMachines/start/action", "Microsoft.Compute/virtualMachines/deallocate/action", "Microsoft.Compute/virtualMachines/runCommands/*"], data_actions = [] }
     deallocator   = { name = "SF VM Deallocator", actions = ["Microsoft.Compute/virtualMachines/read", "Microsoft.Compute/virtualMachines/deallocate/action"], data_actions = [] }
@@ -56,7 +57,7 @@ locals {
     restore = merge({
       backup_read   = { role_definition_id_or_name = "Storage Blob Data Reader", scope = local.backups_scope }
       staging_write = { role_definition_id_or_name = "Storage Blob Data Contributor", scope = local.staging_scope }
-      delegation    = { role_definition_id_or_name = azurerm_role_definition.vault["delegation"].role_definition_resource_id, scope = local.backup_account_id }
+      delegation    = { role_definition_id_or_name = azurerm_role_definition.vault["delegation"].role_definition_resource_id, scope = local.staging_account_id }
     }, var.custody == "vault" ? { key_read = { role_definition_id_or_name = "Key Vault Secrets User", scope = azurerm_key_vault.this.id } } : {})
   }
 }
@@ -68,16 +69,6 @@ resource "azurerm_resource_group" "vault" {
 resource "azurerm_resource_group" "drill" {
   name     = "rg-${var.prefix}-drill"
   location = var.location
-}
-module "workload_rg" {
-  #checkov:skip=CKV_TF_1:ADR 0001 requires exact registry releases; test_terraform_contract.py verifies every source/version.
-  for_each         = { for k, v in var.targets : k => v if v.rg_managed_by == "trust" }
-  source           = "Azure/avm-res-resources-resourcegroup/azurerm"
-  version          = "0.5.0"
-  providers        = { azapi = azapi.target }
-  name             = each.value.resource_group_name
-  location         = each.value.location
-  enable_telemetry = false
 }
 resource "azurerm_role_definition" "target" {
   provider          = azurerm.target
@@ -110,7 +101,7 @@ module "identities" {
   federated_identity_credentials = local.federations[each.key]
   outbound_role_assignments      = merge(local.vault_grants[each.key], var.vault_tenant_id == var.target_tenant_id ? local.target_grants[each.key] : {})
   enable_telemetry               = false
-  depends_on                     = [module.workload_rg, module.backups, module.state]
+  depends_on                     = [terraform_data.workload_rg_ready, module.backups, module.staging, module.state]
 }
 module "target_identities" {
   #checkov:skip=CKV_TF_1:ADR 0001 requires exact registry releases; test_terraform_contract.py verifies every source/version.
@@ -124,7 +115,7 @@ module "target_identities" {
   federated_identity_credentials = local.federations[each.key]
   outbound_role_assignments      = local.target_grants[each.key]
   enable_telemetry               = false
-  depends_on                     = [module.workload_rg]
+  depends_on                     = [terraform_data.workload_rg_ready]
 }
 resource "azurerm_role_assignment" "operator" {
   for_each = {
@@ -134,7 +125,7 @@ resource "azurerm_role_assignment" "operator" {
   principal_id         = var.operator_object_id
   scope                = each.value.scope
   role_definition_name = each.value.role
-  depends_on           = [module.backups]
+  depends_on           = [module.backups, module.staging]
 }
 
 # Twins must be outside the Contributor-controlled workload RG.
@@ -143,4 +134,17 @@ resource "azurerm_resource_group" "target_identities" {
   count    = var.vault_tenant_id != var.target_tenant_id ? 1 : 0
   name     = "rg-${var.prefix}-trust"
   location = values(var.targets)[0].location
+}
+
+# Referencing the resolved module outputs also orders RG creation before scoped grants.
+resource "terraform_data" "workload_rg_ready" {
+  input = var.workload_resource_group_ids
+  lifecycle {
+    precondition {
+      condition = alltrue([for key, target in var.targets :
+        target.rg_managed_by != "trust" || lookup(var.workload_resource_group_ids, key, "") == "${target.subscription_resource_id}/resourceGroups/${target.resource_group_name}"
+      ])
+      error_message = "Every trust-owned workload RG must be composed with its subscription provider; run render-trust.py before init."
+    }
+  }
 }

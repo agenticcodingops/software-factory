@@ -31,6 +31,7 @@ mock_provider "azurerm" {
 mock_provider "azapi" {
   override_during = plan
   alias           = "target"
+  mock_data "azapi_client_config" { defaults = { subscription_id = "00000000-0000-0000-0000-000000000000" } }
 }
 variables {
   prefix                = "sffixture"
@@ -60,7 +61,7 @@ run "trust_storage_and_authorization" {
     error_message = "Key Vault must use RBAC and purge protection."
   }
   assert {
-    condition     = alltrue([for identity in ["ops", "restore"] : output.authorization.vault[identity].delegation.scope == "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups"])
+    condition     = output.authorization.vault.ops.delegation.scope == "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups" && output.authorization.vault.restore.delegation.scope == "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturestaging"
     error_message = "Delegation keys require account scope, not container scope."
   }
   assert {
@@ -150,11 +151,69 @@ run "shared_subscription_cost_grants_are_unique" {
   variables {
     targets = {
       alpha = { subscription_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000", resource_group_name = "rg-fixture", location = "uksouth" }
-      gamma = { subscription_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000", resource_group_name = "rg-third", location = "uksouth" }
+      beta  = { subscription_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000", resource_group_name = "rg-second", location = "uksouth" }
     }
   }
   assert {
     condition     = length([for grant in values(output.authorization.target.ops) : grant if grant.role_definition_id_or_name == "Cost Management Reader"]) == 1
     error_message = "Targets in one subscription must share their subscription-scoped cost reader grant."
   }
+}
+
+run "workload_rgs_use_target_subscriptions" {
+  command = plan
+  assert {
+    condition = alltrue([for key, target in var.targets :
+      output.workload_resource_groups[key].parent_id == target.subscription_resource_id &&
+      output.workload_resource_groups[key].name == target.resource_group_name &&
+      output.authorization.target.deploy["${key}-Contributor"].scope == "${output.workload_resource_groups[key].parent_id}/resourceGroups/${target.resource_group_name}"
+    ])
+    error_message = "Each workload RG and its Contributor grant must use the target's own subscription."
+  }
+}
+run "staging_excluded_from_locked_backup_retention" {
+  command = plan
+  assert {
+    condition = (output.storage.staging.body.properties.immutableStorageWithVersioning == null &&
+      output.storage.staging.body.properties.allowSharedKeyAccess == false &&
+      output.storage.staging.name != output.storage.backups.name &&
+      strcontains(output.authorization.vault.restore.staging_write.scope, "/storageAccounts/${output.storage.staging.name}/") &&
+    !strcontains(output.authorization.vault.restore.staging_write.scope, "/storageAccounts/${output.storage.backups.name}/"))
+    error_message = "Restore staging must be outside the locked backup account and retain scoped restore access."
+  }
+}
+
+mock_provider "azapi" {
+  override_during = plan
+  alias           = "subscription_fc0c4069_12db_58b7_b273_ff3056b17b14"
+  mock_data "azapi_client_config" { defaults = { subscription_id = uuidv5("dns", "beta.example.test") } }
+}
+
+override_resource {
+  target          = module.workload_rg_subscription_00000000_0000_0000_0000_000000000000.module.workload_rg["alpha"].azapi_resource.this[0]
+  values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture" }
+  override_during = plan
+}
+
+override_resource {
+  target          = module.workload_rg_subscription_fc0c4069_12db_58b7_b273_ff3056b17b14.module.workload_rg["beta"].azapi_resource.this[0]
+  values          = { id = "/subscriptions/${uuidv5("dns", "beta.example.test")}/resourceGroups/rg-second" }
+  override_during = plan
+}
+
+override_resource {
+  target          = module.workload_rg_subscription_00000000_0000_0000_0000_000000000000.module.workload_rg["beta"].azapi_resource.this[0]
+  values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-second" }
+  override_during = plan
+}
+
+mock_provider "azapi" {
+  override_during = plan
+  alias           = "subscription_00000000_0000_0000_0000_000000000000"
+  mock_data "azapi_client_config" { defaults = { subscription_id = "00000000-0000-0000-0000-000000000000" } }
+}
+override_resource {
+  target          = module.trust.module.staging.azapi_resource.this
+  values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturestaging" }
+  override_during = plan
 }

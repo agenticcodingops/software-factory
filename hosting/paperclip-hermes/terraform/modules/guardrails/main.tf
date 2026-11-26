@@ -2,6 +2,8 @@ locals {
   rg_budget = max(5, var.override_cost ? var.pilot_monthly_cap : min(var.pilot_monthly_cap, var.headroom))
   # Unsigned URL: the secure webhook authenticates with Entra, never a SAS in state.
   callback_url = "${data.azapi_resource.endpoint.output.properties.accessEndpoint}/triggers/manual/paths/invoke?api-version=2016-10-01"
+  # Azure's noncommon monetary budget schema reports amounts, including numeric strings.
+  threshold_ratio = "div(float(triggerBody()?['data']?['NotificationThresholdAmount']), float(triggerBody()?['data']?['Budget']))"
 }
 module "deallocator" {
   #checkov:skip=CKV_TF_1:ADR 0001 requires exact registry releases; test_terraform_contract.py verifies every source/version.
@@ -34,7 +36,7 @@ module "deallocator" {
       }
       Threshold_and_maintenance = {
         type       = "If"
-        expression = "@and(equals(triggerBody()?['schemaId'], 'AIP Budget Notification'), equals(triggerBody()?['data']?['SubscriptionId'], '${split("/", var.subscription_resource_id)[2]}'), or(and(equals(triggerBody()?['data']?['BudgetName'], '${var.name}-rg'), greaterOrEquals(float(triggerBody()?['data']?['NotificationThresholdAmount']), 0.8)), and(${var.billing_month_verified}, equals(triggerBody()?['data']?['BudgetName'], '${var.name}-subscription'), greaterOrEquals(float(triggerBody()?['data']?['NotificationThresholdAmount']), 0.85))), or(empty(body('Read_VM')?['tags']?['sf-maintenance-until']), lessOrEquals(ticks(coalesce(body('Read_VM')?['tags']?['sf-maintenance-until'], '1970-01-01T00:00:00Z')), ticks(utcNow())), greaterOrEquals(float(triggerBody()?['data']?['NotificationThresholdAmount']), 1)))"
+        expression = "@and(equals(triggerBody()?['schemaId'], 'AIP Budget Notification'), equals(triggerBody()?['data']?['SubscriptionId'], '${split("/", var.subscription_resource_id)[2]}'), or(and(equals(triggerBody()?['data']?['BudgetName'], '${var.name}-rg'), greaterOrEquals(${local.threshold_ratio}, 0.8)), and(${var.billing_month_verified}, equals(triggerBody()?['data']?['BudgetName'], '${var.name}-subscription'), greaterOrEquals(${local.threshold_ratio}, 0.85))), or(empty(body('Read_VM')?['tags']?['sf-maintenance-until']), lessOrEquals(ticks(coalesce(body('Read_VM')?['tags']?['sf-maintenance-until'], '1970-01-01T00:00:00Z')), ticks(utcNow())), greaterOrEquals(${local.threshold_ratio}, 1)))"
         actions = {
           Deallocate = { type = "Http", inputs = { method = "POST", uri = "https://management.azure.com${var.vm_resource_id}/deallocate?api-version=2024-07-01", authentication = { type = "ManagedServiceIdentity" } }, runAfter = {} }
         }

@@ -6,12 +6,16 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
+import uuid
 
 from test_terraform_guards import module
+from trust_fixture import targets as trust_targets
 
 BASE = Path(__file__).resolve().parents[2] / "terraform"
 renderer = module("render-host")
+trust_renderer = module("render-trust")
 inspector = module("check-mock-plans")
+budget_alerts = module("check-budget-alerts")
 
 
 class PinTests(unittest.TestCase):
@@ -55,6 +59,30 @@ class PinTests(unittest.TestCase):
 
 
 class RendererTests(unittest.TestCase):
+    def test_trust_composes_static_subscription_providers_and_moves(self):
+        targets = trust_targets()
+        for third in (False, True):
+            if third:
+                targets["gamma"] = {**targets["alpha"], "subscription_resource_id": f"/subscriptions/{uuid.uuid5(uuid.NAMESPACE_DNS, 'gamma.example.test')}", "rg_managed_by": "host"}
+            with tempfile.TemporaryDirectory() as tmp:
+                root = trust_renderer.render(BASE, Path(tmp) / "rendered", targets)
+                config = json.loads((root / "workload-subscriptions.tf.json").read_text())
+                self.assertEqual(len(config["provider"]["azapi"]), 3 if third else 2)
+                for provider in config["provider"]["azapi"]:
+                    name = "workload_rg_" + provider["alias"]
+                    self.assertEqual(config["module"][name]["providers"]["azapi"], "azapi." + provider["alias"])
+                    self.assertIn(provider["subscription_id"], config["module"][name]["targets"])
+                self.assertEqual(len(config["moved"]), 2)
+                self.assertIn('module.trust.module.workload_rg["alpha"]', [move["from"] for move in config["moved"]])
+                overrides = json.loads((root / "composition_override.tf.json").read_text())
+                self.assertIn("merge(module.workload_rg_subscription_", overrides["module"]["trust"]["workload_resource_group_ids"])
+                self.assertFalse((root / ".terraform").exists())
+
+    def test_trust_composition_rejects_empty_or_invalid_subscriptions(self):
+        for targets in ({}, {"alpha": {"subscription_resource_id": "not-a-subscription"}}):
+            with self.assertRaises(ValueError):
+                trust_renderer.composition(targets)
+
     def receipt(self):
         return {"target": "alpha", "run_id": "7", "environment": "production", "approved": True, "confirm_destroy": "DESTROY alpha", "backup": {"target": "alpha", "vm_id": "/mock/vm", "blob": "backups/final", "version": "fixture", "ciphertext_sha256": "0" * 64, "recipient_fp": "fixture", "size": 42, "verified": True, "successful": True, "reason": "final", "writers_stopped": True, "completed_at": datetime.now(timezone.utc).isoformat()}}
 
@@ -85,6 +113,17 @@ class RendererTests(unittest.TestCase):
 
 
 class MockPlanTests(unittest.TestCase):
+    def test_budget_payload_thresholds_respect_maintenance(self):
+        text = (BASE / "modules/guardrails/main.tf").read_text()
+        ratio = re.search(r'threshold_ratio\s*=\s*"(.*)"', text)[1]
+        expression = re.search(r'expression\s*=\s*"(@.*)"', text)[1]
+        expression = expression.replace('${local.threshold_ratio}', ratio).replace('${var.name}', 'fixture').replace('${split("/", var.subscription_resource_id)[2]}', '00000000-0000-0000-0000-000000000000')
+        for verified in (True, False):
+            rendered = expression.replace('${var.billing_month_verified}', str(verified).lower())
+            self.assertEqual(budget_alerts.findings(rendered, verified), [])
+            unnormalized = rendered.replace(ratio, "float(triggerBody()?['data']?['NotificationThresholdAmount'])")
+            self.assertTrue(budget_alerts.findings(unnormalized, verified))
+
     def test_secret_resource_and_pem_rejections(self):
         for typ, after in (("tls_private_key", {}), ("random_password", {}), ("azurerm_storage_account", {}), ("terraform_data", {"private_key_pem": "planted"})):
             self.assertTrue(inspector.inspect_plan({"resource_changes": [{"type": typ, "change": {"after": after}}]}))

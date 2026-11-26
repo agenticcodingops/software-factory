@@ -41,13 +41,30 @@ class PolicyTests(unittest.TestCase):
 
     def test_expand_aliases_and_groups_and_acl_ports(self):
         for section in ("grants", "acls"):
-            for source in ("tag:pcpilot", "*", "autogroup:tagged", "autogroup:member", "0.0.0.0/0", "::/0"):
+            for source in ("tag:pcpilot", "*", "autogroup:tagged", "0.0.0.0/0", "::/0"):
                 p = {"hosts": {"pilot-alias": source}, "groups": {"group:alias": ["pilot-alias"]}, section: [{"src": ["group:alias"], "dst": ["tag:other:443" if section == "acls" else "tag:other"]}]}
                 self.assertTrue(policy.findings(p, "operator@example.com"))
             p = {"groups": {"group:operator": ["operator@example.com"]}, "hosts": {"pilot-alias": "tag:pcpilot"}, section: [{"src": ["group:operator"], "dst": ["pilot-alias:443" if section == "acls" else "pilot-alias"]}]}
             self.assertFalse(policy.findings(p, "operator@example.com"))
             p[section][0]["src"] = ["autogroup:member"]
             self.assertTrue(policy.findings(p, "operator@example.com"))
+
+    def test_member_selectors_do_not_cover_tagged_pilot(self):
+        for section in ("grants", "acls", "ssh"):
+            for member in ("autogroup:member", "autogroup:members", "autogroup:internet"):
+                with self.subTest(section=section, member=member):
+                    p = {"hosts": {"members": member}, "groups": {"group:members": ["members"]}, section: [{
+                        "src": ["group:members"], "dst": ["tag:unrelated:443" if section == "acls" else "tag:unrelated"],
+                        "ip": ["tcp:443"], "action": "accept", "users": ["admin"],
+                    }]}
+                    self.assertFalse(policy.findings(p, "operator@example.com"))
+                    p[section][0]["dst"] = ["tag:pcpilot:443" if section == "acls" else "tag:pcpilot"]
+                    self.assertTrue(policy.findings(p, "operator@example.com"))
+
+    def test_member_destination_does_not_cover_tagged_pilot(self):
+        for section in ("grants", "acls", "ssh"):
+            p = {section: [{"src": ["another@" + "example.com"], "dst": ["autogroup:member:443" if section == "acls" else "autogroup:member"]}]}
+            self.assertFalse(policy.findings(p, "operator@example.com"))
 
     def test_group_mixing_and_cycles(self):
         p = {"groups": {"group:both": ["operator@example.com", "autogroup:member"]}, "grants": [{"src": ["group:both"], "dst": ["tag:pcpilot"]}]}
@@ -104,6 +121,18 @@ class PolicyTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def test_authorized_delete_only_vm_needs_no_preserved_successor(self):
+        for typ in ("azapi_resource", "azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine", "azurerm_virtual_machine"):
+            with self.subTest(typ=typ):
+                before = {"type": "Microsoft.Compute/virtualMachines@2024-07-01", "tags": {tag: "installed" for tag in plan.PROTOCOL}, "custom_data": "bootstrap", "body": {"properties": {"osProfile": {"customData": "bootstrap"}}}, "replace_triggers_external_values": '["bootstrap-hash"]'}
+                change = {"actions": ["delete"], "before": before, "after": None}
+                p = {"resource_changes": [{"type": typ, "change": change}]}
+                self.assertTrue(plan.guard(p))
+                self.assertFalse(plan.guard(p, True))
+                for actions, after in ((["delete", "create"], {}), (["create", "delete"], {}), (["update"], {}), (["delete"], {})):
+                    change.update(actions=actions, after=after)
+                    self.assertTrue(plan.guard(p, True))
+
     def test_release_blocking_fixtures(self):
         for name in ("vm-replace", "lifecycle-change"):
             run = subprocess.run([sys.executable, TOOLS / "plan-guard.py", FIXTURES / f"plan-{name}.json"], capture_output=True, text=True)

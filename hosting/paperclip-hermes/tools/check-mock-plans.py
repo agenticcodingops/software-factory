@@ -2,10 +2,15 @@
 """Inspect verbose Terraform test JSON for secret resources and network/storage invariants."""
 
 import argparse
+import importlib.util
 import json
 import re
 from pathlib import Path
 import sys
+
+spec = importlib.util.spec_from_file_location("budget_alerts", Path(__file__).with_name("check-budget-alerts.py"))
+budget_alerts = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(budget_alerts)
 
 
 def inspect_plan(plan):
@@ -55,9 +60,15 @@ def inspect_plan(plan):
             identity = body.get("identity") or (after.get("identity") or [None])[0]
             if identity and identity.get("type") not in (None, "None"):
                 errors.append("VM managed identity")
+        if kind == "microsoft.logic/workflows":
+            expression = props["definition"]["actions"]["Threshold_and_maintenance"]["expression"]
+            # Mock host runs cover both the verified BillingMonth and email-only fallback.
+            verified = "and(true," in expression
+            errors.extend(budget_alerts.findings(expression, verified))
         if kind == "microsoft.storage/storageaccounts/managementpolicies":
             rules = {rule["name"]: rule for rule in props["policy"]["rules"]}
-            for name, days, prefix in (("expire-backups", 45, "backups/backups/"), ("expire-staging", 1, "restore-staging/")):
+            required = (("expire-staging", 1, "restore-staging/"),) if after["parent_id"].endswith("staging") else (("expire-backups", 45, "backups/backups/"), ("expire-staging", 1, "restore-staging/"))
+            for name, days, prefix in required:
                 rule = rules.get(name, {})
                 definition = rule.get("definition", {})
                 actions = definition.get("actions", {})

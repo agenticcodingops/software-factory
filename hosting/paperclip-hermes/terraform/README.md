@@ -1,6 +1,6 @@
 # Terraform deployment contracts (WP4)
 
-These four modules and three root stacks implement the infrastructure in
+These reusable modules and three root stacks implement the infrastructure in
 [ADR 0001](../../../docs/adr/0001-azure-deployment.md). They are checked with mock providers;
 they do not enable deployment from this repository. Bootstrap, approved deployment workflows,
 cloud-init preparation, live self-tests and the trusted ops controller belong to later packages.
@@ -48,6 +48,26 @@ The bootstrap-created state account, `tfstate` container and deletion lock are e
 by `stacks/trust/main.tf` using AzAPI, which does not persist account keys.
 The `tfstate` container, soft delete, versioning, Shared Key prohibition and deletion lock are managed.
 No SAS, password or SSH private key is created by these modules.
+
+Before every trust init/plan/apply, compose a fresh isolated tree from private configuration:
+
+```sh
+python3 hosting/paperclip-hermes/tools/render-trust.py \
+  hosting/paperclip-hermes/terraform /tmp/instance-trust \
+  --config /private/instance.tfvars.json
+terraform -chdir=/tmp/instance-trust/stacks/trust init -backend-config=/private/backend.hcl
+terraform -chdir=/tmp/instance-trust/stacks/trust plan -var-file=/private/instance.tfvars.json
+```
+
+Use the same backend/state for every rendered tree. The renderer creates a stable provider alias and
+workload RG module per subscription, using the ADR's pinned AVM resource-group module. Generated
+`moved` blocks preserve addresses from the original trust module. Regenerate from the current full
+target inventory before each run; missing RG composition fails before scoped grants are applied.
+When removing a subscription's final target, keep that subscription in the renderer configuration
+until its resources have left state; pass the reduced target map to Terraform so it can destroy
+those resources using the retained provider alias.
+If an earlier multi-subscription apply created an RG in the wrong subscription, the operator must
+inspect that partial state and its resources before approving the corrective plan.
 
 The trust root has default vault providers and explicit target aliases. `targets` includes every
 subscription in the configured target tenant, including targets being added. If the target tenant
@@ -115,7 +135,8 @@ Pass the four current protocol tags from ARM and the original bootstrap `custom_
 A new VM has no protocol tags. The `expires` tag uses `time_static` plus a 30-day `time_offset`.
 Shutdown defaults to 22:00 and backup to 21:15; invalid times or a smaller gap fail planning.
 `tools/plan-guard.py PLAN.json` rejects protected deletions/replacements and retention/lifecycle changes.
-`--override-replace` never bypasses protocol tag changes or changed/unknown existing VM bootstrap data.
+`--override-replace` authorizes delete-only VM changes, which have no successor to preserve.
+Updates and replacements still reject protocol tag changes and changed/unknown existing VM bootstrap data.
 AVM 0.22.1 stores cloud-init in a write-only field; the guard also checks its first replacement
 fingerprint, covering changes invisible in ordinary `custom_data` JSON.
 
@@ -138,14 +159,21 @@ until they pass; ordinary deploy/ops must never invoke the destroy renderer.
 ## Retention and cost controls
 
 Backups use versioning and 30-day version WORM, Unlocked only before `pilot_end_date`, Locked afterwards.
-The optional container policy is enabled only by failed inheritance self-test 3. Both storage accounts
+The optional container policy is enabled only by failed inheritance self-test 3. All storage accounts
 have Shared Key disabled, TLS 1.2, private containers and deletion locks. Data roles use container scopes;
-user-delegation roles use the backup account scope. Deploy has no backup/key rights. Operator custody
+user-delegation roles use the backup account for ops and the staging account for restore. Deploy has no backup/key rights. Operator custody
 grants no workflow any key access; vault custody grants only restore the read-only Key Vault Secrets User.
 
 Azure lifecycle filters include the container name: `backups/backups/` means encrypted objects under
 `backups/` in the `backups` container, excluding long-lived `receipts/`. Both base blobs and versions
-expire after 45 days. Staging base blobs/versions use `restore-staging/` and one day. The imported kit's
+expire after 45 days. Restore staging lives in the separate vault account `<prefix>staging`, with
+versioning but no WORM default or soft-delete delay. Its `restore-staging/` base blobs and versions
+expire after one day. This isolates staging from the backup account's locked 30-day default while
+preserving backup protection. Restore/operator data rights name the new container; restore's
+delegation-key role names only the staging account. The old staging container and its cleanup rule
+remain in the backup account so upgrades do not try to delete locked data; no restore/operator grants
+point there. Its existing ciphertext remains subject to retention already inherited before this fix.
+The imported kit's
 upload path must be migrated to that object prefix by the runtime package before deployment is enabled.
 Mock plan inspection verifies both actions and both prefix filters.
 
@@ -155,7 +183,12 @@ RG budgets are `max(5, min(cap, headroom))`, with the approved override using th
 Email and deallocation action groups are separate, so email thresholds cannot stop a VM.
 The Consumption Logic App and its SF VM Deallocator assignment are in the target RG and its POST
 URI names only the pilot VM. It checks budget thresholds and the maintenance tag before deallocating;
-100% is the emergency hard threshold. The webhook uses Entra authentication, not a SAS in state.
+100% is the emergency hard threshold. The
+[monetary notification payload](https://learn.microsoft.com/en-us/azure/azure-monitor/alerts/alerts-non-common-schema-definitions#budget-alerts)
+expresses `NotificationThresholdAmount` and `Budget` as amounts; all three comparisons use their
+ratio, including the emergency override. CI evaluates actual mocked workflow expressions against
+string/numeric monetary payloads with active, expired and absent maintenance windows.
+The webhook uses Entra authentication, not a SAS in state.
 `alert_application` describes an operator-provisioned secure-webhook application and Monitor sender.
 Its unsigned runtime invoke URL comes from Azure
 `properties.accessEndpoint`; no `listCallbackUrl` call or signed URL enters state. Live webhook delivery, payloads, maintenance behavior and forecast notifications

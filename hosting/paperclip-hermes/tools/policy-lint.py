@@ -9,7 +9,8 @@ import re
 import sys
 
 PILOT = "tag:pcpilot"
-BROAD = {"*", "autogroup:tagged", "autogroup:member", "autogroup:internet"}
+# The pilot is a tagged identity; member-owned devices and internet routes do not include it.
+BROAD = {"*", "autogroup:tagged"}
 
 
 def load_policy(text):
