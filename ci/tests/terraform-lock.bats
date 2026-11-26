@@ -7,6 +7,7 @@ setup() {
   mkdir -p bin hosting/paperclip-hermes/tools
   cp "$BATS_TEST_DIRNAME/../../hosting/paperclip-hermes/tools/check-mock-plans.py" hosting/paperclip-hermes/tools/
   cp "$BATS_TEST_DIRNAME/../../hosting/paperclip-hermes/tools/check-budget-alerts.py" hosting/paperclip-hermes/tools/
+  cp "$BATS_TEST_DIRNAME/../../hosting/paperclip-hermes/tools/policy-lint.py" hosting/paperclip-hermes/tools/
   export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
   export CALLS="$BATS_TEST_TMPDIR/calls"
   cat > bin/terraform <<'SH'

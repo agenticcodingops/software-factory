@@ -50,13 +50,13 @@ def guard(plan, override_replace=False):
         if "forget" in actions and protected:
             issues.append(f"{addr}: protected resource removed from Terraform ownership")
         # Preservation applies to VMs left behind. An approved delete-only plan has no successor.
-        if "delete" in actions and protected and not override_replace:
+        authorized_delete = override_replace and vm and actions == ["delete"] and change.get("after") is None
+        if "delete" in actions and protected and not authorized_delete:
             issues.append(f"{addr}: protected resource delete/replace")
         if vm and not before:
             new_tags = after.get("tags") or {}
             if any(tag in new_tags or unknown_at(unknown, "tags", tag) for tag in PROTOCOL):
                 issues.append(f"{addr}: new VM must not receive protocol tags before health approval")
-        authorized_delete = override_replace and actions == ["delete"] and change.get("after") is None
         if vm and before and not authorized_delete:
             for tag in PROTOCOL:
                 old_tags, new_tags = before.get("tags") or {}, after.get("tags") or {}

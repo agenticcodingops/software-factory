@@ -33,3 +33,24 @@ run "baseline_preserves_live_values" {
     error_message = "Baseline copies policy/settings unchanged and creates no key."
   }
 }
+
+# Seed only the mock provider's state to represent the three imported live resources.
+# The following complete plan is also passed through report-only lint by check-mock-plans.py.
+run "baseline_mock_imports" {
+  command = apply
+  variables {
+    mode   = "baseline"
+    policy = "{\"grants\": [{\"src\": [\"*\"], \"dst\": [\"*\"], \"ip\": [\"*\"]}]}"
+  }
+}
+run "baseline_no_diff" {
+  command = plan
+  variables {
+    mode   = "baseline"
+    policy = "{\"grants\": [{\"src\": [\"*\"], \"dst\": [\"*\"], \"ip\": [\"*\"]}]}"
+  }
+  assert {
+    condition     = length(output.invariants.keys) == 0
+    error_message = "The imported baseline must not create a join key."
+  }
+}

@@ -11,6 +11,9 @@ import sys
 spec = importlib.util.spec_from_file_location("budget_alerts", Path(__file__).with_name("check-budget-alerts.py"))
 budget_alerts = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(budget_alerts)
+spec = importlib.util.spec_from_file_location("policy_lint", Path(__file__).with_name("policy-lint.py"))
+policy_lint = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(policy_lint)
 
 
 def inspect_plan(plan):
@@ -96,6 +99,11 @@ def main():
             if event.get("type") == "test_plan":
                 plans += 1
                 errors.extend(inspect_plan(event["test_plan"]))
+                if event.get("@testrun") == "baseline_no_diff":
+                    # Use the full generated plan, including local Terraform resources.
+                    baseline = event["test_plan"]
+                    acl = next(r["change"] for r in baseline["resource_changes"] if r["type"] == "tailscale_acl")
+                    errors.extend(policy_lint.baseline_findings(baseline, acl["after"]["acl"], acl["before"]["acl"]))
         if not plans:
             errors.append("no verbose mock plans found")
         for error in sorted(set(errors)):

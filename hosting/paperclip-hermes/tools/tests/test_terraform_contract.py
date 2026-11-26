@@ -19,6 +19,14 @@ budget_alerts = module("check-budget-alerts")
 
 
 class PinTests(unittest.TestCase):
+    def test_vnet_depends_on_workload_resource_group(self):
+        text = (BASE / "modules/host/main.tf").read_text()
+        network = text.split('module "network" {', 1)[1].split('\nmodule ', 1)[0]
+        dependencies = re.search(r'depends_on\s*=\s*\[([^]]+)\]', network)
+        self.assertIsNotNone(dependencies, "VNet creation must wait for its resource group, independently of subnet dependencies")
+        self.assertIn("module.workload_rg", dependencies[1].split(", "))
+        self.assertIn("data.azurerm_resource_group.workload", dependencies[1].split(", "))
+
     def test_every_adr_registry_module_and_root_provider_pin(self):
         required = {"resources-resourcegroup": "0.5.0", "managedidentity-userassignedidentity": "0.6.0", "storage-storageaccount": "0.11.0", "network-virtualnetwork": "0.23.0", "network-networksecuritygroup": "0.7.0", "network-publicipaddress": "0.3.0", "compute-virtualmachine": "0.22.1", "insights-actiongroup": "0.3.0", "logic-workflow": "0.2.0"}
         found = {}

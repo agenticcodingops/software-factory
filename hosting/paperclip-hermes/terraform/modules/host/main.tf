@@ -84,6 +84,7 @@ module "network" {
     }
   }
   enable_telemetry = false
+  depends_on       = [module.workload_rg, data.azurerm_resource_group.workload]
 }
 module "public_ip" {
   #checkov:skip=CKV_TF_1:ADR 0001 requires exact registry releases; test_terraform_contract.py verifies every source/version.

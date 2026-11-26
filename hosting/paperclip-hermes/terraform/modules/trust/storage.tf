@@ -82,11 +82,27 @@ module "staging" {
 }
 # Only enabled by the result of retention inheritance self-test 3.
 resource "azapi_resource" "container_retention" {
-  count     = var.container_retention_fallback ? 1 : 0
-  type      = "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies@2023-05-01"
-  name      = "default"
-  parent_id = module.backups.containers["backups"].id
-  body      = { properties = { immutabilityPeriodSinceCreationInDays = 30, allowProtectedAppendWrites = false } }
+  count                  = var.container_retention_fallback ? 1 : 0
+  type                   = "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies@2023-05-01"
+  name                   = "default"
+  parent_id              = module.backups.containers["backups"].id
+  body                   = { properties = { immutabilityPeriodSinceCreationInDays = 30, allowProtectedAppendWrites = false } }
+  response_export_values = ["etag"]
+}
+# PUT creates an unlocked policy; locking requires POST /lock with the policy's ETag.
+resource "azapi_resource_action" "lock_container_retention" {
+  count       = var.container_retention_fallback && timecmp(var.pilot_end_date, plantimestamp()) <= 0 ? 1 : 0
+  type        = azapi_resource.container_retention[0].type
+  resource_id = azapi_resource.container_retention[0].id
+  action      = "lock"
+  method      = "POST"
+  when        = "apply"
+  headers     = { "If-Match" = azapi_resource.container_retention[0].output.etag }
+  lifecycle {
+    # Locking changes the ETag; retain the completed action rather than locking again on refresh.
+    ignore_changes       = [headers]
+    replace_triggered_by = [azapi_resource.container_retention[0]]
+  }
 }
 # Bootstrap creates this account/container/lock; root imports adopt them before operator apply.
 # AzAPI avoids persisting AzureRM's long-lived account-key and connection-string attributes.

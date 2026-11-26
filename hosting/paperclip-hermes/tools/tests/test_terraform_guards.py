@@ -66,6 +66,30 @@ class PolicyTests(unittest.TestCase):
             p = {section: [{"src": ["another@" + "example.com"], "dst": ["autogroup:member:443" if section == "acls" else "autogroup:member"]}]}
             self.assertFalse(policy.findings(p, "operator@example.com"))
 
+    def test_tailnet_cidr_overlap_sources_and_destinations(self):
+        overlapping = ("100.64.0.0/10", "100.0.0.0/8", "100.100.0.0/16", "100.64.0.1/32",
+                       "fd7a:115c:a1e0::/48", "fd7a:115c::/32", "fd7a:115c:a1e0:1::/64", "fd7a:115c:a1e0::1/128")
+        unrelated = ("100.0.0.0/10", "100.128.0.0/10", "10.0.0.0/8", "fd7a:115c:a1df::/48", "fd7a:115c:a1e1::/48")
+        for section in ("grants", "acls"):
+            for cidr in (*overlapping, *unrelated):
+                for side in ("src", "dst"):
+                    with self.subTest(section=section, cidr=cidr, side=side):
+                        # Exercise expansion as well as IPv6 ACL destination/port parsing.
+                        p = {"hosts": {"range": cidr}, "groups": {"group:range": ["range"]}, section: [{
+                            "src": ["group:range" if side == "src" else "autogroup:member"],
+                            "dst": ["range:443" if section == "acls" else "range"] if side == "dst" else ["tag:unrelated:443" if section == "acls" else "tag:unrelated"],
+                            "ip": ["*"], "action": "accept",
+                        }]}
+                        self.assertEqual(bool(policy.findings(p, "operator@example.com")), cidr in overlapping)
+                        if side == "dst":
+                            p[section][0]["src"] = ["operator@example.com"]
+                            self.assertFalse(policy.findings(p, "operator@example.com"))
+            for cidr in overlapping:
+                dst = f"[{cidr}]:443" if section == "acls" and ":" in cidr else f"{cidr}:443" if section == "acls" else cidr
+                self.assertTrue(policy.findings({section: [{"src": ["autogroup:member"], "dst": [dst]}]}, "operator@example.com"))
+        for cidr in overlapping:
+            self.assertTrue(policy.findings({"ssh": [{"src": ["autogroup:member"], "dst": [cidr], "action": "accept", "users": ["admin"]}]}, "operator@example.com"))
+
     def test_group_mixing_and_cycles(self):
         p = {"groups": {"group:both": ["operator@example.com", "autogroup:member"]}, "grants": [{"src": ["group:both"], "dst": ["tag:pcpilot"]}]}
         self.assertTrue(policy.findings(p, "operator@example.com"))
@@ -108,6 +132,10 @@ class PolicyTests(unittest.TestCase):
         changed = copy.deepcopy(baseline)
         changed["resource_changes"].append({"type": "azurerm_linux_virtual_machine", "change": {"actions": ["create"]}})
         self.assertTrue(policy.baseline_findings(changed, text, text))
+        for actions in (["create"], ["no-op"], ["delete"], ["update"]):
+            changed = copy.deepcopy(baseline)
+            changed["resource_changes"].append({"address": "module.tailnet.terraform_data.join_generation", "type": "terraform_data", "change": {"actions": actions}})
+            self.assertTrue(policy.baseline_findings(changed, text, text))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "plan.json"
             path.write_text(json.dumps(baseline))
@@ -121,6 +149,20 @@ class PolicyTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def test_override_cannot_delete_non_vm_protected_resources(self):
+        cases = [(typ, {}) for typ in plan.PROTECTED if "virtual_machine" not in typ]
+        cases += [("azapi_resource", {"type": kind + "@2023-05-01"}) for kind in (
+            "Microsoft.Compute/disks", "Microsoft.Storage/storageAccounts",
+            "Microsoft.Storage/storageAccounts/blobServices/containers",
+        )]
+        for typ, before in cases:
+            for actions in (["delete"], ["delete", "create"], ["create", "delete"]):
+                with self.subTest(typ=typ, before=before, actions=actions):
+                    p = {"resource_changes": [{"type": typ, "change": {
+                        "actions": actions, "before": before, "after": None if actions == ["delete"] else before,
+                    }}]}
+                    self.assertTrue(plan.guard(p, True))
+
     def test_authorized_delete_only_vm_needs_no_preserved_successor(self):
         for typ in ("azapi_resource", "azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine", "azurerm_virtual_machine"):
             with self.subTest(typ=typ):
@@ -140,7 +182,7 @@ class PlanTests(unittest.TestCase):
 
     def test_safe_and_destructive_override(self):
         self.assertFalse(plan.guard(fixture("plan-safe.json")))
-        self.assertFalse(plan.guard(fixture("plan-vm-replace.json"), True))
+        self.assertTrue(plan.guard(fixture("plan-vm-replace.json"), True))
         self.assertTrue(plan.guard(fixture("plan-lifecycle-change.json"), True))
 
     def test_custom_data_never_overridden(self):

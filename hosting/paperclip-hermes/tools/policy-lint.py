@@ -11,6 +11,7 @@ import sys
 PILOT = "tag:pcpilot"
 # The pilot is a tagged identity; member-owned devices and internet routes do not include it.
 BROAD = {"*", "autogroup:tagged"}
+TAILNET_NETWORKS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 
 
 def load_policy(text):
@@ -71,7 +72,7 @@ def covers_pilot(value):
         return True
     try:
         network = ipaddress.ip_network(value, strict=False)
-        return network.prefixlen == 0
+        return any(network.version == tailnet.version and network.overlaps(tailnet) for tailnet in TAILNET_NETWORKS)
     except ValueError:
         return False
 

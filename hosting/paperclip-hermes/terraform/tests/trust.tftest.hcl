@@ -49,6 +49,10 @@ variables {
 run "trust_storage_and_authorization" {
   command = plan
   assert {
+    condition     = length(output.storage.container_retention) == 0 && length(output.storage.container_retention_locks) == 0
+    error_message = "A successful inheritance self-test needs no fallback policy or lock action."
+  }
+  assert {
     condition     = output.storage.state.body.properties.allowSharedKeyAccess == false && output.storage.backups.body.properties.allowSharedKeyAccess == false
     error_message = "Shared Key must be disabled on state and backup accounts."
   }
@@ -139,6 +143,35 @@ run "pilot_unlock_and_retention_fallback" {
     condition     = output.storage.backups.body.properties.immutableStorageWithVersioning.immutabilityPolicy.state == "Unlocked"
     error_message = "Only the explicit future pilot window permits unlocked WORM."
   }
+  assert {
+    condition     = length(output.storage.container_retention) == 1 && output.storage.container_retention[0].body.properties.immutabilityPeriodSinceCreationInDays == 30 && length(output.storage.container_retention_locks) == 0
+    error_message = "Fallback must retain 30 days without locking during the pilot window."
+  }
+}
+run "post_pilot_locks_retention_fallback" {
+  command = plan
+  variables { container_retention_fallback = true }
+  assert {
+    condition = (output.storage.backups.body.properties.immutableStorageWithVersioning.immutabilityPolicy.state == "Locked" &&
+      length(output.storage.container_retention_locks) == 1 &&
+      output.storage.container_retention_locks[0].resource_id == output.storage.container_retention[0].id &&
+      output.storage.container_retention_locks[0].type == output.storage.container_retention[0].type &&
+      output.storage.container_retention_locks[0].action == "lock" &&
+      output.storage.container_retention_locks[0].method == "POST" &&
+      output.storage.container_retention_locks[0].when == "apply" &&
+      output.storage.container_retention_locks[0].headers["If-Match"] == "\"policy-etag\"" &&
+      output.storage.container_retention[0].body.properties.immutabilityPeriodSinceCreationInDays == 30 &&
+    !output.storage.container_retention[0].body.properties.allowProtectedAppendWrites)
+    error_message = "Post-pilot fallback must POST lock for the 30-day policy with its quoted ETag."
+  }
+}
+override_resource {
+  target = module.trust.azapi_resource.container_retention[0]
+  values = {
+    id     = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups/blobServices/default/containers/backups/immutabilityPolicies/default"
+    output = { etag = "\"policy-etag\"" }
+  }
+  override_during = plan
 }
 override_resource {
   target          = module.trust.module.backups.module.containers["backups"].azapi_resource.this

@@ -113,6 +113,8 @@ Import the complete live policy into `module.tailnet.tailscale_acl.this`, settin
 `module.tailnet.tailscale_tailnet_settings.this`, and DNS into `module.tailnet.tailscale_dns_preferences.this`.
 Provider `overwrite_existing_content` is never enabled. In `mode=baseline`, pass every live setting
 and DNS preference unchanged, with `issue_join_key=false`. Only read-only no-diff planning is allowed.
+The local `terraform_data.join_generation` resource exists only in hardening mode, so the initial
+baseline needs only the three live imports and creates no local generation marker.
 The `reviewed_fragment` output is a patch for the next operator-reviewed hardening PR; Terraform
 does not silently replace or narrow the imported policy. It renders tag owners, the operator grant,
 SSH check mode, operator accept tests, pilot outbound denies and another-user denies.
@@ -159,7 +161,9 @@ until they pass; ordinary deploy/ops must never invoke the destroy renderer.
 ## Retention and cost controls
 
 Backups use versioning and 30-day version WORM, Unlocked only before `pilot_end_date`, Locked afterwards.
-The optional container policy is enabled only by failed inheritance self-test 3. All storage accounts
+The optional container policy is enabled only by failed inheritance self-test 3. After `pilot_end_date`,
+the next approved trust apply explicitly locks that policy using Azure's `POST /lock` operation and
+its ETag, matching the account policy's lock transition. All storage accounts
 have Shared Key disabled, TLS 1.2, private containers and deletion locks. Data roles use container scopes;
 user-delegation roles use the backup account for ops and the staging account for restore. Deploy has no backup/key rights. Operator custody
 grants no workflow any key access; vault custody grants only restore the read-only Key Vault Secrets User.

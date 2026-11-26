@@ -34,7 +34,14 @@ resource "tailscale_dns_preferences" "this" {
   magic_dns = var.magic_dns
 }
 resource "terraform_data" "join_generation" {
+  # A valid baseline creates no marker. Keep the trigger address available for the
+  # key's precondition to reject an attempted baseline join before any apply.
+  count            = local.hardened || var.issue_join_key ? 1 : 0
   triggers_replace = var.join_generation
+}
+moved {
+  from = terraform_data.join_generation
+  to   = terraform_data.join_generation[0]
 }
 resource "tailscale_tailnet_key" "join" {
   count               = var.issue_join_key ? 1 : 0
