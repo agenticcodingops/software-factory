@@ -53,13 +53,13 @@ This ADR specifies a reusable deployment for adopters whose private repositories
      - the workload resource group (in resource-group scope mode);
      - the backup storage account, with its WORM policy, lifecycle rules and locks;
      - the Key Vault.
-   - The state account is imported into the stack, so everything is IaC with drift detection.
+   - The bootstrap-created vault RG, state account, container and deletion lock are imported into the stack, so everything is IaC with drift detection.
    - No workflow identity can apply `trust`. `ph-plan` plans it read-only every night. A pending diff, such as an AVM bump in a new release, opens an `ops-alert` asking the operator to run `sf-bootstrap.sh trust --apply`.
    - *Why:* a deploy identity must never be able to widen its own rights or delete backups. The cost is an operator run only when the trust stack changes, which is rare.
 
 4. **Resource-group-scoped trust by default.**
    - In resource-group scope mode, the `trust` stack owns the empty workload RG, and the `host` stack references it with a data source (`var.rg_managed_by = "trust"`). No `import` block is needed.
-   - With `--scope subscription`, the `host` stack creates the RG (`rg_managed_by = "host"`).
+   - With `--scope subscription`, the `host` stack creates the RG (`rg_managed_by = "host"`). Before full trust apply, the Owner initializes only the target role definitions in trust, records the deallocator role ID in private host inputs, then applies only the host-owned RG in the host backend. The trust composition reads that existing RG before assigning RG-scoped roles. See the [initialization sequence](../../hosting/paperclip-hermes/terraform/README.md#backend-and-target-boundaries). No subscription-wide Contributor grant is needed.
    - The deploy identity gets Contributor on that RG only, plus Cost Management Contributor at subscription scope for the subscription budget.
 
 5. **No stored cloud secret anywhere.**
@@ -191,18 +191,34 @@ flowchart LR
 
 If the vault and the target are in different tenants, the `trust` stack creates a twin of each target-facing identity in the target tenant, with the same GitHub subject. The per-target configuration file names which client ID to use in each tenant. Terraform's `azurerm` backend authenticates with the vault-tenant identity (`use_oidc = true`, `use_azuread_auth = true`).
 
+**WP4 release-blocking authorization amendment (issue #5 review).** The environment-only subjects
+below are insufficient for unattended ops: release-controlled workflow code could add an `ops` job.
+WP4 therefore creates no environment-only federated credentials. GitHub's generally available
+custom subject template uses `["repo", "context", "job_workflow_ref"]`; each credential includes an
+Owner-authorized exact reusable workflow path and full SHA in its subject, including tenant twins.
+No preview flexible credential is used. The Owner must update this allowlist through `trust` until
+a separately trusted controller implements automatic per-target handoff and approval-bound minting.
+Candidate release jobs cannot authorize their own SHA. Bootstrap must configure and read back that
+subject template before enabling federation. The offline mock-plan adversarial test verifies the
+exact matching boundary; a live candidate-release token/run-command denial remains release-blocking
+for the later instance/workflow package. See the [WP4 contracts](../../hosting/paperclip-hermes/terraform/README.md).
+This amendment supersedes the environment-only subject statements in this revision, not the required
+production/restore approvals, target-tag checks, recovery limits or minimum identity privileges.
+
 **Identities.** Each identity has one federated credential per tenant, bound to its environment subject `<sub_claim_prefix>:environment:<env>`. That is 4 per tenant, well under the limit of 20.
 
 | Identity | Env | Target-plane rights | Vault-plane rights | Worst case if its workflow is compromised |
 |---|---|---|---|---|
-| `id-sf-plan` | `plan` (any branch) | Reader on the workload RG(s); Cost Management Reader | Reader on `rg-sf-vault`; Blob Data Reader on `tfstate` | Reads configuration and state; the only state secret is an expired, single-use join key |
-| `id-sf-deploy` | `production` (approval) | Contributor on the workload RG; Cost Management Contributor on the subscription; RBAC Administrator on the RG with an ABAC condition that allows only assigning `SF VM Deallocator` to service principals | Blob Data Contributor on `tfstate`; Contributor on `rg-sf-drill` | Changes the workload RG, after approval. **No rights on backups, the Key Vault or other identities** |
+| `id-sf-plan` | `plan` (any branch) | Reader on the workload RG(s) and tenant-twin trust RG; Cost Management Reader; custom `Microsoft.Authorization/*/read` at target subscriptions | Reader on `rg-sf-vault` and `rg-sf-drill`; custom `Microsoft.Authorization/*/read` at vault subscription; Blob Data Reader on `tfstate` | Reads configuration and state; the only state secret is an expired, single-use join key |
+| `id-sf-deploy` | `production` (approval) | Contributor on the workload RG; Cost Management Contributor and read-only `SF Prerequisite Reader` (feature/provider state only) on the subscription; RBAC Administrator on the RG with an ABAC condition that allows only assigning `SF VM Deallocator` to service principals | Blob Data Contributor on `tfstate`; Contributor on `rg-sf-drill` | Changes the workload RG, after approval. **No rights on backups, the Key Vault or other identities** |
 | `id-sf-ops` | `ops` | `SF Host Operator` on the workload RG (VM read, start, deallocate, `runCommands/*`; **no** VM write, **no** `tags/write`); Cost Management Reader on each target subscription (read-only usage and forecast queries) | `SF Backup Writer` on the `backups` container (blob add, create, write; no delete); Blob Data Reader on `backups` (ciphertext and metadata, for verification); `SF Delegation Key` on the backup **account** (`generateUserDelegationKey` only) | Root on each target VM through its own pinned caller at that target's `sf-approved-sha`; that target's previous approved SHA has a time-limited recovery path during handoff; reads subscription cost data; mints a write-only SAS; reads ciphertext, never a key |
 | `id-sf-restore` | `restore` (approval) | `SF Host Operator` | Blob Data Reader on `backups`; Blob Data Contributor on `restore-staging`; `SF Delegation Key` on the account; Key Vault Secrets User on the age secrets (vault custody only) | Under operator custody, reads ciphertext only. Under vault custody, can decrypt backups after approval plus `accept_runner_exposure` |
 
 A separate verify identity was considered and rejected. It would trust the same `ops` subject, so splitting it adds no isolation, and the data it reads is ciphertext only.
 
 The operator's own user gets Blob Data Reader on `backups` and Blob Data Contributor on `restore-staging` (for `restore-assist`), assigned by the `trust` stack.
+
+**Temporary operator grants and deletion locks (WP4 audit amendment).** A storage account's `CanNotDelete` lock also blocks removing RBAC assignments on that account or its containers. Temporary data roles for bootstrap, pilot closure and vault migration must therefore be assigned at the unlocked parent vault RG and removed through the assignment ledger, with removal verified before workflows/uploads resume. This temporarily widens the operator's data scope across that RG; custom roles still retain their specified actions (including no WORM changes for migration), and no workflow receives these grants. Verify that the parent has no inherited lock before creating them. This supersedes the temporary storage-role scope statements in the bootstrap/migration procedures below; persistent workflow roles remain container/account scoped as specified. Account deletion locks and WORM are never removed for temporary-role cleanup. See [Azure lock inheritance and RBAC constraints](https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/lock-resources).
 
 **What a compromise reaches:**
 
@@ -292,7 +308,7 @@ The ops-plane caller matrix is materialized as separate static jobs, one entry p
 **Details:**
 
 - The `expires` tag is computed from `time_static` plus `time_offset` (30 days). That keeps it stable across applies, unlike `plantimestamp()`.
-- Approval and delivery tags (`sf-approved-sha`, `sf-recovery-sha`, `sf-recovery-until`, `sf-delivery-recipient`) are written only by the deployment protocol. Because the AVM VM module manages `tags` in full and a caller cannot add `ignore_changes` inside a module, `ph-deploy` and `ph-restore` read the VM's current protocol tags with `az` before planning and pass them to the host stack unchanged (absent on a new VM). `plan-guard.py` fails any plan that changes or removes them, and a `terraform test` asserts that the pass-through preserves them.
+- Approval, delivery and maintenance tags (`sf-approved-sha`, `sf-recovery-sha`, `sf-recovery-until`, `sf-delivery-recipient`, `sf-maintenance-until`) are written only by the deployment protocol. Because the AVM VM module manages `tags` in full and a caller cannot add `ignore_changes` inside a module, `ph-deploy` and `ph-restore` read the VM's current protocol tags and live maintenance deadline with `az` after setting maintenance and before planning and pass them to the host stack unchanged (absent on a new VM). `plan-guard.py` fails any plan that changes or removes them, and a `terraform test` asserts that the pass-through preserves them.
 - **The join key** is `reusable=false`, `ephemeral=false`, `preauthorized=true`, `expiry=3600`, `tags=["tag:pcpilot"]` and `recreate_if_invalid="never"`.
   - A `terraform_data` generation counter, not the VM, triggers its replacement.
   - It is delivered encrypted to the host delivery key through run command, never in `custom_data`.
@@ -303,20 +319,35 @@ The ops-plane caller matrix is materialized as separate static jobs, one entry p
   - The NIC has exactly one public IP, and no load balancer, NAT rule or Bastion exists.
   - `managed_identities` is empty, and `generate_admin_password_or_ssh_key = false`.
   - The plan contains no `tls_private_key` or `random_password` resource.
-  - All four current VM protocol tags pass through unchanged; they are absent on a new VM.
+  - All four current VM protocol tags and the live maintenance deadline pass through unchanged; they are absent on a new VM.
   - An existing VM's `custom_data` stays byte-for-byte unchanged across release/workflow SHA bumps, contains no release SHA, and is independent of the candidate kit SHA; plan-guard tests reject changed or unknown `custom_data` even with `override_replace`.
   - A shutdown schedule exists, set at least 45 minutes after the backup timer.
   - The data disk has `prevent_destroy` with `allow_disk_destroy=false`, including ordinary upgrades, moves before decommission and parked disks. The gated `true` configuration removes protection without deleting/replacing the disk during its preparatory apply; workflow acceptance tests enforce the authorization and backup checks in "Teardown".
-  - Shared Key is off on the backup and state accounts.
+  - Backup, staging and state accounts use explicit `Standard_GRS`, public network access with Allow network rules for hosted runners/operator devices, OAuth authentication, no anonymous blob access and Shared Key off. Private endpoints require network-connected runners and operator connectivity and are an alternative architecture.
   - Both lifecycle actions exist, with their prefix filters.
   - `id-sf-ops` and `id-sf-restore` hold the delegation role at account scope and their data roles at container scope.
   - `id-sf-ops` (or its target-tenant twin) holds Cost Management Reader on every target subscription, including a newly added target; it receives no cost-write role.
   - The RG budget is at least £5.
 - **The policy invariant** runs against the instance's real policy, not a mock. `tools/policy-lint.py` runs before Terraform in `ph-plan` and `ph-deploy`. It runs in **enforcing mode** for the hardening PR, all later PRs, nightly drift and every deployment. The sole exception is the read-only baseline-import PR described under "Tailscale": `ph-plan` verifies that it preserves the live policy and settings with no resource diff, then runs the linter in **report-only mode**, listing findings without blocking on them. A label or caller input alone cannot select this exception; policy/settings edits or unrelated deployment changes disqualify it. There is no baseline apply or application of `tag:pcpilot` grants. Enforcing mode must pass before any host joins the tailnet. The linter expands every `grants` and `acls` entry and, in enforcing mode, fails when:
-  - any `src` covers `tag:pcpilot` (the literal tag, `*`, `autogroup:tagged`, or a host alias resolving to it);
+  - any `src` covers `tag:pcpilot` (the case-insensitive literal tag, `*`, `autogroup:tagged`, `autogroup:danger-all`, overlapping IPv4/IPv6 tailnet networks, or a host/group alias resolving to them);
   - any `dst` covering `tag:pcpilot` has a `src` other than the operator login.
+  - IP-set references and unknown selector types are rejected until supported; host aliases cannot shadow reserved selectors, and omitting both grants and ACLs cannot inherit allow-all silently.
 
   The tailnet module also renders the `tests` and `sshTests` entries in the hardening PR (see "Tailscale"). Linter/workflow acceptance tests preserve an allow-all baseline without blocking, list its findings, reject a modified baseline or an attempt to apply it, fail the same allow-all policy in enforcing mode, and block host joins until hardening passes and is applied.
+
+The trust home is an explicit immutable registered `role_home_target`, retained even when its host
+is decommissioned. Target-map changes cannot move custom-role scope, tenant-twin RG or identities.
+Terraform's persisted home guard prevents home key/subscription/region edits; plan-guard rejects
+replacement/removal of target role definitions and twin resources. Existing deployments choose the
+formerly first lexical target during adoption. Cross-tenant drift uses the plan twin's
+`target_client_id` on both target providers and all generated subscription aliases.
+
+EncryptionAtHost is an operator-registered, validated prerequisite: the later `ph-deploy` workflow
+must run `hosting/paperclip-hermes/tools/check-azure-prerequisites.sh` with the target subscription
+before host plan/apply. Deploy receives a narrow `SF Prerequisite Reader` role at each target subscription, limited to
+`Microsoft.Features/providers/features/read` and `Microsoft.Resources/subscriptions/providers/read`.
+The gate only reads provider and feature state and gives an explicit Owner
+bootstrap error on an unmet prerequisite.
 
 ## Bootstrap script
 
@@ -325,7 +356,7 @@ The ops-plane caller matrix is materialized as separate static jobs, one entry p
 | Mode | What it does |
 |---|---|
 | `init --org O --instance-repo R --reviewer U[,U2]` | Requires GitHub Enterprise for private-repo reviewer gates; **refuses Free, Pro, Team and unknown/unverifiable capability**. Checks the org Actions policy (`gh api orgs/{org}/actions/permissions`) and prints the one setting to change only if it is wrong. Creates the private repo from `templates/instance/` and sets `use_immutable_subject`. Creates the environments: `plan` with no branch restriction; `ops`, `production` and `restore` limited to `main`, with reviewers on `production` and `restore`. Prevent-self-review is on only when there are two or more reviewers. Reads back each protection rule and branch restriction and runs a harmless probe that must wait for review. Does not create Azure federation or issue a successful bootstrap receipt until gates are verified; a failed capability check leaves setup incomplete. |
-| `trust --vault-subscription V [--vault-mode separate-subscription\|same-subscription] --target NAME --subscription S --scope resource-group\|subscription --resource-group G --location L [--apply]` | Registers resource providers. Reads `spendingLimit` and enforces the vault-mode rule. Creates the state account and container with `az` if absent: Shared Key off, TLS 1.2, versioning, soft delete, `CanNotDelete` lock. Assigns the signed-in operator **temporary** Blob Data Contributor on `tfstate` and Key Vault Secrets Officer, waits for propagation, then runs `terraform apply` of the `trust` stack under the operator's login (`use_azuread_auth = true`), importing the state account. Removes the temporary assignments. Writes `config/targets/<NAME>.json`. Prints the vCPU headroom (for the VM family and Total Regional) and the cost headroom. Repeated for each new target; `--remove-target` removes one. |
+| `trust --vault-subscription V [--vault-mode separate-subscription\|same-subscription] --target NAME --subscription S --scope resource-group\|subscription --resource-group G --location L [--apply]` | Registers `Microsoft.Compute`, `Microsoft.Network`, `Microsoft.Logic`, `Microsoft.Insights`, `Microsoft.Consumption`, `Microsoft.DevTestLab`, `Microsoft.ManagedIdentity`, `Microsoft.Storage` and `Microsoft.KeyVault` where used. In each target subscription the Owner runs `az feature register --namespace Microsoft.Compute --name EncryptionAtHost`, waits for `az feature show` to report `Registered`, then `az provider register -n Microsoft.Compute` and waits for registration. This is an operator-registered prerequisite validated by the deploy preflight, never a deploy write. Records the immutable `role_home_target` on the first trust apply and retains that registered home across target additions/removals. Reads `spendingLimit` and enforces the vault-mode rule. Creates the state account and container with `az` if absent: Shared Key off, TLS 1.2, versioning, soft delete, `CanNotDelete` lock named `state-cannot-delete` on the state account (container name `tfstate`). Assigns the signed-in operator **temporary** Blob Data Contributor on `tfstate` and Key Vault Secrets Officer, waits for propagation, then runs `terraform apply` of the `trust` stack under the operator's login (`use_azuread_auth = true`), importing the state account. Removes the temporary assignments. Writes `config/targets/<NAME>.json`. Prints the vCPU headroom (for the VM family and Total Regional) and the cost headroom. Repeated for each new target; `--remove-target` removes one. |
 | `age-key [--custody operator\|vault] [--escrow-cmd "…"] [--rotate]` | Generates the key pair in memory and writes no file. The private key goes to `--escrow-cmd` (a password-manager CLI) through stdin, or is shown once on screen. Under vault custody it is also written to Key Vault with `az keyvault secret set --file /dev/stdin` under secret name `age-<fingerprint>`, never as `--value`; records the returned version URI in the fingerprint map. Sets the public recipient and its fingerprint as instance variables. `--rotate` keeps the old key enabled and readable by the gated restore identity until decision 8's retirement checks pass, and triggers `ph-rotate-age`. |
 | `vault-move --phase state\|backups\|keys [--apply]` | Operator-run data migration under the operator's own login; see "Moving the vault" for temporary data roles, verification and cleanup. The deploy and restore identities never receive destination backup or key-write permissions; `ops` gets only its normal `SF Backup Writer` role on the destination `backups` container from `trust`. |
 | `tailscale --token-stdin` | Reads a short-lived Tailscale API access token from stdin. Creates two federated identities through the API: `plan` (read scopes) and `production` (full scopes); any credential creation requiring the new tag ownership waits for the reviewed hardening PR. Does not edit the live policy, add `tagOwners` or apply `tag:pcpilot` grants during baseline import; those changes belong to the following hardening PR. Checks that MagicDNS and HTTPS certificates are on (`GET /tailnet/-/settings`, DNS preferences) and refuses if not. Stores the client IDs and audiences as variables, then revokes the token. |
@@ -392,7 +423,7 @@ Shared rules:
 4. The production federated identity can mint a key for `tag:pcpilot`.
 5. The plan identity's read-only Tailscale scopes are enough for a `tailscale_acl` plan with validation.
 6. The scope needed for `tailscale_tailnet_settings`.
-7. Budget `time_grain = BillingMonth` is accepted by the offer.
+7. Budget `time_grain = BillingMonth` is accepted by the offer. AzureRM 4.81.0 replaces the subscription budget on this switch; review the temporary gap. Budget creation/replacement uses the current apply month's first day (`timestamp()` with `ignore_changes` on the existing start), never a static `budget_start` input.
 8. The ops identity mints a delegation SAS (key at account scope) and uploads a canary.
 9. A TCP scan of the public IP from the runner (`nmap -Pn`, top 1,000 ports plus 22, 443 and 9443) finds nothing open. This scan also runs at the end of every `ph-deploy`.
 
@@ -464,7 +495,7 @@ Acceptance (Open): bump the workflow/kit SHA and assert the existing VM's `custo
 
 - **Storage.**
   - Container `backups` in the vault, with Shared Key off and versioning.
-  - Version-level WORM with a 30-day time-based policy. It is **Unlocked** only while `pilot_end_date` is in the future. `ph-ops` alerts at that date, and the documented default afterwards is **Locked**.
+  - Version-level WORM with a 30-day time-based policy. It is **Unlocked** only while `pilot_end_date` is in the future. At that date, the operator pauses uploads under the instance lock, applies trust to lock the account default and fallback policy, then runs `tools/lock-backup-versions.py --account <backup-account> --pilot-end <RFC3339> --apply` using the operator's Entra session and a temporary Storage Blob Data Owner grant on the unlocked vault RG. The tool enumerates all pages/versions, locks every still-unexpired Unlocked version without changing its retention deadline, and rereads the complete inventory. Already expired or Locked policies need no change. Changing the account default alone is insufficient for existing versions. Record the closure receipt, remove the temporary role on success or failure, and resume uploads only after verification; partial runs are retried idempotently. `ph-ops` alerts on overdue or failed closure. See the [tested pilot-closure procedure](../../hosting/paperclip-hermes/terraform/README.md#pilot-closure-operator-at-pilot_end_date). New accounts must first create an Unlocked policy, then transition to Locked with uploads paused if the intended pilot end is already past.
   - The `trust` stack (Owner only) owns the account, the policy, the lifecycle and the `CanNotDelete` lock. No workflow identity can change them.
   - Lifecycle rules: `baseBlob.delete` and `version.delete` after 45 days on the `backups/` prefix. Every backup is a uniquely named base blob, so the base-blob rule is what actually ages backups out.
   - Teardown of the account waits for retention to expire.
@@ -559,7 +590,7 @@ Acceptance (Open): copies succeed with exactly the temporary roles above in each
      - **removes or narrows every existing grant or ACL whose `src` or `dst` is `*`, `autogroup:member` or `autogroup:tagged` in a way that covers `tag:pcpilot`**;
      - adds no grant with `tag:pcpilot` as its source;
      - adds the SSH rule `{action:"check", src:[operator], dst:["tag:pcpilot"], users:["admin"]}`;
-     - adds `tests`: the operator is accepted to `tag:pcpilot:22,443,9443`; `tag:pcpilot` is **denied** to a sample of every other tag, user and host:port in the file; a second user or an `autogroup:member` stand-in is denied to `tag:pcpilot`;
+     - adds `tests`: the operator is accepted to `tag:pcpilot:22,443,9443`; `tag:pcpilot` is **denied** to a sample of every other tag, user and host:port in the file; a configured real non-operator login is denied to `tag:pcpilot` (omit this test if there is no second user; autogroups are invalid test sources);
      - adds `sshTests` for the check rule.
 
      `policy-lint.py` must pass in **enforcing mode** on this PR before apply. Its approved apply imports the resources into state and applies the reviewed hardening; no host may join until that hardened policy is applied. Every later PR, nightly drift and deployment uses enforcing mode; the report-only exception never applies to deployment or host joins.
@@ -607,10 +638,12 @@ These are UK retail estimates for `Standard_B4as_v2`: about £0.142 an hour, plu
 - `billing_period_start_day` = 17 for this operator.
 - **RG budget:**
   - amount = max(£5, min(`pilot_monthly_cap` (£35), headroom)), or `pilot_monthly_cap` when `override_cost` is set;
-  - e-mail at 50 % actual, deallocate at 80 % actual, e-mail at 100 % forecast.
+  - e-mail at 50 % actual, deallocate at 80 % and 100 % actual, e-mail at 100 % forecast.
 - **Subscription budget** = the credit:
-  - e-mail at 70 % actual; deallocate *only the pilot VM* at 85 % actual; e-mail at 100 % forecast;
+  - e-mail at 70 % actual; deallocate *only the pilot VM* at 85 % and 100 % actual; e-mail at 100 % forecast;
+  - Monetary threshold comparison allows half a penny plus floating-point slack for rounded Azure amounts; RG budgets round down to whole pounds with a five-pound minimum. The 100% override remains exact and runs before maintenance parsing. Only a valid future maintenance expiry within two hours can suppress the lower thresholds; malformed or farther-future tags deallocate through a handled parsing scope. ARM managed-identity HTTP actions specify audience `https://management.azure.com/`.
   - `time_grain = BillingMonth` if self-test 7 passes; otherwise `Monthly`, with the budget used for e-mail only.
+- The Logic App rechecks `sf-maintenance-until` with a second ARM GET immediately before its deallocate POST, with automatic POST retries disabled. This narrows the read-then-deallocate race; it does **not** provide atomic exclusion or a shared lease. Maintenance written after that GET but before Azure accepts the POST can still lose the race. The actual 100% notification overrides maintenance; subscription deallocation remains gated on verified billing months. Live acceptance must exercise the residual window.
 - `ph-cost-guard` is the authoritative trigger, on the real billing period. The operator-applied `trust` stack grants `id-sf-ops` read-only Cost Management Reader on each target subscription so usage and forecast queries run at their queried scope. Its thresholds are lowered by 4 days × the daily run rate to cover data lag.
 - Above 95 % of the forecast, the approval-gated park tier runs.
 - `ph-plan` and `ph-deploy` print the projected date on which the subscription hits its spending limit.

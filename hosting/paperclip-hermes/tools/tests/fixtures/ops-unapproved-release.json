@@ -1,0 +1,9 @@
+{
+  "issuer": "https://token.actions.githubusercontent.com",
+  "audience": "api://AzureADTokenExchange",
+  "subjects": [
+    "repo:example@1/instance@2:environment:ops",
+    "repo:example@1/instance@2:environment:ops:job_workflow_ref:agenticcodingops/software-factory/.github/workflows/ph-deploy.yml@d9a4f2aec32c7045661b05b59660ce99753897a2",
+    "repo:example@1/instance@2:environment:ops:job_workflow_ref:agenticcodingops/software-factory/.github/workflows/ph-ops.yml@d9a4f2aec32c7045661b05b59660ce99753897a2"
+  ]
+}

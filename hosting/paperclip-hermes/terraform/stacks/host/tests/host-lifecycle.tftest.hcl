@@ -1,0 +1,1 @@
+../../../tests/host-lifecycle.tftest.hcl

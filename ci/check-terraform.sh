@@ -23,7 +23,8 @@ if [[ ! -d "$stacks" ]] || ! find "$stacks" -type f \( -name '*.tf' -o -name '*.
 fi
 
 snapshot=$(mktemp)
-trap 'rm -f "$snapshot"' EXIT
+rendered_trust=$(mktemp -d)
+trap 'rm -f "$snapshot"; rm -rf "$rendered_trust"' EXIT
 while IFS= read -r -d '' stack; do
   if ! find "$stack" -maxdepth 1 -type f \( -name '*.tf' -o -name '*.tf.json' \) -print -quit | read -r; then
     continue
@@ -35,9 +36,33 @@ while IFS= read -r -d '' stack; do
   fi
   git ls-files --error-unmatch "$lock" >/dev/null
   cp "$lock" "$snapshot"
+  if [[ "$stack" == "$stacks/trust" ]]; then
+    python3 hosting/paperclip-hermes/tools/tests/trust_fixture.py > "$rendered_trust/targets.json"
+    python3 hosting/paperclip-hermes/tools/render-trust.py \
+      hosting/paperclip-hermes/terraform "$rendered_trust/tree" \
+      --config "$rendered_trust/targets.json" >/dev/null
+    stack="$rendered_trust/tree/stacks/trust"
+    lock="$stack/.terraform.lock.hcl"
+  fi
   terraform -chdir="$stack" init -backend=false -input=false -lockfile=readonly
   terraform -chdir="$stack" validate
-  terraform -chdir="$stack" test
+  # Verbose JSON exposes actual mocked resource changes, including nested AVM resources.
+  mock_log=$(mktemp)
+  if ! terraform -chdir="$stack" test -json -verbose > "$mock_log"; then
+    cat "$mock_log"
+    rm -f "$mock_log"
+    exit 1
+  fi
+  python3 hosting/paperclip-hermes/tools/check-mock-plans.py "$mock_log"
+  python3 - "$mock_log" <<'PYCODE'
+import json
+import sys
+for line in open(sys.argv[1]):
+    event = json.loads(line)
+    if event.get("type") == "test_summary":
+        print(event["@message"])
+PYCODE
+  rm -f "$mock_log"
   terraform -chdir="$stack" providers lock -platform=linux_amd64 -platform=windows_amd64
   if ! cmp -s "$snapshot" "$lock"; then
     diff -u "$snapshot" "$lock" || true

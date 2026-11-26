@@ -1,0 +1,15 @@
+{
+  "grants": [
+    {
+      "src": [
+        "tag:pcpilot"
+      ],
+      "dst": [
+        "tag:other"
+      ],
+      "ip": [
+        "*"
+      ]
+    }
+  ]
+}

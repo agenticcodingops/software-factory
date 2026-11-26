@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Enforce the pilot's network isolation against a complete JSON/HuJSON policy."""
+
+import argparse
+import ipaddress
+import json
+from pathlib import Path
+import re
+import sys
+
+PILOT = "tag:pcpilot"
+# The pilot is a tagged identity; member-owned devices and internet routes do not include it.
+BROAD = {"*", "autogroup:tagged", "autogroup:danger-all"}
+USER_AUTOGROUPS = {"autogroup:" + name for name in (
+    "member", "members", "owner", "admin", "it-admin", "billing-admin", "network-admin",
+    "auditor", "shared", "self", "internet",
+)}
+TAILNET_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"),
+    ipaddress.ip_network("::ffff:100.64.0.0/106"),  # Do not hide tailnet IPv4 in mapped IPv6.
+)
+
+
+def load_policy(text):
+    """Remove HuJSON comments/trailing commas without touching quoted strings."""
+    tokens = re.findall(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/|[^"/]+|/', text)
+    clean = "".join(t for t in tokens if not t.startswith(("//", "/*")))
+    # A second token pass prevents trailing-comma removal inside string literals.
+    parts = re.findall(r'"(?:\\.|[^"\\])*"|\s+|.', clean)
+    for i, part in enumerate(parts):
+        if part == ",":
+            following = next((p for p in parts[i + 1:] if p.strip()), "")
+            if following in ("}", "]"):
+                parts[i] = ""
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate policy key")
+            result[key] = value
+        return result
+
+    value = json.loads("".join(parts), object_pairs_hook=unique)
+    if not isinstance(value, dict):
+        raise ValueError("policy must be an object")
+    return value
+
+
+def lower_keys(value):
+    if not isinstance(value, dict):
+        raise ValueError("policy sections/rules must be objects")
+    result = {}
+    for key, item in value.items():
+        key = key.lower()
+        if key in result:
+            raise ValueError("policy keys collide after case normalization")
+        result[key] = item
+    return result
+
+
+def normalize_policy(policy):
+    policy = lower_keys(policy)
+    allowed = {"acls", "grants", "ssh", "hosts", "groups", "tagowners", "autoapprovers",
+               "nodeattrs", "tests", "sshtests", "derpmap", "randomizeclientport", "disableipv4",
+               "postures", "defaultsrcposture", "ipsets"}
+    if policy.keys() - allowed:
+        raise ValueError("unsupported policy section")
+    for section in ("grants", "acls", "ssh"):
+        entries = policy.get(section, [])
+        if not isinstance(entries, list):
+            raise ValueError("policy rules must be arrays")
+        entries = [lower_keys(rule) for rule in entries]
+        allowed_rule = {"action", "src", "dst", "proto", "ip", "app", "via", "srcposture"}
+        if section == "ssh":
+            allowed_rule |= {"users", "checkperiod", "acceptenv"}
+        for rule in entries:
+            if rule.keys() - allowed_rule:
+                raise ValueError("unsupported rule key (legacy ACL users/ports are forbidden)")
+        policy[section] = entries
+    return policy
+
+
+def selectors(policy, value, trail=()):
+    if not isinstance(value, str):
+        raise ValueError("selectors must be strings")
+    value = value.lower()
+    if value in trail:
+        raise ValueError("cyclic group/host alias")
+    if value.startswith("ipset:"):
+        raise ValueError("IP-set selectors are unsupported; use explicit addresses or tags")
+    if value.startswith("group:"):
+        members = {key.lower(): members for key, members in policy.get("groups", {}).items()}.get(value)
+        if not isinstance(members, list) or not members:
+            raise ValueError("unknown or empty group")
+        return {item for member in members for item in selectors(policy, member, (*trail, value))}
+    hosts = {key.lower(): address for key, address in policy.get("hosts", {}).items()}
+    if value in hosts:
+        return selectors(policy, hosts[value], (*trail, value))
+    if value in BROAD or value in USER_AUTOGROUPS or re.fullmatch(r"tag:[a-z0-9][a-z0-9-]*", value):
+        return {value}
+    if re.fullmatch(r"(?:user:\*|[^@\s:]+)@[^@\s:]+", value):
+        return {value}
+    try:
+        return {str(ipaddress.ip_network(value, strict=False))}
+    except ValueError as exc:
+        raise ValueError("unknown or unsupported selector") from exc
+
+
+def destination(value, acl=False):
+    if not isinstance(value, str):
+        raise ValueError("destination must be a string")
+    if acl:
+        # ACL destinations carry ports; tag names already contain one colon.
+        value, separator, _ = value.rpartition(":")
+        if not separator or not value:
+            raise ValueError("ACL destination needs ports")
+        value = value.strip("[]")
+    return value
+
+
+def covers_pilot(value):
+    if value == PILOT or value in BROAD:
+        return True
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+        return any(network.version == tailnet.version and network.overlaps(tailnet) for tailnet in TAILNET_NETWORKS)
+    except ValueError:
+        return False
+
+
+def findings(policy, operator):
+    # Remember absence before normalization supplies empty rule arrays.
+    missing_rules = not any(key.lower() in {"grants", "acls"} for key in policy)
+    policy = normalize_policy(policy)
+    result = []
+    operator = operator.lower()
+    # Selectors must not be hidden by aliases named after reserved tags, networks or users.
+    for section in ("hosts", "groups"):
+        definitions = policy.get(section, {})
+        if not isinstance(definitions, dict) or len({key.lower() for key in definitions}) != len(definitions):
+            raise ValueError("invalid or duplicate selector definitions")
+        for key in definitions:
+            pattern = r"[a-zA-Z][a-zA-Z0-9_.-]*" if section == "hosts" else r"group:[a-zA-Z0-9_-]+"
+            if not re.fullmatch(pattern, key):
+                raise ValueError("invalid host alias or group name")
+    if missing_rules:
+        result.append("missing grants/acls inherits Tailscale's default allow-all policy")
+    for section in ("grants", "acls"):
+        entries = policy.get(section, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"{section} must be a list")
+        for index, rule in enumerate(entries):
+            if not isinstance(rule, dict) or not isinstance(rule.get("src"), list) or not isinstance(rule.get("dst"), list) or not rule["src"] or not rule["dst"]:
+                raise ValueError("every rule requires nonempty src/dst arrays")
+            src = {s for item in rule["src"] for s in selectors(policy, item)}
+            dst = {s for item in rule["dst"] for s in selectors(policy, destination(item, section == "acls"))}
+            if section == "grants" and any(covers_pilot(s) for item in rule.get("via", []) for s in selectors(policy, item)):
+                result.append(f"grants[{index}]: pilot cannot route traffic via itself")
+            if any(covers_pilot(s) for s in src):
+                result.append(f"{section}[{index}]: source covers {PILOT}")
+            if any(covers_pilot(d) for d in dst) and src != {operator}:
+                result.append(f"{section}[{index}]: only the operator may reach {PILOT}")
+    for index, rule in enumerate(policy.get("ssh", [])):
+        dst = {s for item in rule.get("dst", []) for s in selectors(policy, item)}
+        src = {s for item in rule.get("src", []) for s in selectors(policy, item)}
+        if any(covers_pilot(s) for s in src):
+            result.append(f"ssh[{index}]: source covers {PILOT}")
+        if any(covers_pilot(d) for d in dst):
+            if src != {operator} or rule.get("action") != "check" or rule.get("users") != ["admin"]:
+                result.append(f"ssh[{index}]: pilot SSH requires operator check mode as admin")
+    for test in policy.get("sshtests", []):
+        if not isinstance(test.get("src"), str) or not isinstance(test.get("dst"), list) or "user" in test:
+            raise ValueError("sshTests requires src and a dst array, with accept/check/deny user arrays")
+        if any(not isinstance(test[key], list) or not all(isinstance(user, str) for user in test[key]) for key in ("accept", "check", "deny") if key in test):
+            raise ValueError("sshTests accept/check/deny must be arrays of SSH users")
+    for entry in policy.get("nodeattrs", []):
+        entry = lower_keys(entry)
+        attrs = entry.get("attr", [])
+        # No pilot node attributes are currently authorized. Funnel is always rejected.
+        if "funnel" in attrs or attrs and any(covers_pilot(s) for item in entry.get("target", []) for s in selectors(policy, item)):
+            result.append("nodeAttrs: unauthorized pilot/public attribute")
+    approvers = lower_keys(policy.get("autoapprovers", {}))
+    for entries in [approvers.get("exitnode", []), *approvers.get("routes", {}).values()]:
+        if any(covers_pilot(s) for item in entries for s in selectors(policy, item)):
+            result.append("autoApprovers: pilot must not auto-approve routes or exit nodes")
+    owners = lower_keys(policy.get("tagowners", {}))
+    for tag, expected in ((PILOT, ["tag:pc-deployer"]), ("tag:pc-deployer", [operator])):
+        if tag in owners and owners[tag] != expected:
+            result.append(f"tagOwners: {tag} requires exactly {expected}")
+    return result
+
+
+def baseline_findings(plan, policy_text, live_policy):
+    """The report-only exception requires an externally read live baseline and no-diff plan."""
+    errors = []
+    if policy_text != live_policy:
+        errors.append("baseline policy differs from the live policy")
+    allowed = {"tailscale_acl", "tailscale_tailnet_settings", "tailscale_dns_preferences"}
+    seen = set()
+    for resource in plan.get("resource_changes", []):
+        if resource.get("mode", "managed") != "managed":
+            errors.append("baseline has unrelated data reads")
+        if resource.get("type") not in allowed or resource.get("change", {}).get("actions") != ["no-op"]:
+            errors.append("baseline must have no resource diff or unrelated deployment changes")
+        seen.add(resource.get("type"))
+    if not {"tailscale_acl", "tailscale_tailnet_settings"} <= seen:
+        errors.append("baseline requires policy and settings in its no-diff plan")
+    for resource in plan.get("resource_changes", []):
+        if resource.get("type") == "tailscale_acl" and resource.get("change", {}).get("after", {}).get("acl") != live_policy:
+            errors.append("baseline plan does not preserve live policy")
+    if plan.get("errored") or plan.get("deferred_changes") or plan.get("complete") is False:
+        errors.append("baseline plan is incomplete")
+    return errors
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("policy", type=Path)
+    parser.add_argument("--operator", required=True)
+    parser.add_argument("--mode", choices=("enforcing", "report-only"), default="enforcing")
+    parser.add_argument("--baseline-plan", type=Path)
+    parser.add_argument("--live-policy", type=Path)
+    parser.add_argument("--operation", choices=("plan", "apply", "join"), default="plan")
+    args = parser.parse_args()
+    try:
+        text = args.policy.read_text()
+        loaded = load_policy(text)
+        try:
+            issues = findings(loaded, args.operator)
+        except ValueError as exc:
+            if args.mode != "report-only":
+                raise
+            # An exact read-only baseline can report unsupported legacy semantics.
+            # The complete no-diff/live-byte checks below still forbid any mutation.
+            issues = [str(exc)]
+        if args.mode == "report-only":
+            if args.operation != "plan" or not args.baseline_plan or not args.live_policy:
+                raise ValueError("report-only requires a read-only no-diff baseline plan and live policy; apply/join forbidden")
+            errors = baseline_findings(json.loads(args.baseline_plan.read_text()), text, args.live_policy.read_text())
+            if errors:
+                raise ValueError("; ".join(errors))
+        for issue in issues:
+            print(issue)
+        print(f"policy-lint ({args.mode}): {len(issues)} finding(s)")
+        return int(bool(issues) and args.mode == "enforcing")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        print(f"policy-lint: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
