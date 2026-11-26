@@ -33,7 +33,7 @@ lock() {
   run bash "$script"
   [ "$status" -eq 0 ]
   [[ "$output" == *'none yet'* ]]
-  run rg -q 'providers lock' "$CALLS"
+  run grep -q -e 'providers lock' "$CALLS"
   [ "$status" -eq 1 ]
 }
 
@@ -49,10 +49,10 @@ lock() {
   lock
   run bash "$script"
   [ "$status" -eq 0 ]
-  rg -q 'init -backend=false -input=false -lockfile=readonly' "$CALLS"
-  rg -q 'validate' "$CALLS"
-  rg -q 'test' "$CALLS"
-  rg -q 'providers lock -platform=linux_amd64 -platform=windows_amd64' "$CALLS"
+  grep -q -e 'init -backend=false -input=false -lockfile=readonly' "$CALLS"
+  grep -q -e 'validate' "$CALLS"
+  grep -q -e 'test' "$CALLS"
+  grep -q -e 'providers lock -platform=linux_amd64 -platform=windows_amd64' "$CALLS"
 }
 
 @test 'regenerated platform hash drift fails' {

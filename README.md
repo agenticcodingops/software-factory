@@ -16,7 +16,7 @@ Repository paths follow the ADR: kit, Terraform, tools, bootstrap and rulesets l
 ## Local checks
 
 On Linux amd64, install Python 3.11, Node 22.23.5, Terraform at the version in
-[.terraform-version](.terraform-version), ShellCheck, Bats, ripgrep, curl, unzip and Git. Then:
+[.terraform-version](.terraform-version), ShellCheck, Bats, curl, unzip and Git. Then:
 
 ```sh
 python3 -m venv .venv
