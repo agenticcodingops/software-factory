@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+# Includes the root-only Compose environment and runtime secret sources.
+.secrets/
+data/
+*.backup

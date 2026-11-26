@@ -1,0 +1,4 @@
+[credential]
+    helper =
+    helper = /bin/sh /kit/git-credential-fixture.sh
+    useHttpPath = true

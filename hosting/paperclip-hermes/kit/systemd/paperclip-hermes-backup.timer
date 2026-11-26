@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Paperclip and Hermes encrypted backup
+
+[Timer]
+OnCalendar=*-*-* 00:15:00
+Persistent=true
+RandomizedDelaySec=0
+Unit=paperclip-hermes-backup.service
+
+[Install]
+WantedBy=timers.target

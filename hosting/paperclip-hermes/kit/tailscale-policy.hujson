@@ -1,0 +1,23 @@
+// Standalone, minimal example. Replace BOTH placeholders before applying.
+// Grants are additive: retaining an existing allow-all rule defeats isolation.
+{
+  "tagOwners": {
+    "tag:pcpilot": ["operator@example.com"],
+  },
+  "grants": [
+    {
+      "src": ["operator@example.com"],
+      "dst": ["tag:pcpilot"],
+      "ip": ["*"],
+    },
+  ],
+  // No grants originate from tag:pcpilot. Unmatched traffic is denied.
+  "ssh": [
+    {
+      "action": "check",
+      "src": ["operator@example.com"],
+      "dst": ["tag:pcpilot"],
+      "users": ["admin"], // Replace with the host's admin user.
+    },
+  ],
+}

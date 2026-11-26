@@ -1,0 +1,214 @@
+name: paperclip-hermes
+
+x-runtime: &runtime
+  restart: unless-stopped
+  security_opt: [no-new-privileges:true]
+  cap_drop: [NET_RAW]
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    <<: *runtime
+    image: postgres:17@sha256:87c8b42f423b45d5247e6aa8fdb2e7762fec164c68a50fe3eb07e7bfcaf4dbcf
+    environment:
+      POSTGRES_USER: paperclip
+      POSTGRES_DB: paperclip
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    networks: [database]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U paperclip -d paperclip"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  paperclip:
+    <<: *runtime
+    image: ghcr.io/paperclipai/paperclip:2026.1117.0@sha256:bdf38d10544dc6c831e16dc027f23ad586353ef3be1a1b2c6979e63b956aceb1
+    entrypoint: [/usr/bin/tini, -s, --, /bin/sh, /kit/paperclip-entrypoint.sh]
+    command: [node, server/dist-runtime/index.mjs]
+    pids_limit: 2048
+    stop_grace_period: 90s
+    ports: ["127.0.0.1:3100:3100"]
+    environment:
+      DATABASE_URL: postgres://paperclip:${POSTGRES_PASSWORD:-}@postgres:5432/paperclip
+      PAPERCLIP_HOME: /paperclip
+      PAPERCLIP_INSTANCE_ID: default
+      PAPERCLIP_BIND: custom
+      PAPERCLIP_BIND_HOST: 0.0.0.0
+      HOST: 0.0.0.0
+      PORT: "3100"
+      SERVE_UI: "true"
+      PAPERCLIP_DEPLOYMENT_MODE: authenticated
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: private
+      PAPERCLIP_API_URL: http://127.0.0.1:3100
+      PAPERCLIP_PUBLIC_URL: https://${TAILSCALE_HOSTNAME:-pilot.tailnet.example}
+      PAPERCLIP_AUTH_BASE_URL_MODE: explicit
+      PAPERCLIP_AUTH_PUBLIC_BASE_URL: https://${TAILSCALE_HOSTNAME:-pilot.tailnet.example}
+      PAPERCLIP_ALLOWED_HOSTNAMES: ${TAILSCALE_HOSTNAME:-pilot.tailnet.example}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-}
+      PAPERCLIP_AGENT_JWT_SECRET: ${PAPERCLIP_AGENT_JWT_SECRET:-}
+      PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: ${PAPERCLIP_TOOL_ACTION_SIGNING_SECRET:-}
+      PAPERCLIP_SECRETS_MASTER_KEY: ${PAPERCLIP_SECRETS_MASTER_KEY:-}
+      NODE_EXTRA_CA_CERTS: /caddy-ca/root.crt
+      FIXTURE_REPOSITORY: ${FIXTURE_REPOSITORY:-owner/fixture-repository}
+    secrets: [fixture_github_token]
+    tmpfs: [/run/kit:mode=0755]
+    volumes:
+      - paperclip:/paperclip
+      - public_ca:/caddy-ca:ro
+      - ./container:/kit:ro
+      - ./container/gitconfig:/etc/gitconfig:ro
+      - ./container/gh.sh:/usr/local/bin/gh:ro
+    networks: [database, tls, paperclip_egress]
+    depends_on:
+      postgres: {condition: service_healthy}
+      caddy: {condition: service_healthy}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - 'fetch("http://127.0.0.1:3100/api/health", {headers: {host: process.env.PAPERCLIP_ALLOWED_HOSTNAMES}}).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))'
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  hermes:
+    <<: *runtime
+    build:
+      context: .
+      dockerfile: Dockerfile.hermes
+      target: runtime
+    entrypoint: [/bin/sh, /kit/hermes-entrypoint.sh]
+    command: [gateway, run]
+    pids_limit: 2048
+    stop_grace_period: 90s
+    ports: ["127.0.0.1:9119:9119"]
+    environment:
+      HERMES_UID: "10000"
+      HERMES_GID: "10000"
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_PORT: "8642"
+      API_SERVER_KEY: ${HERMES_GATEWAY_KEY:-}
+      HERMES_DASHBOARD: "1"
+      HERMES_DASHBOARD_HOST: 0.0.0.0
+      HERMES_DASHBOARD_PORT: "9119"
+      HERMES_DASHBOARD_PUBLIC_URL: https://${TAILSCALE_HOSTNAME:-pilot.tailnet.example}:9443
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: operator
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:-}
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${HERMES_DASHBOARD_BASIC_AUTH_SECRET:-}
+      HERMES_MODEL: ${HERMES_MODEL:-gpt-5-mini}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DASHBOARD_GATEWAY: ${DASHBOARD_GATEWAY:-172.30.99.1}
+      TERMINAL_ENV: ssh
+      TERMINAL_SSH_HOST: sandbox
+      TERMINAL_SSH_PORT: "2222"
+      TERMINAL_SSH_USER: hermes
+      TERMINAL_SSH_KEY: /run/kit/sandbox_ed25519
+      FIXTURE_REPOSITORY: ${FIXTURE_REPOSITORY:-owner/fixture-repository}
+      # Set by restore: configure-hermes.py switches every messaging platform off.
+      KIT_MESSAGING_OFF: ${KIT_MESSAGING_OFF:-}
+    secrets: [fixture_github_token, sandbox_ssh_key]
+    tmpfs: [/run/kit:mode=0755]
+    volumes:
+      - hermes:/opt/data
+      - ./container:/kit:ro
+      - ./hermes-config.yaml:/kit-config.yaml:ro
+      - ./container/gitconfig:/etc/gitconfig:ro
+      - ./container/gh.sh:/usr/local/bin/gh:ro
+    networks:
+      gateway: {}
+      sandbox: {}
+      dashboard: {gw_priority: 1}
+    depends_on:
+      sandbox: {condition: service_healthy}
+    healthcheck:
+      test:
+        - CMD
+        - /opt/hermes/.venv/bin/python
+        - -c
+        - 'import socket, urllib.request; urllib.request.urlopen("http://127.0.0.1:8642/health", timeout=3).close(); socket.create_connection(("127.0.0.1", 9119), timeout=3).close()'
+      interval: 10s
+      timeout: 8s
+      retries: 30
+      start_period: 30s
+
+  # An SSH execution sandbox, deliberately without the Hermes home, provider
+  # environment, host directories or Docker socket. Only fixture Git access.
+  sandbox:
+    <<: *runtime
+    build:
+      context: .
+      dockerfile: Dockerfile.hermes
+      target: sandbox
+    entrypoint: [/bin/sh, /kit/sandbox-entrypoint.sh]
+    pids_limit: 1024
+    environment:
+      FIXTURE_REPOSITORY: ${FIXTURE_REPOSITORY:-owner/fixture-repository}
+    secrets: [fixture_github_token, sandbox_ssh_public_key]
+    tmpfs: [/run:mode=0755, "/tmp:exec,nosuid,nodev,mode=1777"]
+    volumes:
+      - sandbox:/workspace
+      - sandbox_hostkeys:/etc/ssh/hostkeys
+      - ./container:/kit:ro
+      - ./container/sshd_config:/etc/ssh/sshd_config:ro
+      - ./container/gitconfig:/etc/gitconfig:ro
+      - ./container/gh.sh:/usr/local/bin/gh:ro
+    networks: [sandbox]
+    healthcheck:
+      test: [CMD-SHELL, "ssh-keyscan -p 2222 127.0.0.1 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  caddy:
+    <<: *runtime
+    image: caddy:2-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
+    entrypoint: [/bin/sh, /kit/caddy-entrypoint.sh]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./container:/kit:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - public_ca:/public-ca
+    networks: [tls, gateway]
+    healthcheck:
+      test: [CMD-SHELL, "test -s /public-ca/root.crt && wget -q -O /dev/null http://127.0.0.1:2019/config/"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+secrets:
+  fixture_github_token: {file: ./.secrets/github-token}
+  sandbox_ssh_key: {file: ./.secrets/sandbox_ed25519}
+  sandbox_ssh_public_key: {file: ./.secrets/sandbox_ed25519.pub}
+
+networks:
+  database: {internal: true}
+  tls: {internal: true}
+  gateway: {internal: true}
+  paperclip_egress: {}
+  sandbox: {}
+  dashboard:
+    ipam:
+      config:
+        - subnet: ${DASHBOARD_SUBNET:-172.30.99.0/24}
+          gateway: ${DASHBOARD_GATEWAY:-172.30.99.1}
+
+volumes:
+  postgres: {}
+  paperclip: {}
+  hermes: {}
+  sandbox: {}
+  sandbox_hostkeys: {}
+  caddy_data: {}
+  caddy_config: {}
+  public_ca: {}
