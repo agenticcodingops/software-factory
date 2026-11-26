@@ -7,8 +7,9 @@ Terraform with Azure Verified Modules, GitHub Actions over OIDC, automated upgra
 subscription moves. See [ADR 0001](docs/adr/0001-azure-deployment.md).
 
 WP1 provides the repository scaffold, CI, release automation and ruleset payloads. The
-[Compose kit](hosting/paperclip-hermes/kit/README.md) is already imported. Automated Azure deployment,
-the instance merge gate and the bootstrap command remain future work; this scaffold is not deployable.
+[Compose kit](hosting/paperclip-hermes/kit/README.md) is already imported. WP5 adds the
+[operator bootstrap and acceptance matrix](hosting/paperclip-hermes/bootstrap/README.md).
+Automated Azure deployment and the instance merge gate remain future work; this scaffold is not deployable.
 
 Repository paths follow the ADR: kit, Terraform, tools, bootstrap and rulesets live under
 `hosting/paperclip-hermes/`; reusable workflows live directly in `.github/workflows/`.
@@ -56,6 +57,8 @@ The `kit-e2e` workflow exercises container upgrade rollback and cross-version re
 Azure and GitHub settings checks require later packages and operator infrastructure.
 Install Docker Compose v2.33.1 or later for the unit-test profile matrix (no daemon needed).
 The kit unit tests use sudo when needed to exercise root-only ownership protections.
+WP5 Bats tests replace every cloud CLI with a fail-closed local stub and exercise reviewer gates,
+observed OIDC claims, custody, migration, secret handling and temporary-role cleanup.
 
 ## Releases and protection
 
@@ -74,7 +77,7 @@ that runs Release Please. The workflow fails visibly if it is missing. Never put
 
 Review the [ruleset payloads and apply/readback procedure](hosting/paperclip-hermes/rulesets/README.md).
 Only the public payload is ready for operator application. The instance and org templates remain
-disabled until the later bootstrap and trusted, release-pinned merge gate exist. WP5 supplies
+disabled until the trusted, release-pinned merge gate exists. WP5 supplies
 `sf-bootstrap.sh rulesets [--apply]`; WP1 does not modify repository or organization settings.
 
 See [SECURITY.md](SECURITY.md) for private vulnerability reporting and public-tree identifier rules.

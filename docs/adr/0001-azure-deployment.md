@@ -117,7 +117,7 @@ This ADR specifies a reusable deployment for adopters whose private repositories
     - **Self-review.** In single-operator mode, `init` leaves "prevent self-review" **off**, because GitHub would otherwise block the operator from approving any run they triggered. It is turned on only when `--reviewer` lists two or more people. The documented convention is that agents, not the operator, trigger the runs the operator approves.
     - **CODEOWNERS** in the instance repo:
       - The operator owns `.github/**`, `config/**` and `config/tailnet/**`.
-      - The callers `.github/workflows/ph-*.yml` have **no code owner**. They are protected by `sf-merge-gate` instead.
+      - WP5 bootstrap also assigns the operator to `.github/workflows/ph-*.yml`. The automatic ref-only carve-out described below remains disabled until a separately reviewed gate implementation can enforce it; caller additions and other changes always need CODEOWNER review.
     - **`sf-merge-gate`** is an **organisation ruleset "required workflow"**. It comes from a repo the PR cannot change, at a SHA pinned in the ruleset; for agenticcodingops that is `software-factory` at a release SHA. The gate:
       - passes a PR that touches only `ph-*.yml` callers, where each change is only a `uses: …@<sha> # vX.Y.Z` line pointing to a tagged `software-factory` release;
       - also requires, for each **per-target ops-plane caller entry** (`ph-ops`, `ph-power`, `ph-cost-guard`, `ph-backup-verify`), that `<sha>` equals that entry's target VM tag `sf-approved-sha`, read with the plan identity; each entry has a fixed target input and its own literal `uses:` SHA;
@@ -264,7 +264,7 @@ config/tailnet/policy.hujson       # the whole imported policy (contains logins,
 config/receipts/bootstrap.json     # non-secret receipt
 .github/workflows/*.yml            # thin callers; ops-plane files have one statically pinned job per target
                                    # each job: fixed target input + uses: .../ph-*.yml@<target-sha> # vX.Y.Z
-.github/CODEOWNERS                 # operator owns .github/** and config/**; ph-*.yml have no owner (merge gate)
+.github/CODEOWNERS                 # operator owns .github/**, config/** and ph-*.yml; ref carve-out deferred
 .github/workflows/claude.yml       # optional bot review
 renovate.json                      # extends github>…/software-factory//renovate/instance#vX
 ```
