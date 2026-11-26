@@ -1,0 +1,6 @@
+# Exact, case-insensitive public placeholders only; no regexes or path exclusions.
+# The only permitted GUID is the all-zero documentation placeholder.
+00000000-0000-0000-0000-000000000000
+# Existing kit policy example and URL user-info test fixture, never real addresses.
+operator@example.com
+password@storage.example.test

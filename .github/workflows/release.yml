@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to repair (defaults to the current manifest version)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      # Only asset upload uses GITHUB_TOKEN; Release Please uses its machine-user token.
+      contents: write
+    steps:
+      - name: Require a machine-user token for release PRs to trigger CI
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: test -n "$RELEASE_TOKEN"
+      - uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4.4.0
+        if: github.event_name != 'workflow_dispatch'
+        id: release
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select a release needing assets
+        id: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          NEW_RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="${REQUESTED_TAG:-${NEW_RELEASE_TAG:-v$(jq -r '.["."]' .release-please-manifest.json)}}"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Expected a release tag in vX.Y.Z format' >&2
+            exit 1
+          fi
+          # Listing distinguishes an absent release from a failed API request.
+          release=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" | \
+            jq -c --arg tag "$RELEASE_TAG" '.[] | select(.tag_name == $tag)')
+          if [[ -z "$release" ]]; then
+            if [[ "$EVENT_NAME" == workflow_dispatch || "$RELEASE_CREATED" == true ]]; then
+              echo 'The requested release does not exist' >&2
+              exit 1
+            fi
+            exit 0
+          fi
+          asset="paperclip-hermes-kit-${RELEASE_TAG}.tar.gz"
+          if [[ "$EVENT_NAME" == workflow_dispatch || "$RELEASE_CREATED" == true ]] || \
+            ! jq -e --arg asset "$asset" \
+              'any(.assets[]; .name == $asset) and any(.assets[]; .name == ($asset + ".sha256"))' \
+              <<< "$release" > /dev/null; then
+            echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.assets.outputs.tag != ''
+        with:
+          ref: refs/tags/${{ steps.assets.outputs.tag }}
+          persist-credentials: false
+      - name: Attach the kit archive and checksum
+        if: steps.assets.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.assets.outputs.tag }}
+        run: |
+          set -euo pipefail
+          asset="paperclip-hermes-kit-${RELEASE_TAG}.tar.gz"
+          git archive --format=tar --prefix=paperclip-hermes-kit/ HEAD:hosting/paperclip-hermes/kit | gzip -n > "$asset"
+          sha256sum "$asset" > "$asset.sha256"
+          gh release upload "$RELEASE_TAG" "$asset" "$asset.sha256" --clobber

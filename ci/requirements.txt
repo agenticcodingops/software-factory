@@ -1,0 +1,5 @@
+PyYAML==6.0.3
+pytest==8.4.2
+ruamel.yaml==0.19.1
+checkov==3.4.11
+zizmor==1.16.3

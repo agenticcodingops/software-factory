@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  merge_group:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '22.23.5'
+      - name: Select the repository Terraform version
+        # setup-terraform has no version-file input. Read it before the pinned setup step below.
+        id: terraform
+        run: echo "version=$(cat .terraform-version)" >> "$GITHUB_OUTPUT"
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ steps.terraform.outputs.version }}
+          terraform_wrapper: false
+      - name: Install check tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck bats
+          python3 -m pip install -r ci/requirements.txt
+          npm ci --ignore-scripts --no-audit --no-fund
+          bash ci/install-tools.sh "$RUNNER_TEMP/wp1-bin"
+          echo "$RUNNER_TEMP/wp1-bin" >> "$GITHUB_PATH"
+      - name: Check the entire tree
+        run: bash ci/check.sh
