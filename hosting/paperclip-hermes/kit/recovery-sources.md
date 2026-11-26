@@ -104,3 +104,13 @@ Docker restore. Run tests/e2e-backup-restore.sh on disposable Linux Docker, then
 complete the application-level pending approval, attachment and exactly-one-PR
 checks with the operator. Neither a parsed script nor a healthy container is
 reported as the full restore drill passing.
+
+### Block-upload authorization
+
+The uploader pins `x-ms-version: 2023-11-03` and requires `sp=cw`. Both
+[Put Block](https://learn.microsoft.com/en-us/rest/api/storageservices/put-block#user-delegation-sas)
+and [Put Block List](https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-list#user-delegation-sas)
+require Write for this version; Create alone is supported starting with
+`2026-04-06`. A small successful canary does not establish block-upload
+authorization. Local tests reject `c` and exercise `cw` through both single PUT
+and staged-block publication with the pinned version.

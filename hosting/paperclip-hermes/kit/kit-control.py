@@ -80,6 +80,16 @@ def required_space(compose):
     return math.ceil((size + dump) * 2.2)
 
 
+def fence_project(compose):
+    # Compose's old model omits candidate-only services. Remove every project
+    # container before touching shared data, without deleting any volumes.
+    containers = r.run(['docker', 'container', 'ls', '--all', '--quiet', '--filter',
+                        'label=com.docker.compose.project=' + compose.name]).split()
+    if containers:
+        r.run(['docker', 'container', 'stop', '--time', '90', *containers])
+        r.run(['docker', 'container', 'rm', *containers])
+
+
 def rollback_point(action, path, compose):
     path = Path(path)
     if action == 'create':
@@ -114,7 +124,7 @@ def rollback_point(action, path, compose):
             # stack. Never let cleanup conceal that both operations failed.
             try:
                 if running:
-                    compose('start', '--wait', '--wait-timeout', '300', *running)
+                    r.restart_services(compose, running)
             except BaseException:
                 print('ops-alert: previous stack restart failed after rollback-point failure', file=sys.stderr)
                 raise
@@ -131,7 +141,7 @@ def rollback_point(action, path, compose):
     current = volume_map(compose)
     if not set(record['volumes']) <= set(current):
         r.fail('Rollback volume inventory changed')
-    compose('stop', '--timeout', '90')
+    fence_project(compose)
     # Candidate-only volumes are outside the recorded recovery inventory.
     for name in record['volumes']:
         destination = current[name]
@@ -196,6 +206,11 @@ def checkout(sha):
     return kit
 
 
+def copy_secrets(source, destination):
+    if source.resolve() != destination.resolve():
+        shutil.copytree(source / '.secrets', destination / '.secrets', dirs_exist_ok=True)
+
+
 def activate(kit):
     temporary = INSTALL / '.current'
     temporary.unlink(missing_ok=True)
@@ -231,7 +246,7 @@ def upgrade(sha, run_id, lock_fd):
     journal('installing', **fields)
     try:
         candidate = checkout(sha)
-        shutil.copytree(KIT / '.secrets', candidate / '.secrets', dirs_exist_ok=True)
+        copy_secrets(KIT, candidate)
         # The project remains stable across checkout directory names.
         candidate_compose = r.Compose(candidate, compose.name)
         candidate_compose('pull', '--ignore-buildable')
@@ -243,12 +258,13 @@ def upgrade(sha, run_id, lock_fd):
         try:
             # Already hold op.lock: the child inherits only this explicit fd.
             previous_kit = checkout(previous)
+            copy_secrets(KIT, previous_kit)
             activate(previous_kit)
             r.run(['python3', previous_kit / 'kit-control.py', 'recover-locked', '--point', point, '--lock-fd', str(lock_fd)], cwd=previous_kit, pass_fds=(lock_fd,))
             journal('rolled-back', **fields)
         except BaseException:
             with suppress(Exception):
-                compose('stop', '--timeout', '90')
+                fence_project(compose)
             journal('rollback-failed', **fields)
             print('ops-alert: rollback failed; use the off-site blob in last-backup.json for approved ph-restore', file=sys.stderr)
             raise
@@ -483,9 +499,13 @@ def main():
             upgrade(args.sha, args.run_id, lock_fd)
         elif args.command in ('rollback', 'recover'):
             record = json.loads(r.read_private(STATE / 'last-op.json'))
+            if (record.get('operation') != 'upgrade' or record.get('phase') not in
+                    ('installing', 'healthy-awaiting-handoff', 'rollback-failed', 'creating-rollback-point')):
+                r.fail('Recovery requires an unresolved upgrade')
             if args.point:
                 record['rollback_point'] = str(args.point)
             previous = checkout(record['previous_sha'])
+            copy_secrets(KIT, previous)
             activate(previous)
             r.run(['python3', previous / 'kit-control.py', 'recover-locked', '--point', record['rollback_point'], '--lock-fd', str(lock_fd)], pass_fds=(lock_fd,))
             journal('rolled-back', **{k: record[k] for k in ('previous_sha', 'candidate_sha', 'rollback_point', 'run_id')})

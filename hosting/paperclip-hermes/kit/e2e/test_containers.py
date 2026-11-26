@@ -11,6 +11,7 @@ from pathlib import Path
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 from unittest.mock import patch
 
@@ -58,6 +59,12 @@ def installation():
             stream.write('\n# Candidate release fixture.\n')
         config = yaml.safe_load((candidate / 'compose.yaml').read_text())
         config['volumes']['candidate_only'] = {}
+        config['services']['candidate_writer'] = {
+            'image': config['services']['postgres']['image'],
+            'entrypoint': ['/bin/sh', '-c'],
+            'command': ['while true; do echo candidate >> /shared/candidate-writes; sleep 0.1; done'],
+            'volumes': ['paperclip:/shared'], 'network_mode': 'none',
+        }
         config['services']['caddy']['volumes'].append('candidate_only:/candidate-only')
         (candidate / 'compose.yaml').write_text(yaml.safe_dump(config))
         run('git','-C',candidate,'add','Caddyfile','compose.yaml')
@@ -88,9 +95,10 @@ def installation():
                         except r.RecoveryError:
                             pass
                 # The previous Compose file cannot remove the candidate-only volume.
-                candidate_volume = 'paperclip-hermes_candidate_only'
-                if run('docker', 'volume', 'ls', '--quiet', '--filter', 'name=^' + candidate_volume + '$'):
-                    run('docker', 'volume', 'rm', candidate_volume)
+                for project in ('paperclip-hermes', 'sf-e2e-restored', 'sf-e2e-wrong'):
+                    candidate_volume = project + '_candidate_only'
+                    if run('docker', 'volume', 'ls', '--quiet', '--filter', 'name=^' + candidate_volume + '$'):
+                        run('docker', 'volume', 'rm', candidate_volume)
 
 
 def sentinel(compose):
@@ -135,6 +143,9 @@ def test_upgrade_rollback(installation):
         if str(args[0])=='bash' and str(args[1])==str(candidate/'health.sh'):
             compose('exec','-T','postgres','psql','-U','paperclip','-d','paperclip','-c',"UPDATE wp3_sentinel SET value='candidate-migration';")
             raise c.r.RecoveryError('Injected candidate health failure')
+        if str(args[0]) == 'tar' and '--extract' in args:
+            assert not original(['docker', 'container', 'ls', '--all', '--quiet', '--filter',
+                                 'label=com.docker.compose.project=paperclip-hermes']).strip()
         if 'recover-locked' in args:
             # Invoke the previous checkout's actual restore implementation,
             # while the caller retains the real host operation lock.
@@ -146,6 +157,9 @@ def test_upgrade_rollback(installation):
          c.r.locked() as lock_fd,pytest.raises(c.r.RecoveryError,match='previous kit and data restored'):
         c.upgrade(candidate_sha,'e2e-upgrade',lock_fd)
     assert run('docker', 'volume', 'ls', '--quiet', '--filter', 'name=^paperclip-hermes_candidate_only$')
+    assert not run('docker', 'container', 'ls', '--all', '--quiet', '--filter',
+                   'label=com.docker.compose.project=paperclip-hermes', '--filter',
+                   'label=com.docker.compose.service=candidate_writer')
     assert sentinel(compose)=='previous'
     rows=container_status(compose)
     assert all(row['Health']=='healthy' for row in rows)
@@ -154,10 +168,19 @@ def test_upgrade_rollback(installation):
     stop_db=next(i for i,cmd in enumerate(commands) if cmd[-4:]==['stop','--timeout','90','postgres'])
     archive=next(i for i,cmd in enumerate(commands) if cmd[0]=='tar' and '-cf' in cmd)
     assert dump<stop_db<archive
+    compose('exec', '-T', 'postgres', 'psql', '-U', 'paperclip', '-d', 'paperclip', '-c',
+            "UPDATE wp3_sentinel SET value='post-rollback-write';")
+    for command in ('rollback', 'recover'):
+        with patch.object(sys, 'argv', ['sfctl', command]), \
+             patch.object(c.os, 'umask'), patch.object(c.r.signal, 'signal'), \
+             pytest.raises(c.r.RecoveryError, match='unresolved upgrade'):
+            c.main()
+        assert sentinel(compose) == 'post-rollback-write'
 
 
 def test_dump_failure_keeps_old_stack_healthy(installation):
     root,old,candidate,previous,candidate_sha,c,compose=installation
+    containers = {service: compose.container(service) for service in compose.services()}
     original=c.r.run
     def execute(args,**kwargs):
         if 'pg_dump' in args:
@@ -169,6 +192,7 @@ def test_dump_failure_keeps_old_stack_healthy(installation):
     assert sentinel(compose)=='previous'
     assert all(row['Health']=='healthy' for row in container_status(compose))
     assert not (root/'failed-point').exists()
+    assert containers == {service: compose.container(service) for service in compose.services()}
 
 
 def test_cross_version_restore(installation):
@@ -192,3 +216,45 @@ def test_cross_version_restore(installation):
     assert sentinel(restored)=='previous'
     assert 'KIT_MESSAGING_OFF=1' in (root/'restored/.secrets/compose.env').read_text()
     assert r.image_pins(root/'restored')==r.image_pins(old)
+
+    restored_control = load(root / 'restored')
+    assert restored_control.r.kit_commit() == previous
+    assert restored_control.r.kit_modified() is False
+    # Upgrade the restored installation and fail candidate health. Roll back
+    # through a fresh checkout, which has no secrets until upgrade copies them.
+    rollback_kit = root / 'rollback-kit'
+    run('git', 'clone', '--no-hardlinks', old, rollback_kit)
+    assert not (rollback_kit / '.secrets').exists()
+    commands = restored_control.r.run
+    compose_type = restored_control.r.Compose
+    def execute(args, **kwargs):
+        if str(args[0]) == 'bash' and str(args[1]) == str(candidate / 'health.sh'):
+            restored('exec', '-T', 'postgres', 'psql', '-U', 'paperclip', '-d', 'paperclip',
+                     '-c', "UPDATE wp3_sentinel SET value='restored-candidate';")
+            raise restored_control.r.RecoveryError('Injected restored candidate health failure')
+        if 'recover-locked' in args:
+            previous_control = load(rollback_kit)
+            previous_control.rollback_point('restore', Path(args[args.index('--point') + 1]),
+                                            compose_type(rollback_kit, 'sf-e2e-restored'))
+            return ''
+        return commands(args, **kwargs)
+    with patch.object(restored_control, 'STATE', root / 'restored-state'), \
+         patch.object(restored_control, 'ROLLBACK_ROOT', root / 'restored-points'), \
+         patch.object(restored_control, 'INSTALL', root / 'installation'), \
+         patch.object(restored_control, 'checkout', side_effect=lambda sha: rollback_kit if sha == previous else candidate), \
+         patch.object(restored_control.r, 'Compose', side_effect=lambda kit, project: compose_type(kit, 'sf-e2e-restored')), \
+         patch.object(restored_control.r, 'run', side_effect=execute), \
+         restored_control.r.locked() as lock_fd, \
+         pytest.raises(restored_control.r.RecoveryError, match='previous kit and data restored'):
+        restored_control.upgrade(candidate_sha, 'restored-upgrade', lock_fd)
+    assert sentinel(compose_type(rollback_kit, 'sf-e2e-restored')) == 'previous'
+    assert (rollback_kit / '.secrets/compose.env').read_bytes() == (root / 'restored/.secrets/compose.env').read_bytes()
+
+
+def test_paperclip_tini_forwards_sigterm(installation):
+    root,old,candidate,previous,candidate_sha,c,compose=installation
+    container = compose.container('paperclip')
+    compose('stop', '--timeout', '90', 'paperclip')
+    state = json.loads(run('docker', 'inspect', container))[0]['State']
+    assert state['ExitCode'] in (0, 143)  # No EPERM or forced SIGKILL.
+    assert 'Operation not permitted' not in compose('logs', '--no-color', 'paperclip')

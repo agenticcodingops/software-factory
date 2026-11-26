@@ -71,15 +71,15 @@ class ArgumentTests(unittest.TestCase):
 
 
 class SasTests(unittest.TestCase):
-    def test_delegation_sas_c_and_cw_use_unique_blob_path(self):
-        for extra in ({'sp': 'c'}, {'sp': 'cw'}):
+    def test_delegation_sas_cw_uses_unique_blob_path(self):
+        for extra in ({'sp': 'cw'},):
             container = recovery.sas_url(signed_url(**extra))
             result = recovery.blob_url(container, 'unique.tar.age')
             self.assertIn('/recovery/unique.tar.age?', result)
             self.assertEqual(result.split('?', 1)[1], container.query)
 
     def test_rejects_broad_permissions_malformed_or_non_container_urls(self):
-        bad = [signed_url(sp='r'), signed_url(sp='rcwl'), signed_url(sp=''), signed_url(si=''),
+        bad = [signed_url(sp='c'), signed_url(sp='r'), signed_url(sp='rcwl'), signed_url(sp=''), signed_url(si=''),
                signed_url(sr='b'), signed_url(spr='https,http'), signed_url().replace('https:', 'http:'),
                signed_url().replace('/recovery?', '/recovery/blob?'), signed_url() + '&sp=cw&sp=cw',
                signed_url().replace('storage.example.test', 'user:password@storage.example.test')]
@@ -526,7 +526,7 @@ class BackupFailureTests(unittest.TestCase):
                 injected.append(message)
                 raise recovery.RecoveryError(message)
             def compose(*args, **kwargs):
-                if args[0] == 'start':
+                if args[0] == 'up' and '--no-recreate' in args:
                     staged_at_restart.extend(path for path in work.rglob('*') if path.is_file())
                 if args[:3] == ('ps', '--services', '--status'):
                     return '\n'.join(('postgres', *recovery.SERVICES))
@@ -598,11 +598,11 @@ class BackupFailureTests(unittest.TestCase):
                     self.assertIn('hermes.zip', staged_at_removal[0])
                 calls = fake.mock_calls
                 self.assertLess(calls.index(unittest.mock.call.remove_containers(True)),
-                                calls.index(unittest.mock.call('start', '--wait', '--wait-timeout', '300',
+                                calls.index(unittest.mock.call('up', '-d', '--no-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300',
                                                                *recovery.SERVICES)))
             self.assertEqual(list(work.iterdir()), [])
             self.assertEqual(list(upload.iterdir()), [])
-            self.assertIn(unittest.mock.call('start', '--wait', '--wait-timeout', '300', *recovery.SERVICES), fake.call_args_list)
+            self.assertIn(unittest.mock.call('up', '-d', '--no-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', *recovery.SERVICES), fake.call_args_list)
             if failure in ('dump', 'tar', 'hermes'):
                 # Plaintext is deleted before waiting on the service restart.
                 self.assertEqual(staged_at_restart, [])
@@ -1226,3 +1226,21 @@ class ComposeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RestoredProvenanceTests(unittest.TestCase):
+    def test_restore_records_trusted_commit_and_detects_local_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = kit_archive(root / 'config.tar')
+            target = root / 'restored'
+            target.mkdir()
+            trusted = recovery.kit_commit()
+            recovery.restore_config(archive, target, 'f' * 40)
+            with patch.object(recovery, 'KIT', target):
+                self.assertEqual(recovery.kit_commit(), trusted)
+                self.assertFalse(recovery.kit_modified())
+                (target / 'compose.yaml').write_text('local edit')
+                self.assertEqual(recovery.kit_commit(), 'unknown')
+                self.assertTrue(recovery.kit_modified())
+            self.assertEqual((target / '.kit-provenance.json').stat().st_mode & 0o777, 0o600)

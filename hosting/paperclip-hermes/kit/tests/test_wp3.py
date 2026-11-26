@@ -39,9 +39,14 @@ def delegation(**changes):
     return 'https://storage.example.test/backups?' + urlencode(query)
 
 
-@pytest.mark.parametrize('permissions', ['c', 'cw'])
-def test_user_delegation_accept(permissions):
-    assert r.sas_url(delegation(sp=permissions)).scheme == 'https'
+def test_user_delegation_accept():
+    assert r.sas_url(delegation(sp='cw')).scheme == 'https'
+
+
+def test_create_only_sas_rejected_before_any_upload():
+    with patch.object(r.urllib.request, 'build_opener') as opener, pytest.raises(r.RecoveryError):
+        r.sas_url(delegation(sp='c'))
+    opener.assert_not_called()
 
 
 @pytest.mark.parametrize('change', [dict(si='policy'), dict(skoid=None), dict(sktid=None),
@@ -73,6 +78,13 @@ def test_upload_metadata_on_single_put_and_block_commit(tmp_path):
         assert final.get_header('X-ms-meta-target') == 'test'
         assert final.get_header('X-ms-meta-reason') == 'nightly'
         assert result['version'] == 'test-version'
+        requests = [call.args[0] for call in opener.open.call_args_list]
+        assert all(req.get_header('X-ms-version') == '2023-11-03' for req in requests)
+        if limit == 1:
+            assert '&comp=block&' in requests[0].full_url
+            assert '&comp=blocklist' in requests[-1].full_url
+        else:
+            assert len(requests) == 1 and 'comp=block' not in final.full_url
 
 
 @pytest.mark.parametrize('reason', ['nightly', 'pre-stop', 'pre-upgrade', 'canary', 'final'])
@@ -116,6 +128,11 @@ class Stack:
             self.volumes[name] = path
         self.fail_dump = self.fail_restart = self.fail_restore = False
 
+    def fence(self, compose):
+        assert compose is self
+        self.calls.append(('fence-project',))
+        self.running.clear()
+
     def images(self):
         return {service: {'image_id': 'fixture'} for service in self.installed}
 
@@ -124,6 +141,8 @@ class Stack:
 
     def __call__(self, *args, **kwargs):
         self.calls.append(args)
+        if args[0] == 'start' and '--wait' in args:
+            raise r.RecoveryError('unknown flag: --wait (Compose 2.38.2)')
         if args[0] == 'ps':
             return '\n'.join(s for s in self.installed if s in self.running)
         if args[0] == 'stop':
@@ -152,7 +171,7 @@ class Stack:
 def test_rollback_point_sequence_and_restore_data(tmp_path, paperclip):
     stack = Stack(tmp_path, paperclip)
     point = tmp_path/'rollback'
-    with patch.object(c, 'volume_map', return_value=stack.volumes):
+    with patch.object(c, 'volume_map', return_value=stack.volumes), patch.object(c, 'fence_project', side_effect=stack.fence):
         record = c.rollback_point('create', point, stack)
         assert not stack.running
         assert point.stat().st_mode & 0o777 == 0o700
@@ -179,6 +198,8 @@ def test_dump_failure_restores_old_stack_and_prevents_archives(tmp_path):
     volumes.assert_not_called()
     assert stack.running == set(stack.installed)
     assert ('stop','--timeout','90','postgres') not in stack.calls
+    assert any(args[:7] == ('up','-d','--no-recreate','--no-build','--pull','never','--wait')
+               for args in stack.calls)
     assert not (tmp_path/'rollback').exists()
 
 
@@ -216,7 +237,7 @@ def test_space_refusal_precedes_stop_or_checkout(tmp_path):
 def test_space_requirement_volumes_plus_database_times_2_2(tmp_path):
     stack = Stack(tmp_path)
     size = sum((path/'state').stat().st_size for path in stack.volumes.values())
-    with patch.object(c, 'volume_map', return_value=stack.volumes):
+    with patch.object(c, 'volume_map', return_value=stack.volumes), patch.object(c, 'fence_project', side_effect=stack.fence):
         assert c.required_space(stack) == __import__('math').ceil((size+100)*2.2)
 
 
@@ -255,6 +276,8 @@ def test_secret_to_service_isolation_and_capabilities():
     for name,service in services.items():
         assert service['cap_drop'] == ['ALL']
         assert service['cap_add']
+        if name in ('paperclip', 'hermes'):
+            assert 'KILL' in service['cap_add']
         assert not any(name in service['environment'] for name in ('OPENAI_API_KEY','POSTGRES_PASSWORD','BETTER_AUTH_SECRET')) if 'environment' in service else True
         assert not any('backup.env' in mount or 'delivery.key' in mount for mount in service.get('volumes',[]))
 
@@ -345,6 +368,7 @@ def test_upgrade_failed_health_restores_previous_code_and_data(tmp_path, restore
     with patch.object(c,'KIT',old),patch.object(c,'INSTALL',install),patch.object(c,'STATE',tmp_path/'status'), \
          patch.object(c,'ROLLBACK_ROOT',tmp_path/'points'),patch.object(c.r,'kit_commit',return_value=previous), \
          patch.object(c,'volume_map',return_value=stack.volumes),patch.object(c,'required_space',return_value=0), \
+         patch.object(c,'fence_project',side_effect=stack.fence), \
          patch.object(c.r,'Compose',side_effect=compose_factory),patch.object(c,'checkout',side_effect=lambda sha: old if sha==previous else candidate), \
          patch.object(c.r,'run',side_effect=execute),pytest.raises(r.RecoveryError,match=error):
         c.upgrade(candidate_sha,'upgrade-1',0)
@@ -494,7 +518,8 @@ def test_pre_stop_failure_after_shutdown_restarts_previous_writers():
         raise r.RecoveryError('dump failed')
     with patch.object(r,'data_backup',side_effect=stopped),pytest.raises(r.RecoveryError,match='dump failed'):
         r.backup(args)
-    stack.assert_called_once_with('start','--wait','--wait-timeout','300','paperclip','caddy')
+    stack.assert_called_once_with('up','-d','--no-recreate','--no-build','--pull','never',
+                                  '--wait','--wait-timeout','300','paperclip','caddy')
 
 
 @pytest.mark.parametrize('command', ['backup','restore'])
@@ -556,7 +581,7 @@ def test_verify_staging_refuses_kit_directory():
 def test_rollback_inventory_allows_candidate_volumes_but_requires_originals(tmp_path, missing):
     stack = Stack(tmp_path)
     point = tmp_path / 'rollback'
-    with patch.object(c, 'volume_map', return_value=stack.volumes):
+    with patch.object(c, 'volume_map', return_value=stack.volumes), patch.object(c, 'fence_project', side_effect=stack.fence):
         c.rollback_point('create', point, stack)
         original = dict(stack.volumes)
         added = tmp_path / 'candidate_only'
@@ -647,3 +672,102 @@ def test_checkout_failure_restores_private_umask(tmp_path):
         assert not list((tmp_path / 'install').iterdir())
     finally:
         os.umask(mask)
+
+
+@pytest.mark.parametrize('limit', [1, 100])
+def test_large_inventories_have_bounded_public_metadata(tmp_path, limit):
+    archive = tmp_path / 'backup.age'
+    archive.write_bytes(secrets.token_bytes(64))
+    schema = {'journal': 'drizzle.__drizzle_migrations', 'applied': [
+        {'id': i, 'hash': secrets.token_hex(32), 'created_at': 1700000000000 + i}
+        for i in range(1000)]}
+    pins = ['example/image' + str(i) + '@sha256:' + secrets.token_hex(32) for i in range(500)]
+    for name in r.PAYLOADS:
+        (tmp_path / name).write_bytes(b'fixture')
+    with patch.object(r, 'image_pins', return_value=pins):
+        record = r.manifest(tmp_path, {}, schema, 'fixture', r.utc())
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value.status = 201
+        opener.open.return_value.__enter__.return_value.headers = {}
+        args = SimpleNamespace(reason='nightly', canary=False, target='fixture', vm_id='fixture-vm')
+        with patch.object(r, 'STATE_DIR', tmp_path / 'state'), patch.object(r, 'SINGLE_PUT_LIMIT', limit), \
+             patch.object(r.urllib.request, 'build_opener', return_value=opener):
+            receipt = r.publish_backup(args, 'age1' + secrets.token_hex(29),
+                                       r.sas_url(delegation()), archive, 'unique.age', record)
+    assert record['paperclip_schema'] == schema  # Full encrypted manifest inventory.
+    assert record['image_pins'] == pins
+    assert receipt['schema_count'] == 1000 and receipt['image_count'] == 500
+    compact = lambda value: __import__('hashlib').sha256(json.dumps(
+        value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    assert receipt['schema'] == compact(schema) and receipt['image_digests'] == compact(pins)
+    for call in opener.open.call_args_list:
+        metadata = {key: value for key, value in call.args[0].header_items() if key.lower().startswith('x-ms-meta-')}
+        assert sum(len(key) + len(value) for key, value in metadata.items()) < 2048
+    assert 'applied' not in json.dumps(receipt)
+
+
+def test_fence_project_includes_stopped_and_candidate_only_containers():
+    stack = SimpleNamespace(name='fixture')
+    with patch.object(r, 'run', side_effect=['old\ncandidate-only\nstopped\n', '', '']) as run:
+        c.fence_project(stack)
+    assert run.call_args_list[0].args[0] == ['docker', 'container', 'ls', '--all', '--quiet',
+                                           '--filter', 'label=com.docker.compose.project=fixture']
+    assert run.call_args_list[1].args[0] == ['docker', 'container', 'stop', '--time', '90', 'old', 'candidate-only', 'stopped']
+    assert run.call_args_list[2].args[0] == ['docker', 'container', 'rm', 'old', 'candidate-only', 'stopped']
+
+
+@pytest.mark.parametrize('command', ['rollback', 'recover'])
+@pytest.mark.parametrize('phase', ['complete', 'rolled-back', 'prepare-failed', 'failed', None])
+def test_recovery_rejects_resolved_or_other_journals_before_checkout(tmp_path, command, phase):
+    r.atomic_json(tmp_path / 'state/last-op.json', {'operation': 'upgrade', 'phase': phase})
+    with patch.object(sys, 'argv', ['sfctl', command, '--point', str(tmp_path / 'point')]), \
+         patch.object(r, 'locked', __import__('contextlib').nullcontext), patch.object(r.signal, 'signal'), \
+         patch.object(c, 'STATE', tmp_path / 'state'), patch.object(c, 'checkout') as checkout, \
+         patch.object(c, 'activate') as activate, patch.object(r, 'run') as run, \
+         pytest.raises(r.RecoveryError, match='unresolved upgrade'):
+        c.main()
+    checkout.assert_not_called()
+    activate.assert_not_called()
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize('command', ['rollback', 'recover'])
+@pytest.mark.parametrize('phase', ['installing', 'healthy-awaiting-handoff', 'rollback-failed', 'creating-rollback-point'])
+def test_recovery_accepts_only_unresolved_upgrades_and_copies_restored_secrets(tmp_path, command, phase):
+    source = tmp_path / 'restored'
+    source.mkdir()
+    c.atomic_secret(source / '.secrets/key', b'restored secret')
+    previous = tmp_path / 'previous'
+    previous.mkdir()
+    fields = dict(previous_sha='a' * 40, candidate_sha='b' * 40, rollback_point=str(tmp_path / 'point'), run_id='fixture')
+    r.atomic_json(tmp_path / 'state/last-op.json', {'operation': 'upgrade', 'phase': phase, **fields})
+    with patch.object(sys, 'argv', ['sfctl', command]), patch.object(r, 'locked', return_value=__import__('contextlib').nullcontext(7)), \
+         patch.object(r.signal, 'signal'), patch.object(c, 'STATE', tmp_path / 'state'), patch.object(c, 'KIT', source), \
+         patch.object(c, 'checkout', return_value=previous), patch.object(c, 'activate') as activate, patch.object(r, 'run') as run:
+        c.main()
+    activate.assert_called_once_with(previous)
+    assert (previous / '.secrets/key').read_bytes() == b'restored secret'
+    assert 'recover-locked' in run.call_args.args[0]
+    assert json.loads((tmp_path / 'state/last-op.json').read_text())['phase'] == 'rolled-back'
+
+
+def test_recovery_rejects_non_upgrade_operation(tmp_path):
+    r.atomic_json(tmp_path / 'state/last-op.json', {'operation': 'restore', 'phase': 'installing'})
+    with patch.object(sys, 'argv', ['sfctl', 'recover']), patch.object(r, 'locked', __import__('contextlib').nullcontext), \
+         patch.object(r.signal, 'signal'), patch.object(c, 'STATE', tmp_path / 'state'), \
+         patch.object(c, 'checkout') as checkout, pytest.raises(r.RecoveryError, match='unresolved upgrade'):
+        c.main()
+    checkout.assert_not_called()
+
+
+def test_fencing_failure_prevents_volume_wipe(tmp_path):
+    stack = Stack(tmp_path)
+    point = tmp_path / 'point'
+    with patch.object(c, 'volume_map', return_value=stack.volumes):
+        c.rollback_point('create', point, stack)
+        for volume in stack.volumes.values():
+            (volume / 'state').write_text('candidate data')
+        with patch.object(c, 'fence_project', side_effect=r.RecoveryError('stop failed')), \
+             pytest.raises(r.RecoveryError, match='stop failed'):
+            c.rollback_point('restore', point, stack)
+    assert all((volume / 'state').read_text() == 'candidate data' for volume in stack.volumes.values())

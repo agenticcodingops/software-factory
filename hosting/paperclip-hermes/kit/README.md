@@ -633,8 +633,12 @@ container helper, unit and the Hermes startup policy `hermes-config.yaml` from
 the kit checkout running it, and refuses an archive whose copies of those differ
 byte for byte: check out the kit commit that made the backup. The manifest
 records that commit (`git rev-parse HEAD` of the kit, or `unknown` when the kit
-is not a root-owned git checkout) and the refusal message prints it; record it
-in the pilot log as well and update it on every kit update. From the archive
+has no trusted commit provenance) and the refusal message prints it; record it
+in the pilot log as well and update it on every kit update. A restored install
+records the trusted restoring checkout's commit and code hashes in root-only
+`.kit-provenance.json`, so later upgrades and rollback can resolve that release
+without Git metadata in the restored tree. Recovery copies the restored secrets
+into the previous checkout before activating it. From the archive
 restore takes only `.secrets/*` and the volume, database and Hermes home
 payloads. As defence in depth, the policy is checked against a baseline fixed
 in `container/validate-hermes-config.py` (only the model, terminal and dashboard
@@ -672,7 +676,7 @@ the Hermes CLI. Writers restart after ordinary backups, including failure paths.
 
 `--canary` uploads encrypted empty content to prove the upload credential, without
 stopping writers or advancing the successful data-backup clock. Every archive
-upload has non-secret metadata: kit commit, image digests, schema, recipient fingerprint,
+upload has non-secret metadata: kit commit, image-pin and schema digests with counts, recipient fingerprint,
 target/VM identity, backup ID, completion time and reason. Archives use unique
 `backups/` names and successful receipts use unique `receipts/<target>/` objects.
 Receipts include the ciphertext SHA-256, size and returned blob version/ETag.
@@ -734,8 +738,8 @@ sudo vi /etc/paperclip-hermes/backup.env
 The approved deployment creates the destination in a separate failure boundary
 with versioning and time-based immutability. Keep Shared Key off. The validator
 accepts only a container-scoped **user-delegation SAS**, with `skoid`, `sktid`,
-`skt`, `ske`, `sks=b`, `skv`, `se`, `sr=c`, `spr=https` and `sp=cw` (or `c` after
-the deployment self-test). Both expiries must be valid and at most seven days
+`skt`, `ske`, `sks=b`, `skv`, `se`, `sr=c`, `spr=https` and `sp=cw`.
+Write permission is required for the pinned block-upload API version. Both expiries must be valid and at most seven days
 away, and the SAS cannot outlive its delegation key; the key's lifetime must not
 exceed seven days. Service, account, stored-policy, duplicate-field, expired and
 broader-permission forms are rejected locally. Read, List and Delete are never
@@ -823,7 +827,9 @@ and delete staged plaintext first, then restart the originally running writers;
 further signals are ignored until cleanup ends. Ordinary backups restart writers
 after capture, before encryption/upload, so upload failures leave them running.
 Successful pre-stop/final backups keep writers stopped through publication;
-a failure after stopping them restarts them with a health wait. Restore failures
+a failure after stopping them restarts them with a health wait. Restarts use
+`compose up --no-recreate --no-build --pull never --wait`, which also works
+with Compose 2.38 (whose `start` command has no `--wait` option). Restore failures
 instead remove the partial project's containers as described above. Transient
 upload failures are retried four times with backoff; a retried conditional PUT that finds the blob already present fails as uncertain, so check
 the container with a separate read credential. A hard kill, power loss or disk
@@ -997,7 +1003,10 @@ python3 -B -m unittest discover -s tests
 The WP3 acceptance suite runs a real upgrade with forced candidate health failure
 and data rollback, a failing dump that must leave the old stack healthy, and a
 backup under a previous fixture commit that is rejected by a different commit
-and then restored through the backup's own commit. The weekly and PR `kit-e2e`
+and then restored through the backup's own commit. It also checks Tini signal
+forwarding, fences a candidate-only writer sharing an original volume, and
+upgrades and rolls back a restored install through a fresh previous checkout.
+The weekly and PR `kit-e2e`
 workflow runs these on a Docker-capable Ubuntu runner. The fixture releases use
 the pinned Paperclip/PostgreSQL/Caddy stack without cloud, tailnet, GitHub or
 model credentials. Hermes-only and combined profile sequencing are covered by

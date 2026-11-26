@@ -193,7 +193,7 @@ def sas_url(value):
                 or url.port not in (None, 443) or url.fragment
                 or not re.fullmatch(r'/[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', url.path)
                 or any(len(values) != 1 for values in query.values())
-                or query.get('sr') != ['c'] or query.get('sp') not in (['c'], ['cw'])
+                or query.get('sr') != ['c'] or query.get('sp') != ['cw']
                 or any(name in query for name in ('si', 'ss', 'srt'))
                 or any(not query.get(name, [''])[0] for name in
                        ('sig', 'sv', 'skoid', 'sktid', 'skt', 'ske', 'sks', 'skv', 'se'))
@@ -310,6 +310,13 @@ def upload(container, archive, name, metadata=None):
     except Exception:
         # HTTPError/URLError can contain the signed URL. Never stringify them.
         raise RecoveryError('Backup upload failed; no backup was published successfully') from None
+
+
+def restart_services(compose, services):
+    # Compose 2.38 (the CI runner) has no `start --wait`. Use the loaded
+    # project model and health wait without replacing containers or images.
+    compose('up', '-d', '--no-recreate', '--no-build', '--pull', 'never',
+            '--wait', '--wait-timeout', '300', *services)
 
 
 def sync_directory(path):
@@ -483,10 +490,23 @@ def image_pins(kit):
     return sorted(set(re.findall(r'[A-Za-z0-9][A-Za-z0-9._/:+-]*@sha256:[a-f0-9]{64}', text)))
 
 
+def installed_provenance():
+    path = KIT / '.kit-provenance.json'
+    if not path.exists():
+        return None
+    record = json.loads(read_private(path))
+    files = {name: digest(path) for name, path in kit_files(KIT, CODE).items()}
+    return record, files != record['files']
+
+
 def kit_commit():
     # The commit restore must check out. Git refuses a checkout root does not
     # own (safe.directory) rather than run its hooks or config: then 'unknown',
     # and the operator's pilot log is the record.
+    provenance = installed_provenance()
+    if provenance is not None:
+        record, modified = provenance
+        return 'unknown' if modified else commit_label(record['kit_commit'])
     try:
         value = run(['git', '-C', KIT, 'rev-parse', '--verify', 'HEAD']).strip()
     except RecoveryError:
@@ -495,6 +515,9 @@ def kit_commit():
 
 
 def kit_modified():
+    provenance = installed_provenance()
+    if provenance is not None:
+        return provenance[1]
     # Local edits to compared files make a later restore from the recorded
     # commit refuse, so record them.
     try:
@@ -664,7 +687,7 @@ def backup(args):
         if args._restart_services is not None:
             compose, writers = args._restart_services
             with deferred_signals():
-                compose('start', '--wait', '--wait-timeout', '300', *writers)
+                restart_services(compose, writers)
         raise
 
 
@@ -753,7 +776,7 @@ def data_backup(args):
             # services this job stopped always come back.
             if reason not in ('pre-stop', 'final'):
                 with deferred_signals():
-                    compose('start', '--wait', '--wait-timeout', '300', *(service for service in SERVICES if service in running))
+                    restart_services(compose, [service for service in SERVICES if service in running])
         # No plaintext aggregate archive is written: stream tar directly to age.
         with open(stage / 'backup.age', 'xb') as encrypted:
             process = subprocess.Popen(['age', '--encrypt', '--recipient', public_key],
@@ -799,9 +822,16 @@ STATE_DIR = Path('/data/paperclip-hermes')
 
 def publish_backup(args, public_key, container, archive, name, record=None):
     reason = 'canary' if getattr(args, 'canary', False) else getattr(args, 'reason', 'nightly')
+    schema = (record or {}).get('paperclip_schema', {})
+    pins = image_pins(KIT)
+    # Full inventories stay in the encrypted manifest. Metadata and the public
+    # receipt contain bounded identifiers, comfortably below Azure's 8 KiB cap.
+    compact_digest = lambda value: hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     metadata = {
-        'kit_commit': kit_commit(), 'image_digests': json.dumps(image_pins(KIT), separators=(',', ':')),
-        'schema': json.dumps((record or {}).get('paperclip_schema', {}), separators=(',', ':')),
+        'kit_commit': kit_commit(), 'image_digests': compact_digest(pins),
+        'image_count': len(pins), 'schema': compact_digest(schema),
+        'schema_count': len(schema.get('applied', [])),
         'recipient_fp': hashlib.sha256(public_key.encode()).hexdigest(),
         'target': getattr(args, 'target', 'local'), 'vm_id': getattr(args, 'vm_id', 'local'),
         'backup_id': uuid.uuid4().hex, 'completed_at': utc(), 'reason': reason,
@@ -938,6 +968,12 @@ def restore_config(archive, destination, commit='unknown', modified=False):
     if any(value is None for value in secrets.values()):
         fail('Configuration archive lacks the kit secrets')
     install_kit(destination)
+    # Provenance comes from the trusted restore code's checkout, never the
+    # untrusted archive's claimed commit. Hashes detect later local code edits.
+    write_private(destination / '.kit-provenance.json', json.dumps({
+        'kit_commit': kit_commit(),
+        'files': {name: digest(path) for name, path in kit_files(destination, CODE).items()},
+    }).encode(), 0o600)
     (destination / '.secrets').mkdir(mode=0o700)
     os.chmod(destination / '.secrets', 0o700)
     for name, data in secrets.items():

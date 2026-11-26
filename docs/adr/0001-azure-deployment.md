@@ -385,7 +385,9 @@ Shared rules:
 **What `ph-selftest` tests:**
 
 1. A protected parameter carrying a dummy value is not echoed by GET, the Activity Log or `/var/lib/waagent`. This is now defence in depth, because the path carries only ciphertext.
-2. A SAS with `sp=c` alone can upload with Put Block and Put Block List.
+2. The kit requires `sp=cw` for Put Block and Put Block List with its pinned
+   `x-ms-version: 2023-11-03`. Accepting `sp=c` alone requires a protocol update
+   to `2026-04-06` or later and tests of both block operations.
 3. The 30-day retention is inherited by the container.
 4. The production federated identity can mint a key for `tag:pcpilot`.
 5. The plan identity's read-only Tailscale scopes are enough for a `tailscale_acl` plan with validation.
@@ -466,9 +468,9 @@ Acceptance (Open): bump the workflow/kit SHA and assert the existing VM's `custo
   - The `trust` stack (Owner only) owns the account, the policy, the lifecycle and the `CanNotDelete` lock. No workflow identity can change them.
   - Lifecycle rules: `baseBlob.delete` and `version.delete` after 45 days on the `backups/` prefix. Every backup is a uniquely named base blob, so the base-blob rule is what actually ages backups out.
   - Teardown of the account waits for retention to expire.
-- **Blob metadata** (non-secret, written at upload): `kit_commit`, the image digests, `schema`, `recipient_fp`, `target`, `vm_id`, `backup_id`, `completed_at` and `reason` (`nightly`, `pre-stop`, `pre-upgrade`, `canary` or `final`). Backups immediately preceding a stop also carry `stop_operation_id` and `pre_stop=true`, including a final backup used by teardown or move fencing.
+- **Blob metadata** (non-secret, written at upload): `kit_commit`, the image-pin and schema SHA-256 digests (`image_digests`, `schema`) with counts (`image_count`, `schema_count`), `recipient_fp`, `target`, `vm_id`, `backup_id`, `completed_at` and `reason` (`nightly`, `pre-stop`, `pre-upgrade`, `canary` or `final`). Backups immediately preceding a stop also carry `stop_operation_id` and `pre_stop=true`, including a final backup used by teardown or move fencing.
 - **Upload credential.**
-  - `id-sf-ops` mints a 7-day user-delegation SAS (`sr=c`, `sp=cw`; `sp=c` if self-test 2 passes).
+  - `id-sf-ops` mints a 7-day user-delegation SAS (`sr=c`, `sp=cw`; create-only requires the protocol update in self-test 2).
   - It is encrypted to the host delivery key and decrypted by `sfctl set-backup-credential` into `/etc/paperclip-hermes/backup.env` (root, 0600, mounted into no container).
   - It is re-minted by `ph-power start`, by `ph-ops` when less than 72 h remain, and by `ph-deploy` before its backup, then proved by `backup.sh --canary`.
   - Revocation: remove the role, or revoke the delegation keys [V].
@@ -661,7 +663,7 @@ Each item is allowed by R11 or reserved to the operator by R12 and the operator'
 ## Risks and open questions
 
 1. **Protected parameters.** Only ciphertext travels this way; self-test 1 is defence in depth.
-2. **Uploads with `sp=c` alone** are untested; `cw` is the default.
+2. **Uploads with `sp=c` alone** require a newer upload API version; the kit requires `cw`.
 3. **Retention inheritance** is untested; the `azapi` fallback is ready.
 4. **Tailscale.** Three items are unverified:
    - minting keys for an owned tag through a federated identity;
