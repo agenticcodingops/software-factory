@@ -159,6 +159,7 @@ if exe == 'gh':
         state.setdefault('branches', {})[value['ref'].removeprefix('refs/heads/')] = dict(state['files']); out({})
     if '/git/trees/' in path:
         branch = path.split('/git/trees/')[1].split('?')[0]
+        if branch != 'main' and branch not in state.get('branches', {}): sys.exit(4)  # GitHub 404
         files = state['files'] if branch == 'main' else state['branches'][branch]
         out({'tree': [{'path': k, 'sha': 'file-sha'} for k in files], 'truncated': False})
     if '/pulls' in path:
@@ -172,6 +173,7 @@ if exe == 'gh':
         if 'sf-merge-gate.yml' in name: out({'content': base64.b64encode(b'implemented gate').decode()})
         branch = value['branch'] if method == 'PUT' else path.split('?ref=')[1]
         if method == 'PUT' and branch == 'main': sys.exit(97)
+        if branch != 'main' and branch not in state.get('branches', {}): sys.exit(4)  # GitHub 404
         files = state['files'] if branch == 'main' else state['branches'][branch]
         if method == 'PUT': files[name] = value['content']
         out({'sha': 'file-sha', 'content': files[name]})
@@ -278,8 +280,30 @@ if exe == 'az':
     if args[:2] == ['lock', 'create']: out({})
     if args[:2] == ['lock', 'list']:
         rg = f"/subscriptions/{option('--subscription')}/resourceGroups/rg-example-vault"
-        out([{'name': 'state-cannot-delete', 'level': 'CanNotDelete', 'id': rg + '/providers/Microsoft.Storage/storageAccounts/examplestate/providers/Microsoft.Authorization/locks/state-cannot-delete'}] +
+        locks = state.setdefault('storage_locks', {})
+        if option('--subscription') not in locks:
+            locks[option('--subscription')] = [
+                {'name': name + '-cannot-delete', 'level': 'CanNotDelete', 'notes': 'retain ' + name,
+                 'id': rg + '/providers/Microsoft.Storage/storageAccounts/example' + name + '/providers/Microsoft.Authorization/locks/' + name + '-cannot-delete'}
+                for name in ('state', 'backups', 'staging')]
+        out(locks[option('--subscription')] +
             ([{'id': rg + '/providers/Microsoft.Authorization/locks/parent-lock', 'level': 'CanNotDelete'}] if os.environ.get('PARENT_LOCK') else []))
+    if args[:2] == ['lock', 'delete']:
+        # Crash recovery must already be durable before the delete request.
+        ledger = json.loads((HOME / 'locks.json').read_text())
+        assert any(entry['id'] == option('--ids') for entry in ledger)
+        locks = state['storage_locks'][option('--subscription')]
+        locks[:] = [lock for lock in locks if lock['id'] != option('--ids')]
+        out({})
+    if args[:3] == ['rest', '--method', 'put']:
+        lock_id = option('--url').removeprefix('https://management.azure.com').split('?')[0]
+        subscription = lock_id.split('/')[2]
+        lock = dict(json.loads(option('--body'))['properties'], id=lock_id, name=lock_id.rsplit('/', 1)[1])
+        locks = state['storage_locks'][subscription]
+        locks[:] = [old for old in locks if old['id'] != lock_id]
+        locks.append(lock)
+        if os.environ.get('BAD_LOCK_RESTORE'): locks[-1]['notes'] = 'wrong'
+        out({})
     if args[:3] == ['keyvault', 'secret', 'list']: out([])
     if args[:3] == ['keyvault', 'secret', 'set']:
         value = sys.stdin.read()
@@ -322,10 +346,11 @@ if exe == 'terraform':
         previous = state.setdefault('initialized', {}).get(directory)
         states = state.setdefault('backend_states', {})
         if '-migrate-state' in command_args:
+            state['migrated'] = True
             if not previous: sys.exit(95)
             states[backend_key] = states.get(previous, {'lineage': 'fixture-lineage', 'serial': 9, 'resources': []})
         elif backend_key not in states:
-            states[backend_key] = {} if backend['storage_account_name'] == 'destinationstate' else {'lineage': 'fixture-lineage', 'serial': 9, 'resources': []}
+            states[backend_key] = {'lineage': 'initialized-empty-lineage', 'serial': 0, 'resources': [], 'outputs': {}} if backend['storage_account_name'] == 'destinationstate' else {'lineage': 'fixture-lineage', 'serial': 9, 'resources': []}
         state['initialized'][directory] = backend_key
         with LOG.open('a') as log: log.write('TF_BACKEND ' + json.dumps(config) + '\n')
         out(b'', raw=True)
@@ -338,7 +363,10 @@ if exe == 'terraform':
         state.setdefault('tfvars_by_stack', {})[Path(args[0].split('=', 1)[1]).name] = values
         if '-target=module.host.module.workload_rg[0]' in command_args: state['host_rg'] = True
         if command_args[0] == 'plan' and os.environ.get('TF_DRIFT'): sys.exit(2)
-        if command_args[0] == 'destroy': state['revoked'] = True
+        if command_args[0] == 'destroy':
+            # Azure rejects RBAC deletion beneath an account deletion lock.
+            if any(state.get('storage_locks', {}).values()): sys.exit(96)
+            state['revoked'] = True
         out(b'', raw=True)
     if command_args[0] == 'output':
         if command_args[-1] == 'deallocator_role_id': out('/subscriptions/' + TARGET_SUB + '/providers/Microsoft.Authorization/roleDefinitions/deallocator-role')
@@ -348,13 +376,18 @@ if exe == 'terraform':
              'target': {}, 'vault': {}, 'twins': []})
     if command_args[:1] == ['state'] and directory not in state.get('initialized', {}): sys.exit(93)
     if command_args[:2] == ['state', 'pull']:
-        changed = os.environ.get('BAD_STATE') and state.get('pulled')
+        changed = os.environ.get('BAD_STATE') and state.get('migrated')
         state['pulled'] = True
         result = dict(state['backend_states'][state['initialized'][directory]])
         if changed: result['resources'] = [{'type': 'unexpected'}]
         out(result)
+    if command_args[:2] == ['show', '-json']:
+        roles = [{'address': f'module.trust.azurerm_role_assignment.operator["{name}"]', 'type': 'azurerm_role_assignment',
+                  'values': {'scope': f'/subscriptions/{VAULT_SUB}/resourceGroups/rg-example-vault/providers/Microsoft.Storage/storageAccounts/example{name}/blobServices/default/containers/{name}'}}
+                 for name in ('state', 'backups', 'staging')]
+        out({'values': {'root_module': {'child_modules': [{'resources': roles}]}}})
     if command_args[:2] == ['state', 'list']:
-        out('' if state.get('revoked') else 'module.trust.module.identities["ops"].azurerm_federated_identity_credential.this["github"]\nmodule.trust.azurerm_role_assignment.operator["backups"]\nmodule.trust.azurerm_resource_group.vault\n', raw=True)
+        out('' if state.get('revoked') else 'module.trust.module.identities["ops"].azurerm_federated_identity_credential.this["github"]\nmodule.trust.azurerm_role_assignment.operator["state"]\nmodule.trust.azurerm_role_assignment.operator["backups"]\nmodule.trust.azurerm_role_assignment.operator["staging"]\nmodule.trust.azurerm_resource_group.vault\n', raw=True)
 if exe == 'curl':
     config = sys.stdin.read()
     url = re.search(r'url = "(.*?)"', config)[1]
@@ -392,7 +425,7 @@ if exe == 'curl':
             if key in state['federations']: del state['federations'][key]
             else: state['token_revoked'] = True
             out({})
-        if url.endswith('/keys'): out({'keys': list(state['federations'].values())})
+        if url.endswith('/keys'): out({'keys': [{'id': key} for key in state['federations']]})
         key = url.rsplit('/', 1)[1]
         out(state['federations'][key])
     if method == 'PUT':

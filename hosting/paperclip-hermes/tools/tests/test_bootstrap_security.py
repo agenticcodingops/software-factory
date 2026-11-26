@@ -240,8 +240,12 @@ class BootstrapSecurityTests(unittest.TestCase):
         events = []
         def tf(*args, **kwargs):
             events.append(args)
+            if 'show' in args:
+                return json.dumps({'values': {'root_module': {'resources': [
+                    {'address': 'module.trust.azurerm_role_assignment.operator["backups"]',
+                     'type': 'azurerm_role_assignment', 'values': {'scope': '/subscriptions/sub/resourceGroups/vault'}}]}}}).encode()
             return b'module.trust.azurerm_role_assignment.operator["backups"]\n' if 'list' in args and not any('destroy' in e for e in events) else b''
-        with patch.object(self.app, 'storage_grant', side_effect=lambda *a: events.append(('grant', *a))), patch.object(self.app, 'az', side_effect=lambda *a: events.append(('az', *a))), patch.object(self.app, 'backend', side_effect=lambda *a: events.append(('backend', *a))), patch.object(self.app, 'tf', side_effect=tf):
+        with patch.object(self.app, 'storage_grant', side_effect=lambda *a: events.append(('grant', *a))), patch.object(self.app, 'az', side_effect=lambda *a: events.append(('az', *a)) or []), patch.object(self.app, 'backend', side_effect=lambda *a: events.append(('backend', *a))), patch.object(self.app, 'tf', side_effect=tf):
             self.app.revoke()
         self.assertEqual(events[0], ('grant', '/subscriptions/sub/resourceGroups/vault/providers/Microsoft.Storage/storageAccounts/state/blobServices/default/containers/tfstate', 'Storage Blob Data Contributor', 'sub'))
         self.assertEqual(events[1][:4], ('az', 'storage', 'blob', 'list'))

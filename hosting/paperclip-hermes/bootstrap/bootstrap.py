@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Operator-only bootstrap. No cloud credentials or key values are persisted.
 
-Only non-secret configuration/receipts and a crash-recovery assignment ledger are
-written, in an explicitly selected private directory outside this checkout.
+Only non-secret configuration/receipts and crash-recovery assignment/lock ledgers
+are written, in an explicitly selected private directory outside this checkout.
 Terraform fallback state is isolated for explicit recovery; working trees are removed.
 Subprocess diagnostics are captured: SDK errors can echo secret request bodies.
 """
@@ -114,6 +114,7 @@ class Bootstrap:
         require(not self.home.is_relative_to(ROOT), "Select a private --instance-dir outside the public checkout")
         self.config = self.load("bootstrap.json", {})
         self.ledger = self.load("assignments.json", [])
+        self.lock_ledger = self.load("locks.json", [])
         self.token = None
         self.tf_session = None
         self.tf_trees = {}
@@ -258,13 +259,67 @@ class Bootstrap:
                 "Temporary storage grant requires an unlocked vault RG with no inherited lock")
         self.grant(rg, role, subscription)
 
+    def restore_locks(self):
+        failures = []
+        for entry in list(reversed(self.lock_ledger)):
+            try:
+                self.az("rest", "--method", "put", "--url",
+                        "https://management.azure.com" + entry["id"] + "?api-version=2016-09-01",
+                        "--body", json.dumps({"properties": entry["properties"]}),
+                        "--subscription", entry["subscription"], change=True)
+                def restored():
+                    locks = self.az("lock", "list", "--subscription", entry["subscription"])
+                    require(any(lock.get("id", "").lower() == entry["id"].lower() and
+                                subset(entry["properties"], lock) for lock in locks), "Storage lock restoration readback failed")
+                self.retry(restored)
+                self.lock_ledger.remove(entry)
+                self.save("locks.json", self.lock_ledger)
+            except (Refusal, ValueError, KeyError, OSError, subprocess.SubprocessError):
+                failures.append(entry)
+        require(not failures, "Storage lock restoration readback failed: rerun cleanup --apply using locks.json before continuing")
+
+    def unlock_role_scopes(self, scopes):
+        # CanNotDelete locks inherit to RBAC assignments. Persist recovery data
+        # before unlocking, and restore in cleanup even after a failed destroy.
+        affected = []
+        for subscription in sorted({scope.split("/")[2] for scope in scopes}):
+            locks = self.az("lock", "list", "--subscription", subscription)
+            for lock in locks:
+                lock_scope = lock["id"].lower().split("/providers/microsoft.authorization/locks/")[0]
+                if not any(scope.lower() == lock_scope or scope.lower().startswith(lock_scope + "/") for scope in scopes):
+                    continue
+                require(lock.get("level") == "CanNotDelete" and re.fullmatch(
+                    r"/subscriptions/[^/]+/resourcegroups/[^/]+/providers/microsoft.storage/storageaccounts/[^/]+", lock_scope),
+                    "Revocation can temporarily remove only storage account CanNotDelete locks")
+                affected.append({"id": lock["id"], "subscription": subscription,
+                                 "properties": {k: lock[k] for k in ("level", "notes", "owners") if lock.get(k) is not None}})
+        # Validate the entire inventory and operator access before any unlock.
+        for subscription in sorted({entry["subscription"] for entry in affected}):
+            self.operator(subscription)
+        for entry in affected:
+            self.lock_ledger.append(entry)
+            self.save("locks.json", self.lock_ledger)
+            self.az("lock", "delete", "--ids", entry["id"], "--subscription", entry["subscription"], change=True)
+            def absent():
+                locks = self.az("lock", "list", "--subscription", entry["subscription"])
+                require(not any(lock.get("id", "").lower() == entry["id"].lower() for lock in locks),
+                        "Storage lock removal readback failed")
+            self.retry(absent)
+
     def cleanup(self):
         if not self.a.apply:
+            if self.lock_ledger:
+                progress("DRY-RUN: restore every storage lock in locks.json and verify its level/notes before clearing the ledger")
             for entry in reversed(self.ledger):
                 self.az("role", "assignment", "delete", "--ids", entry["id"], "--subscription", entry["subscription"], change=True)
             if self.ledger:
                 progress("DRY-RUN: read back removal of every temporary assignment; retain ledger if cleanup fails")
             return
+        lock_failure = None
+        try:
+            self.restore_locks()
+        except Refusal as exc:
+            lock_failure = exc
         failures = []
         for entry in list(reversed(self.ledger)):
             try:
@@ -280,6 +335,8 @@ class Bootstrap:
                 self.save("assignments.json", self.ledger)
             except (Refusal, ValueError, KeyError, OSError, subprocess.SubprocessError):
                 failures.append(entry)
+        if lock_failure:
+            raise lock_failure
         require(not failures, "CLEANUP FAILED: rerun cleanup --apply using assignments.json before continuing")
 
     def gate_check(self):
@@ -424,7 +481,11 @@ class Bootstrap:
         branch = "sf-bootstrap-" + digest(pack(files))[:20]
         endpoint = f"repos/{self.repo()}"
         refs = self.gh(f"{endpoint}/git/matching-refs/heads/{branch}")
-        if not any(r["ref"] == "refs/heads/" + branch for r in refs):
+        exists = any(r["ref"] == "refs/heads/" + branch for r in refs)
+        if not self.a.apply:
+            progress(f"DRY-RUN: stage {len(files)} file(s) on {branch} ({'existing' if exists else 'new'} branch), open a bootstrap PR, then merge before dispatching the probe")
+            return
+        if not exists:
             main = self.gh(f"{endpoint}/git/ref/heads/main")["object"]["sha"]
             self.gh(f"{endpoint}/git/refs", "POST", {"ref": "refs/heads/" + branch, "sha": main})
         tree = self.gh(f"{endpoint}/git/trees/{branch}?recursive=1")
@@ -465,6 +526,9 @@ class Bootstrap:
         text = "name: Bootstrap OIDC probe\non: workflow_dispatch\npermissions: {}\njobs:\n" + "".join(jobs)
         self.put_file(".github/workflows/sf-bootstrap-probe.yml", text)
         self.publish_files()
+        if not self.a.apply:
+            progress("DRY-RUN: after the probe caller is merged, dispatch on main and collect the approved run's claims; no receipt")
+            return
         if self.a.apply:
             caller = self.gh(f"repos/{self.repo()}/git/ref/heads/main")["object"]["sha"]
             self.save("probe-request.json", {"nonce": nonce, "refs": refs, "caller_sha": caller})
@@ -1147,7 +1211,7 @@ class Bootstrap:
                 readback = self.ts(f"tailnet/-/keys/{key_id}")
                 require(subset(body, readback) and readback.get("audience"), "Tailscale federation readback mismatch; use --print-subject fallback")
                 result[description] = {"client_id": key_id, "audience": readback["audience"], **claim}
-        remaining = self.ts("tailnet/-/keys").get("keys", [])
+        remaining = [self.ts(f"tailnet/-/keys/{entry['id']}") for entry in self.ts("tailnet/-/keys").get("keys", [])]
         managed = [k for k in remaining if k.get("description", "").startswith(("sf-plan-", "sf-production-"))]
         require({k["id"] for k in managed} == {v["client_id"] for v in result.values()}, "Managed Tailscale federation inventory readback mismatch")
         self.save("config/tailnet/federation.json", result)
@@ -1321,24 +1385,24 @@ class Bootstrap:
                 prior = receipt["states"].get(state_key)
                 if prior:
                     require(prior["backend"] == new, "Migration destination changed from receipt")
-                    self.backend(stack, new)
                     summary = prior
-                    right = json.loads(self.tf(stack, "state", "pull") or b"{}")
-                    if not right.get("lineage") and right.get("serial") is None:
-                        require(prior.get("status") == "pending", "Previously verified destination state is missing")
-                        self.backend(stack, old)
-                        left = json.loads(self.tf(stack, "state", "pull"))
-                        require(self.state_matches(summary, left), "Source state changed since pending migration; workflows must stay paused")
-                        self.backend(stack, new, migrate=True)
                 else:
                     self.backend(stack, old)
-                    before = self.tf(stack, "state", "pull")
-                    if self.a.apply:
-                        before_state = json.loads(before)
-                        summary = {"lineage": before_state["lineage"], "serial": before_state["serial"],
-                                   "inventory_hash": digest(pack(before_state["resources"])), "backend": new, "status": "pending"}
-                        receipt["states"][state_key] = summary
-                        self.save("config/receipts/vault-move.json", receipt)
+                    before_state = json.loads(self.tf(stack, "state", "pull"))
+                    summary = {"lineage": before_state["lineage"], "serial": before_state["serial"],
+                               "inventory_hash": digest(pack(before_state["resources"])), "backend": new, "status": "pending"}
+                # Reconfigure without migration to inspect BEFORE force-copy.
+                # An exact copy is safe to adopt; any other nonempty state is refused.
+                self.backend(stack, new)
+                right = json.loads(self.tf(stack, "state", "pull") or b"{}")
+                if not self.state_matches(summary, right):
+                    require(self.state_empty(right), "Destination state is nonempty and differs from source; refusing migration")
+                    require(not prior or prior.get("status") == "pending", "Previously verified destination state is missing")
+                    self.backend(stack, old)
+                    left = json.loads(self.tf(stack, "state", "pull"))
+                    require(self.state_matches(summary, left), "Source state changed since pending migration; workflows must stay paused")
+                    receipt["states"][state_key] = summary
+                    self.save("config/receipts/vault-move.json", receipt)
                     self.backend(stack, new, migrate=True)
                 if self.a.apply:
                     right = json.loads(self.tf(stack, "state", "pull"))
@@ -1435,6 +1499,18 @@ class Bootstrap:
         selected = [s for s in addresses if re.search(r"\.(?:azurerm_federated_identity_credential|azurerm_role_assignment)\.", s)]
         require(selected, "No revocable leaf authorization resources in initialized private trust backend")
         require(all(s.startswith("module.trust.") for s in selected), "Unexpected authorization state addresses")
+        state = json.loads(self.tf("trust", "show", "-json"))
+        def resources(module):
+            yield from module.get("resources", [])
+            for child in module.get("child_modules", []):
+                yield from resources(child)
+        roles = [r for r in resources(state["values"]["root_module"])
+                 if r["address"] in selected and r["type"] == "azurerm_role_assignment"]
+        require({r["address"] for r in roles} == {s for s in selected if ".azurerm_role_assignment." in s},
+                "Missing revocation role scope inventory")
+        scopes = [r["values"]["scope"] for r in roles]
+        require(all(re.match(r"/subscriptions/[^/]+(?:/|$)", scope) for scope in scopes), "Invalid revocation role scope")
+        self.unlock_role_scopes(scopes)
         variables = self.load("config/instance.tfvars.json", {})
         # Trust variables may include non-Terraform operator settings; select the
         # same public contract and private temporary JSON file as trust apply.
@@ -1443,6 +1519,14 @@ class Bootstrap:
         if self.a.apply:
             remaining = self.tf("trust", "state", "list").decode().splitlines()
             require(not set(selected).intersection(remaining), "Revocation readback failed")
+
+    @staticmethod
+    def state_empty(state):
+        # Azure's StateMgr creates a serial-zero snapshot on first access.
+        # A lineage alone is therefore not evidence of an existing deployment.
+        return state == {} or (state.get("serial") == 0 and bool(state.get("lineage")) and
+                               state.get("resources") == [] and state.get("outputs", {}) == {} and
+                               state.get("check_results") is None)
 
     @staticmethod
     def state_matches(summary, state):
@@ -1485,6 +1569,7 @@ def main():
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise Refusal("Another bootstrap process holds the local lock") from exc
+        require(not app.lock_ledger or args.mode == "cleanup", "Unrestored storage locks: run cleanup --apply before resuming")
         require(not app.ledger or args.mode == "cleanup", "Unfinished assignment ledger: run cleanup --apply before resuming")
         require(args.mode == "cleanup" or not list((app.home / "recovery").glob("*/errored.tfstate")), "Recover errored.tfstate with terraform state push against its intended backend, then securely delete it before continuing")
         interruption = {"raised": False}

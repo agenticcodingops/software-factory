@@ -14,7 +14,7 @@ operator login caches belong to the operator's CLI sessions.
 
 Use `--instance-dir /absolute/private/directory` or `SF_INSTANCE_DIR`. This must
 resolve outside the public checkout. It holds only configuration, public claims,
-receipts and an assignment ledger. Rendered Terraform trees and temporary 0600 JSON
+receipts, an assignment ledger and a storage-lock recovery ledger. Rendered Terraform trees and temporary 0600 JSON
 var-files are removed in every exit path, after role cleanup. Never put
 credentials in configuration, CLI arguments, Terraform variables or backend
 settings. No private key, SAS, bearer token, plan or pulled state is written by
@@ -76,6 +76,8 @@ before the first write. Terraform receives only bootstrap-controlled ARM setting
    are logged by `.github/workflows/sf-oidc-probe.yml`; tokens are never logged.
    For each actual workflow ref in `workflow_refs`, run `oidc-probe --apply` and
    collect that run after approval with `oidc-probe --probe-run RUN --apply`.
+   Without `--apply`, `oidc-probe` describes the PR and dispatch steps without
+   creating a branch, writing a nonce or reading a planned branch that does not exist.
    Workflows must implement the probe-only interface (`environment`, `nonce`,
    `probe_only`) with no cloud operations. Missing workflows or probes cannot be
    replaced by synthesized subjects or an environment-only federation.
@@ -118,7 +120,9 @@ before the first write. Terraform receives only bootstrap-controlled ARM setting
    verifies HTTPS/MagicDNS and creates exact plan/production federations from probe
    claims. It reads back each subject, workflow claim rule, scope, tag and generated
    audience, then stores only non-secret IDs/audiences. Creation uses the upstream
-   keys API with `keyType=federated`. The token is revoked on success and failure;
+   keys API with `keyType=federated`. Both inventory checks fetch each key's details
+   before filtering descriptions: the [upstream list contract](https://github.com/tailscale/tailscale-client-go-v2/blob/v2.12.0/keys.go#L192-L209)
+   supplies identifiers only. The token is revoked on success and failure;
    HTTP 401 is required as revocation readback. A cleanup failure explicitly requests
    console revocation. Only currently Owner-authorized refs are used, even when
    the probe receipt also contains older claims. Managed descriptions are reconciled:
@@ -149,13 +153,22 @@ before the first write. Terraform receives only bootstrap-controlled ARM setting
    It first acquires temporary Blob Data Contributor access on the unlocked vault RG
    and waits for data-plane propagation before initializing that backend. Dry-run
    describes the state checks without reading an uninitialized backend.
+   Azure [deletion locks also prevent RBAC assignment deletion](https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/lock-resources#considerations-before-applying-your-locks),
+   including assignments under storage containers. Revocation inspects role scopes
+   and their inherited locks, refuses locks other than account `CanNotDelete` locks,
+   and records each affected lock's ID, level and notes in private `locks.json`
+   before removing it. Cleanup restores and verifies those locks on success or failure.
+   A failed restoration retains the recovery ledger and blocks further work until
+   `cleanup --apply` succeeds. Storage resources and their Terraform lock addresses
+   are never targeted for destruction.
    It never targets entire identity modules, resource groups, vaults or disks.
    Normal resources and data retention remain intact.
-9. `cleanup --apply` retries unfinished assignment ledgers before any new work.
+9. `cleanup --apply` restores unfinished storage-lock ledgers, then retries
+   unfinished assignment ledgers before any new work.
    Each temporary assignment ID is durably recorded **before** creation. Success,
    failure, lost grant responses and INT/TERM/HUP all attempt removal and verify it.
    Output is best effort after terminal loss. The signal handler raises once;
-   INT/TERM/HUP are blocked during token, assignment and working-tree cleanup.
+   INT/TERM/HUP are blocked during token, lock, assignment and working-tree cleanup.
    Failed cleanup retains the ledger and blocks subsequent operations. SIGKILL or
    power loss cannot run handlers; the next invocation requires ledger cleanup.
 
@@ -183,6 +196,12 @@ never assigned to a workflow identity. Temporary roles grant no WORM or Shared K
 management. Trust's normal ops writer remains unchanged.
 
 State migration uses `terraform init -migrate-state` with Entra authentication.
+Because [`-force-copy` automatically confirms migration questions](https://developer.hashicorp.com/terraform/cli/commands/init#backend-initialization),
+the first attempt initializes the destination with `-reconfigure` and inspects it
+before copying. Azure's [state manager initializes an empty serial-zero snapshot](https://github.com/hashicorp/terraform/blob/v1.17.2/internal/backend/remote-state/azure/backend_state.go#L104-L138)
+when first accessed; a snapshot is empty only with no resources, outputs or check results.
+Only an empty destination can receive a copy; an identical state
+is adopted without copying, and any nonempty mismatch is refused.
 Before migration a pending per-stack receipt records lineage, serial and resource
 inventory hash. Readback must match before that backend is verified. Retries first
 inspect the recorded destination. An empty pending destination permits retry only

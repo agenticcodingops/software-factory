@@ -70,11 +70,11 @@ assert not p.exists() or json.loads(p.read_text()) == []
 PY
 }
 refute_match() {
-  if rg "$@"; then return 1; else [ "$?" -eq 1 ]; fi
+  if grep -E "$@"; then return 1; else [ "$?" -eq 1 ]; fi
 }
 assert_no_secrets() {
   [[ "$output" != *'fixture-private-material'* ]]
-  refute_match -l 'fixture-private-material|archive-plaintext|tskey-api-fixture-secret' "$BATS_TEST_TMPDIR" --glob '!bin/**'
+  refute_match -rl --exclude-dir=bin 'fixture-private-material|archive-plaintext|tskey-api-fixture-secret' "$BATS_TEST_TMPDIR"
 }
 
 @test 'dry-run is default: no writes, secret generation, grants or Terraform apply' {
@@ -107,14 +107,14 @@ assert_no_secrets() {
   run init --apply
   [ "$status" -eq 0 ]
   [[ "$output" == *'Reviewer gates verified'* ]]
-  rg '"prevent_self_review": false' "$CALLS"
+  grep -E '"prevent_self_review": false' "$CALLS"
   assert_no_secrets
 }
 
 @test 'two distinct reviewers enable self-review prevention' {
   run reviewed_boot init --org sample --instance-repo instance --reviewer first,second --probe-run 1 --apply
   [ "$status" -eq 0 ]
-  rg '"prevent_self_review": true' "$CALLS"
+  grep -E '"prevent_self_review": true' "$CALLS"
 }
 
 @test 'init refuses failed protection readback and a probe that does not wait' {
@@ -192,10 +192,10 @@ PYCODE
 @test 'trust applies WP4 variables, verifies no drift and removes temporary roles' {
   run trust --apply
   [ "$status" -eq 0 ]
-  rg '"rg_managed_by": "trust"' "$CALLS"
-  rg 'Storage Blob Data Contributor.*resourceGroups/rg-example-vault' "$CALLS"
-  rg 'Key Vault Secrets Officer' "$CALLS"
-  rg 'plan -input=false -detailed-exitcode' "$CALLS"
+  grep -E '"rg_managed_by": "trust"' "$CALLS"
+  grep -E 'Storage Blob Data Contributor.*resourceGroups/rg-example-vault' "$CALLS"
+  grep -E 'Key Vault Secrets Officer' "$CALLS"
+  grep -E 'plan -input=false -detailed-exitcode' "$CALLS"
   assert_clean
   assert_no_secrets
   run trust --apply
@@ -207,7 +207,7 @@ PYCODE
 @test 'subscription scope sets host RG ownership' {
   run trust --scope subscription --apply
   [ "$status" -eq 0 ]
-  rg '"rg_managed_by": "host"' "$CALLS"
+  grep -E '"rg_managed_by": "host"' "$CALLS"
 }
 
 @test 'trust refuses unsafe storage, apply failure and drift with grant cleanup' {
@@ -230,9 +230,9 @@ PYCODE
 @test 'age-key vault custody grants verifies writes via stdin and cleans on success' {
   run boot age-key --custody vault --escrow-cmd escrow --apply
   [ "$status" -eq 0 ]
-  rg 'assignment create.*Key Vault Secrets Officer.*Microsoft.KeyVault/vaults/examplevault' "$CALLS"
-  rg 'secret set.*--file /dev/stdin' "$CALLS"
-  rg 'secret show --id' "$CALLS"
+  grep -E 'assignment create.*Key Vault Secrets Officer.*Microsoft.KeyVault/vaults/examplevault' "$CALLS"
+  grep -E 'secret set.*--file /dev/stdin' "$CALLS"
+  grep -E 'secret show --id' "$CALLS"
   refute_match -- '--value' "$CALLS"
   assert_clean
   assert_no_secrets
@@ -248,7 +248,7 @@ PYCODE
 @test 'key rotation preserves enabled historical map and dispatches rotate workflow' {
   run boot age-key --custody vault --escrow-cmd escrow --rotate --apply
   [ "$status" -eq 0 ]
-  rg 'ph-rotate-age.yml/dispatches' "$CALLS"
+  grep -E 'ph-rotate-age.yml/dispatches' "$CALLS"
   refute_match 'set-attributes|secret delete|secret purge' "$CALLS"
   assert_clean
 }
@@ -291,12 +291,21 @@ PYCODE
   assert_clean
 }
 
-@test 'tailscale federates exact probe claims without policy writes or joining' {
+@test 'tailscale fetches ID-only inventory details and publishes exact claims without policy writes or joining' {
   run bash -c 'printf "%s" tskey-api-fixture-secret | bash "$1" tailscale --token-stdin --apply' _ "$bootstrap"
   [ "$status" -eq 0 ]
-  rg 'TS_BODY.*repo:sample@7/instance@8:environment:production:job_workflow_ref:' "$CALLS"
-  rg 'HTTP DELETE.*/keys/fixture' "$CALLS"
+  grep -E 'TS_BODY.*repo:sample@7/instance@8:environment:production:job_workflow_ref:' "$CALLS"
+  grep -E 'HTTP DELETE.*/keys/fixture' "$CALLS"
   refute_match 'HTTP (PUT|PATCH).*policy|tagOwners|^tailscale ' "$CALLS"
+  python3 - <<'PYTS'
+import json, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR']); cloud=json.loads(Path(os.environ['FAKE_DB']).read_text())
+receipt=json.loads((home/'config/tailnet/federation.json').read_text())
+assert set(receipt)=={'sf-plan-bootstrap','sf-production-bootstrap'}
+assert {v['client_id'] for v in receipt.values()}==set(cloud['federations'])
+assert {'TAILSCALE_SF_PLAN_BOOTSTRAP','TAILSCALE_SF_PRODUCTION_BOOTSTRAP'}<=set(cloud['variables'])
+PYTS
   assert_no_secrets
 }
 
@@ -305,7 +314,7 @@ PYCODE
     export "$condition=1"
     run bash -c 'printf "%s" tskey-api-fixture-secret | bash "$1" tailscale --token-stdin --apply' _ "$bootstrap"
     [ "$status" -eq 1 ]
-    rg 'HTTP DELETE.*/keys/fixture' "$CALLS"
+    grep -E 'HTTP DELETE.*/keys/fixture' "$CALLS"
     unset "$condition"
   done
   assert_no_secrets
@@ -315,7 +324,7 @@ PYCODE
   export FAIL='HTTP POST'
   run bash -c 'printf "%s" tskey-api-fixture-secret | bash "$1" tailscale --token-stdin --apply' _ "$bootstrap"
   [ "$status" -eq 1 ]
-  rg 'HTTP DELETE.*/keys/fixture' "$CALLS"
+  grep -E 'HTTP DELETE.*/keys/fixture' "$CALLS"
   run boot tailscale --print-subject
   [ "$status" -eq 0 ]
   [[ "$output" == *'policy_file:read'* ]]
@@ -326,13 +335,13 @@ PYCODE
   sha=$(printf 'a%.0s' {1..40})
   run boot rulesets --source-repo sample/source --release-sha "$sha" --apply
   [ "$status" -eq 0 ]
-  rg 'POST repos/sample/source/rulesets' "$CALLS"
-  rg 'POST repos/sample/instance/rulesets' "$CALLS"
-  rg 'POST orgs/sample/rulesets' "$CALLS"
-  before=$(rg -c -- '--method POST.*rulesets' "$CALLS")
+  grep -E 'POST repos/sample/source/rulesets' "$CALLS"
+  grep -E 'POST repos/sample/instance/rulesets' "$CALLS"
+  grep -E 'POST orgs/sample/rulesets' "$CALLS"
+  before=$(grep -E -c -- '--method POST.*rulesets' "$CALLS")
   run boot rulesets --source-repo sample/source --release-sha "$sha" --apply
   [ "$status" -eq 0 ]
-  [ "$(rg -c -- '--method POST.*rulesets' "$CALLS")" -eq "$before" ]
+  [ "$(grep -E -c -- '--method POST.*rulesets' "$CALLS")" -eq "$before" ]
 }
 
 @test 'rulesets refuse unresolved SHA and full payload readback mismatch' {
@@ -347,8 +356,8 @@ PYCODE
 @test 'restore-assist streams plaintext only between age processes and verifies staged hash' {
   run bash "$helper" restore-assist --backup-account sourcebackups --blob backups/retained.age --version historical-version --staging-blob restore/unique.age --ephemeral-recipient age1ephemeral --key-cmd key-reader --apply
   [ "$status" -eq 0 ]
-  rg 'HTTP GET.*versionid=historical-version' "$CALLS"
-  rg 'HTTP PUT.*/restore-staging/restore/unique.age' "$CALLS"
+  grep -E 'HTTP GET.*versionid=historical-version' "$CALLS"
+  grep -E 'HTTP PUT.*/restore-staging/restore/unique.age' "$CALLS"
   assert_no_secrets
 }
 
@@ -362,7 +371,7 @@ PYCODE
 @test 'vault state migration grants removable RG roles and records verified per-stack receipts' {
   run boot vault-move --phase state --apply
   [ "$status" -eq 0 ]
-  rg 'init -migrate-state -force-copy' "$CALLS"
+  grep -E 'init -migrate-state -force-copy' "$CALLS"
   [ -f "$SF_INSTANCE_DIR/config/receipts/vault-move.json" ]
   assert_clean
 }
@@ -370,9 +379,9 @@ PYCODE
 @test 'vault backups stream every version preserve metadata and verify hashes and retention' {
   run boot vault-move --phase backups --apply
   [ "$status" -eq 0 ]
-  rg 'Storage Blob Data Reader.*resourceGroups/rg-example-vault' "$CALLS"
-  rg 'example SF Backup Migration Writer.*resourceGroups/rg-example-vault' "$CALLS"
-  rg 'versionid=historical-version' "$CALLS"
+  grep -E 'Storage Blob Data Reader.*resourceGroups/rg-example-vault' "$CALLS"
+  grep -E 'example SF Backup Migration Writer.*resourceGroups/rg-example-vault' "$CALLS"
+  grep -E 'versionid=historical-version' "$CALLS"
   assert_clean
   assert_no_secrets
 }
@@ -380,9 +389,9 @@ PYCODE
 @test 'vault keys copy enabled exact historical versions via stdin under temporary roles' {
   run boot vault-move --phase keys --apply
   [ "$status" -eq 0 ]
-  rg 'Key Vault Secrets User.*secrets/age-' "$CALLS"
-  rg 'Key Vault Secrets Officer.*destinationvault' "$CALLS"
-  rg 'secret set.*destinationvault.*--file /dev/stdin' "$CALLS"
+  grep -E 'Key Vault Secrets User.*secrets/age-' "$CALLS"
+  grep -E 'Key Vault Secrets Officer.*destinationvault' "$CALLS"
+  grep -E 'secret set.*destinationvault.*--file /dev/stdin' "$CALLS"
   assert_clean
   assert_no_secrets
 }
@@ -421,7 +430,7 @@ PYCODE
 @test 'revoke targets only authorization leaves and verifies removal' {
   run boot --revoke --apply
   [ "$status" -eq 0 ]
-  rg -- '-target=module.trust.*azurerm_federated_identity_credential' "$CALLS"
+  grep -E -- '-target=module.trust.*azurerm_federated_identity_credential' "$CALLS"
   refute_match -- '-target=module.trust.azurerm_resource_group' "$CALLS"
 }
 
@@ -458,7 +467,7 @@ PYCODE
   run reviewed_boot init --org sample --instance-repo instance --reviewer first --source-repo sample/source --release-sha "$(printf 'a%.0s' {1..40})" --apply
   [ "$status" -eq 1 ]
   [[ "$output" == *'Setup incomplete'* ]]
-  rg 'sf-bootstrap-probe.yml/dispatches' "$CALLS"
+  grep -E 'sf-bootstrap-probe.yml/dispatches' "$CALLS"
   python3 - <<'PY'
 import base64,json,os
 from pathlib import Path
@@ -545,8 +554,8 @@ PY
   [ "$status" -eq 0 ]
   [[ "$output" == *'CODEOWNER review'* ]]
   for workflow in ph-ops ph-power ph-cost-guard ph-backup-verify; do
-    rg 'target-primary:' "$SF_INSTANCE_DIR/.github/workflows/$workflow.yml"
-    rg 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb # v0.9.0' "$SF_INSTANCE_DIR/.github/workflows/$workflow.yml"
+    grep -E 'target-primary:' "$SF_INSTANCE_DIR/.github/workflows/$workflow.yml"
+    grep -E 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb # v0.9.0' "$SF_INSTANCE_DIR/.github/workflows/$workflow.yml"
   done
   refute_match 'PUT repos/sample/instance/contents/.github/workflows/ph-' "$CALLS"
   assert_clean
@@ -567,8 +576,8 @@ p=home/'config/instance.tfvars.json';v=json.loads(p.read_text());v['targets']={'
 PY
   run boot vault-move --phase state --apply
   [ "$status" -eq 0 ]
-  rg 'migration-host-alpha/stacks/host' "$CALLS"
-  rg 'migration-host-beta/stacks/host' "$CALLS"
+  grep -E 'migration-host-alpha/stacks/host' "$CALLS"
+  grep -E 'migration-host-beta/stacks/host' "$CALLS"
   python3 - <<'PY'
 import json,os
 from pathlib import Path
@@ -706,7 +715,7 @@ PY
 @test 'restore staging account and receipt match Terraform separate WORM-free staging' {
   run boot restore-assist --backup-account sourcebackups --blob backups/retained.age --staging-blob restore/unique.age --ephemeral-recipient age1ephemeral --key-cmd key-reader --apply
   [ "$status" -eq 0 ]
-  rg 'HTTP PUT https://examplestaging.blob.core.windows.net/restore-staging/' "$CALLS"
+  grep -E 'HTTP PUT https://examplestaging.blob.core.windows.net/restore-staging/' "$CALLS"
   refute_match 'HTTP PUT https://sourcebackups' "$CALLS"
   python3 - <<'PY'
 import json,os
@@ -732,8 +741,8 @@ PY
   pilot_config
   run trust --close-pilot --apply
   [ "$status" -eq 0 ]
-  rg 'Storage Blob Data Owner.*resourceGroups/rg-example-vault' "$CALLS"
-  rg 'HTTP PUT.*versionid=pilot-version' "$CALLS"
+  grep -E 'Storage Blob Data Owner.*resourceGroups/rg-example-vault' "$CALLS"
+  grep -E 'HTTP PUT.*versionid=pilot-version' "$CALLS"
   python3 - <<'PY'
 import json,os
 from pathlib import Path
@@ -908,7 +917,7 @@ PY
   run boot vault-move --phase backups --apply
   [ "$status" -eq 1 ]
   [[ "$output" == *'missing recipient_fp metadata'* ]]
-  rg -- '--include vmi' "$CALLS"
+  grep -E -- '--include vmi' "$CALLS"
   refute_match 'HTTP PUT.*destinationbackups' "$CALLS"
   assert_clean
 }
@@ -939,7 +948,7 @@ PY
   run boot age-key --custody operator --escrow-cmd escrow --apply
   [ "$status" -eq 0 ]
   refute_match '^age-keygen|^escrow ' "$CALLS"
-  rg 'AGE_RECIPIENT|AGE_FINGERPRINT' "$CALLS"
+  grep -E 'AGE_RECIPIENT|AGE_FINGERPRINT' "$CALLS"
 }
 
 @test 'closed stdout plus HUP and repeated interruptions still revoke token and roles' {
@@ -957,7 +966,7 @@ p.communicate(timeout=20)
 assert p.returncode == 1
 PYCLOSE
   [ "$status" -eq 0 ]
-  rg 'HTTP DELETE.*/keys/fixture' "$CALLS"
+  grep -E 'HTTP DELETE.*/keys/fixture' "$CALLS"
   assert_clean
 }
 
@@ -975,7 +984,7 @@ p.communicate(timeout=20)
 assert p.returncode == 1
 PYCLOSE
   [ "$status" -eq 0 ]
-  rg 'assignment delete' "$CALLS"
+  grep -E 'assignment delete' "$CALLS"
   assert_clean
 }
 
@@ -988,7 +997,7 @@ PYCLOSE
   run boot age-key --custody vault --escrow-cmd escrow --key-cmd key-reader --apply
   [ "$status" -eq 0 ]
   refute_match '^age-keygen[[:space:]]*$' "$CALLS"
-  rg '^key-reader ' "$CALLS"
+  grep -E '^key-reader ' "$CALLS"
   assert_clean
 }
 
@@ -1009,5 +1018,157 @@ PYSTATE
   [ "$status" -eq 1 ]
   [[ "$output" == *'Source state changed since pending migration'* ]]
   refute_match 'init -migrate-state' "$CALLS"
+  assert_clean
+}
+
+@test 'state migration refuses unrelated newer and divergent destinations before force-copy' {
+  for kind in unrelated newer divergent malformed outputs; do
+    python3 - "$kind" <<'PY'
+import json, os, sys
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); cloud=json.loads(p.read_text())
+original={'lineage':'fixture-lineage','serial':9,'resources':[]}
+foreign=dict(original)
+if sys.argv[1]=='unrelated': foreign['lineage']='foreign-lineage'
+if sys.argv[1]=='newer': foreign['serial']=10
+if sys.argv[1]=='divergent': foreign['resources']=[{'type':'foreign'}]
+if sys.argv[1]=='malformed': foreign={'resources':[{'type':'foreign'}]}
+if sys.argv[1]=='outputs': foreign={'lineage':'foreign-lineage','serial':0,'resources':[],'outputs':{'foreign':{'value':'retained'}}}
+cloud['backend_states']={'destinationstate/trust.tfstate':foreign}
+cloud['expected_destination']=foreign
+p.write_text(json.dumps(cloud))
+PY
+    : > "$CALLS"
+    run boot vault-move --phase state --apply
+    [ "$status" -eq 1 ]
+    [[ "$output" == *'Destination state is nonempty'* ]]
+    refute_match 'init -migrate-state' "$CALLS"
+    python3 - <<'PY'
+import json, os
+from pathlib import Path
+cloud=json.loads(Path(os.environ['FAKE_DB']).read_text())
+assert cloud['backend_states']['destinationstate/trust.tfstate']==cloud['expected_destination']
+PY
+    assert_clean
+  done
+}
+
+@test 'state migration adopts identical destination without overwriting it' {
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); cloud=json.loads(p.read_text())
+cloud['backend_states']={'destinationstate/'+stack+'.tfstate':{'lineage':'fixture-lineage','serial':9,'resources':[]} for stack in ('trust','host','tailnet')}
+p.write_text(json.dumps(cloud))
+PY
+  run boot vault-move --phase state --apply
+  [ "$status" -eq 0 ]
+  refute_match 'init -migrate-state' "$CALLS"
+  assert_clean
+}
+
+assert_locks_restored() {
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR']); cloud=json.loads(Path(os.environ['FAKE_DB']).read_text())
+locks=cloud['storage_locks'][os.environ['VAULT_SUB']]
+assert len(locks)==3
+assert {lock['notes'] for lock in locks}=={'retain state','retain backups','retain staging'}
+assert all(lock['level']=='CanNotDelete' for lock in locks)
+assert json.loads((home/'locks.json').read_text())==[]
+PY
+}
+
+@test 'revoke removes and restores all storage locks with verified recovery ledgers' {
+  run boot --revoke --apply
+  [ "$status" -eq 0 ]
+  assert_locks_restored
+  assert_clean
+  python3 - <<'PY'
+import os
+from pathlib import Path
+lines=Path(os.environ['CALLS']).read_text().splitlines()
+deletes=[i for i,l in enumerate(lines) if l.startswith('az lock delete ')]
+restores=[i for i,l in enumerate(lines) if l.startswith('az rest --method put ')]
+destroy=next(i for i,l in enumerate(lines) if ' destroy ' in l)
+assert len(deletes)==len(restores)==3 and max(deletes)<destroy<min(restores)
+PY
+}
+
+@test 'revoke restores locks after Terraform fails and can be retried' {
+  export FAIL='destroy -input=false'
+  run boot --revoke --apply
+  [ "$status" -eq 1 ]
+  assert_locks_restored
+  assert_clean
+  unset FAIL
+  run boot --revoke --apply
+  [ "$status" -eq 0 ]
+  assert_locks_restored
+  assert_clean
+}
+
+@test 'failed lock restore retains ledger and cleanup verifies restoration before resuming' {
+  export BAD_LOCK_RESTORE=1
+  run boot --revoke --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Storage lock restoration readback failed'* ]]
+  assert_clean
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR'])
+assert len(json.loads((home/'locks.json').read_text()))==3
+assert not (home/'config/receipts/last-bootstrap-operation.json').exists()
+PY
+  run boot --revoke --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Unrestored storage locks'* ]]
+  unset BAD_LOCK_RESTORE
+  run boot cleanup --apply
+  [ "$status" -eq 0 ]
+  assert_locks_restored
+  assert_clean
+}
+
+@test 'oidc-probe dry-run succeeds read-only for missing and existing PR branches' {
+  python3 - <<'PY'
+import hashlib, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR'])
+Path(os.environ['BATS_TEST_TMPDIR'],'before').write_text(repr(sorted((str(p.relative_to(home)),hashlib.sha256(p.read_bytes()).hexdigest()) for p in home.rglob('*') if p.is_file())))
+PY
+  for branch in missing existing; do
+    if [ "$branch" = existing ]; then
+      run boot oidc-probe --apply
+      [ "$status" -eq 1 ]
+      [[ "$output" == *'Merge bootstrap pull request'* ]]
+    fi
+    cp "$FAKE_DB" "$BATS_TEST_TMPDIR/cloud-before"
+    : > "$CALLS"
+    run boot oidc-probe
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'DRY-RUN: stage '* ]]
+    [[ "$output" == *'no receipt'* ]]
+    cmp "$FAKE_DB" "$BATS_TEST_TMPDIR/cloud-before"
+    refute_match 'GH_BODY|/git/trees/sf-bootstrap-|/contents/.*ref=sf-bootstrap-|/pulls\?' "$CALLS"
+    if [ "$branch" = missing ]; then
+      python3 - <<'PY'
+import hashlib, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR'])
+assert Path(os.environ['BATS_TEST_TMPDIR'],'before').read_text()==repr(sorted((str(p.relative_to(home)),hashlib.sha256(p.read_bytes()).hexdigest()) for p in home.rglob('*') if p.is_file()))
+PY
+    fi
+  done
+}
+
+@test 'revoke restores locks when a later unlock fails before Terraform destroy' {
+  export FAIL="lock delete --ids /subscriptions/$VAULT_SUB/resourceGroups/rg-example-vault/providers/Microsoft.Storage/storageAccounts/examplebackups"
+  run boot --revoke --apply
+  [ "$status" -eq 1 ]
+  refute_match ' destroy ' "$CALLS"
+  assert_locks_restored
   assert_clean
 }
