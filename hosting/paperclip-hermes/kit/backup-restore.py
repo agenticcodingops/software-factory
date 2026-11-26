@@ -207,6 +207,7 @@ def sas_url(value):
                 or query.get('sks') != ['b'] or query.get('spr') != ['https']
                 or not now < when('ske') <= now + timedelta(days=7)
                 or not now < when('se') <= when('ske')
+                or when('se') - (when('st') if 'st' in query else now) > timedelta(days=7)
                 or ('st' in query and when('st') > now)
                 or when('skt') > now or when('ske') - when('skt') > timedelta(days=7)):
             fail('Invalid container SAS settings; require a write-only user-delegation SAS, at most 7 days')
@@ -399,11 +400,13 @@ def publish_local(archive, destination, name):
         raise
 
 
-def run(args, *, cwd=KIT, output=None, input_file=None, pass_fds=()):
+def run(args, *, cwd=KIT, output=None, input_file=None, pass_fds=(), env=None):
     # Capture output privately rather than leaking config, archive filenames or
     # application/provider diagnostics into journald. No secret in args either.
     kwargs = {'cwd': cwd, 'stdout': output if output is not None else subprocess.PIPE,
               'stderr': subprocess.PIPE, 'stdin': input_file or subprocess.DEVNULL, 'pass_fds': pass_fds}
+    if env is not None:
+        kwargs['env'] = env
     if str(args[0]) == 'git':
         # Host operations always name the intended checkout explicitly. Inherited
         # Git context must not redirect its repository, index or configuration.
@@ -422,6 +425,7 @@ class Compose:
         self.kit = kit
         self.name = name
         self.files = []
+        self.image_tag = kit_image_tag(kit)
         env = kit / '.secrets/compose.env'
         profiles = 'paperclip,hermes'
         if env.exists():
@@ -434,10 +438,20 @@ class Compose:
 
     def __call__(self, *args, **kwargs):
         return run(['docker', 'compose', '--project-name', self.name,
-                    '--env-file', '.secrets/compose.env', *self.profiles, *self.files, *args], cwd=self.kit, **kwargs)
+                    '--env-file', '.secrets/compose.env', *self.profiles, *self.files, *args], cwd=self.kit,
+                   env={**os.environ, 'KIT_IMAGE_TAG': self.image_tag}, **kwargs)
 
     def services(self):
         return self('config', '--services').split()
+
+    def preserve_build_images(self):
+        # An older upgrader or manual Compose invocation may have used a
+        # fallback tag. Preserve the actual installed build before a candidate
+        # can retag anything, including when every service is stopped.
+        for service in self.services():
+            if service in ('hermes', 'sandbox'):
+                image = run(['docker', 'inspect', '--format', '{{.Image}}', self.container(service)]).strip()
+                run(['docker', 'image', 'tag', image, 'software-factory-' + service + ':' + self.image_tag])
 
     def container(self, service):
         # Compose ps can include a run container left by a killed client.
@@ -526,25 +540,35 @@ def image_pins(kit):
     return sorted(set(re.findall(r'[A-Za-z0-9][A-Za-z0-9._/:+-]*@sha256:[a-f0-9]{64}', text)))
 
 
-def installed_provenance():
-    path = KIT / '.kit-provenance.json'
+def kit_image_tag(kit):
+    # Independent of the project name, checkout location and copied secrets.
+    # The commit also separates identical code rebuilt for distinct releases.
+    # Candidate builds cannot retag the previous kit's local images.
+    files = {name: digest(path) for name, path in kit_files(kit, CODE).items()}
+    return hashlib.sha256(json.dumps({'commit': kit_commit(kit), 'files': files}, sort_keys=True).encode()).hexdigest()
+
+
+def installed_provenance(kit=None):
+    kit = kit or KIT
+    path = kit / '.kit-provenance.json'
     if not path.exists():
         return None
     record = json.loads(read_private(path))
-    files = {name: digest(path) for name, path in kit_files(KIT, CODE).items()}
+    files = {name: digest(path) for name, path in kit_files(kit, CODE).items()}
     return record, files != record['files']
 
 
-def kit_commit():
+def kit_commit(kit=None):
     # The commit restore must check out. Git refuses a checkout root does not
     # own (safe.directory) rather than run its hooks or config: then 'unknown',
     # and the operator's pilot log is the record.
-    provenance = installed_provenance()
+    kit = kit or KIT
+    provenance = installed_provenance(kit)
     if provenance is not None:
         record, modified = provenance
         return 'unknown' if modified else commit_label(record['kit_commit'])
     try:
-        value = run(['git', '-C', KIT, 'rev-parse', '--verify', 'HEAD']).strip()
+        value = run(['git', '-C', kit, 'rev-parse', '--verify', 'HEAD']).strip()
     except RecoveryError:
         return 'unknown'
     return commit_label(value)
@@ -753,7 +777,16 @@ def require_no_service_operation():
         fail('Recover the interrupted backup/restore before another operation')
 
 
+def require_resolved_upgrade():
+    path = STATE_DIR / 'last-op.json'
+    if path.exists():
+        record = json.loads(read_private(path))
+        if record.get('operation') == 'upgrade' and record.get('phase') not in ('complete', 'rolled-back', 'prepare-failed'):
+            fail('Recover the unresolved upgrade before taking a backup')
+
+
 def backup(args):
+    require_resolved_upgrade()
     args._restart_services = None
     try:
         return data_backup(args)
@@ -1302,6 +1335,7 @@ def restore(args):
             # every start switch off each messaging platform in the root and
             # every profile, whatever credential the restored home holds.
             compose('up', '-d', '--wait', '--wait-timeout', '300')
+            finish_service_operation(args)
         except BaseException:
             hold_signals()
             # abandon() still runs compose with the override file, which
@@ -1321,7 +1355,6 @@ def restore(args):
                 if home is not None:
                     remove_import_undo(home)
             raise
-        finish_service_operation(args)
         # The manifest was checked before applications started.
         print('Restore complete; messaging is off until you remove KIT_MESSAGING_OFF. '
               'Recovery point: ' + record['completed_at'])
@@ -1345,6 +1378,8 @@ def main(argv=None):
     with locked():
         if args.command in ('backup', 'restore'):
             require_no_service_operation()
+            if args.command == 'backup':
+                require_resolved_upgrade()
             args._track_service_operation = True
             status = {'protocol': 1, 'operation': args.command, 'phase': 'running', 'started_at': utc()}
             old = STATE_DIR / 'last-op.json'

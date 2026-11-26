@@ -816,7 +816,11 @@ selected application writers. After starting such a backup, wait for it to finis
 before starting work: `systemctl status paperclip-hermes-backup.service` must
 show it inactive with a successful result (not "activating"). A nonzero service
 result means no successful backup; monitor it and inspect container health.
-To re-run a failed backup, wait until the stack is healthy (`docker
+To re-run a failed backup, first run `sudo ./sfctl status`. If `service-op` shows
+a pending backup (`operation: backup`, `phase: running`), run `sudo ./sfctl recover`
+to clean its staging and restart its recorded inventory, then check status again.
+Resolve any pending upgrade before taking a backup. If there is no pending
+operation, retry directly. Wait until the stack is healthy (`docker
 compose --env-file .secrets/compose.env ps` shows every selected service running and
 healthy), then run `sudo systemctl start paperclip-hermes-backup.service` and
 confirm `systemctl status paperclip-hermes-backup.service` shows a successful
@@ -1057,6 +1061,27 @@ Run IDs must contain 1–255 ASCII letters, digits, underscores or hyphens. An
 existing rollback path (including a symlink) is rejected before changing the
 journal; use a fresh ID for every upgrade attempt, including after a rollback.
 
+### Pre-WP3 migration
+
+The previous commit must provide a working `kit-control.py recover-locked`.
+Upgrade checks that command in the immutable previous checkout before creating
+the rollback point or stopping writers. Pre-WP3 kits are refused; there is no
+supported in-place data migration from them through `upgrade.sh`.
+
+For the first WP3 deployment, stop and disable the legacy schedulers and writers,
+take and verify a backup using that legacy kit's own recovery procedure, and
+retain the old checkout and data disk as the legacy recovery environment.
+Provision a fresh host and empty volumes using this README's bootstrap procedure,
+configure credentials and validate the WP3 stack before switching traffic and
+enabling scheduling. Keep the legacy host fenced throughout the cutover.
+WP3 restore does not accept legacy bundles; this clean-install migration starts
+with empty application state. If existing state must be carried forward, keep
+the legacy deployment until a separately rehearsed application data migration
+is available. Once the WP3 baseline is healthy, take its first WP3 backup;
+subsequent upgrades can use the rollback protocol below.
+
+### Supported upgrade sequence
+
 The upgrade refuses unless available space is at least 2.2 times the sum of
 volume bytes and the database dump estimate. It then creates `/data/rollback/<run>`
 (root 0700): stop installed application writers, dump the live PostgreSQL, stop
@@ -1075,6 +1100,12 @@ referring to the last off-site backup receipt. Healthy candidates retain a
 deployment finishes handoff or rolls back. WP3 preserves the journal and rollback
 point; the later ops/deploy package owns approval tags, finalization and pruning
 after six successful checks or 24 running hours. Do not prune an unresolved handoff.
+Backups refuse an unresolved upgrade so their kit provenance cannot describe
+the previous checkout while capturing candidate data. Local Hermes and Sandbox
+builds use a fingerprint of the kit commit and code as their image tag; candidate builds cannot
+overwrite the previous kit's images used by a startup-only recovery retry.
+Before capture, upgrade tags the actual installed builds with those references,
+including builds started under fallback tags by an older upgrader.
 
 `health.sh` prints one JSON line under 4 KB and exits nonzero for a failed check.
 It covers installed Compose service health, Paperclip through Caddy, Hermes's

@@ -208,7 +208,7 @@ def test_upgrade_rollback(installation):
         if str(args[0]) == 'tar' and '--extract' in args:
             assert not original(['docker', 'container', 'ls', '--all', '--quiet', '--filter',
                                  'label=com.docker.compose.project=paperclip-hermes']).strip()
-        if 'recover-locked' in args:
+        if 'recover-locked' in args and '--help' not in args:
             # Invoke the previous checkout's actual restore implementation,
             # while the caller retains the real host operation lock.
             c.recover_point(Path(args[args.index('--point')+1]), compose)
@@ -309,7 +309,7 @@ def test_cross_version_restore(installation):
             restored('exec', '-T', 'postgres', 'psql', '-U', 'paperclip', '-d', 'paperclip',
                      '-c', "UPDATE wp3_sentinel SET value='restored-candidate';")
             raise restored_control.r.RecoveryError('Injected restored candidate health failure')
-        if 'recover-locked' in args:
+        if 'recover-locked' in args and '--help' not in args:
             previous_control = load(rollback_kit)
             with patch.object(previous_control, 'STATE', root / 'restored-state'):
                 previous_control.recover_point(Path(args[args.index('--point') + 1]),
@@ -369,3 +369,55 @@ def test_recovery_barrier_resumes_exact_inventory_and_preserves_new_writes(insta
         c.recover_point(point, compose)
     assert sentinel(compose) == 'acknowledged-after-barrier'
     assert set(compose('ps', '--services', '--status', 'running').split()) == {'paperclip', 'postgres'}
+
+
+def test_recovery_starts_previous_build_after_candidate_retags_its_image():
+    # Cheap distinct builds exercise the same image naming and startup retry
+    # as Hermes, without a provider call or a second upstream Hermes download.
+    with tempfile.TemporaryDirectory(prefix='sf-build-recovery-', dir='/root') as directory:
+        root = Path(directory)
+        c = load(SOURCE)
+        base = yaml.safe_load((SOURCE / 'compose.yaml').read_text())['services']['postgres']['image']
+        build_id = secrets.token_hex(16)
+        models = []
+        for generation in ('previous', 'candidate'):
+            kit = root / generation
+            (kit / '.secrets').mkdir(parents=True, mode=0o700)
+            (kit / '.secrets/compose.env').write_text('COMPOSE_PROFILES=hermes\n')
+            (kit / 'Dockerfile.hermes').write_text(
+                'FROM ' + base + '\nLABEL test-run=' + build_id + '\nRUN echo ' + generation + ' > /generation\n')
+            (kit / 'compose.yaml').write_text(yaml.safe_dump({
+                'services': {'hermes': {
+                    'image': 'software-factory-hermes:${KIT_IMAGE_TAG:-local}',
+                    'build': {'context': '.', 'dockerfile': 'Dockerfile.hermes'},
+                    'entrypoint': ['/bin/sleep', 'infinity'],
+                    'healthcheck': {'test': ['CMD', '/bin/true'], 'interval': '1s'},
+                    'volumes': ['hermes:/opt/data'],
+                }}, 'volumes': {'hermes': {}},
+            }))
+            models.append(c.r.Compose(kit, 'sf-e2e-build-recovery'))
+        old, candidate = models
+        try:
+            # Model an older upgrader which did not set the derived image tag.
+            run('docker', 'compose', '--project-name', old.name, '--env-file', '.secrets/compose.env',
+                'up', '-d', '--build', '--wait', cwd=old.kit,
+                env={key: value for key, value in os.environ.items() if key != 'KIT_IMAGE_TAG'})
+            previous_image = run('docker', 'inspect', '--format', '{{.Image}}', old.container('hermes'))
+            reference = 'software-factory-hermes:' + old.image_tag
+            assert not run('docker', 'image', 'ls', '--quiet', '--filter', 'reference=' + reference)
+            old.preserve_build_images()
+            assert run('docker', 'image', 'inspect', '--format', '{{.Id}}', reference) == previous_image
+            candidate('up', '-d', '--build', '--wait')
+            candidate_image = run('docker', 'inspect', '--format', '{{.Image}}', candidate.container('hermes'))
+            assert previous_image != candidate_image
+            c.fence_project(candidate)
+            point = root / 'unavailable-archives'
+            with patch.object(c, 'STATE', root / 'state'):
+                c.journal('restored-services-started', previous_sha='a' * 40, candidate_sha='b' * 40,
+                          rollback_point=str(point), run_id='build-retry', operation_id=secrets.token_hex(32),
+                          previous_running=['hermes'])
+                c.recover_point(point, old)
+            assert run('docker', 'inspect', '--format', '{{.Image}}', old.container('hermes')) == previous_image
+            assert old('exec', '-T', 'hermes', 'cat', '/generation').strip() == 'previous'
+        finally:
+            old('down', '--volumes', '--remove-orphans')

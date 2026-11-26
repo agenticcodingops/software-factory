@@ -88,13 +88,13 @@ writer startup whenever an archive could still be replayed. A retried barrier is
 | --- | --- |
 | `creating-rollback-point` | The previous inventory and operation identity are durable before stopping writers. Death before/after stop, dump, database stop or archive writes leaves either an incomplete point or a complete, hashed manifest. Without a manifest recovery records `preparation-restarting` before startup. With a manifest it validates the run and physical resources before restore. |
 | `preparation-restarting` | Archive replay is forbidden even if an old manifest reappears. Death before/after startup or its health wait retries only the recorded inventory; successful startup records `prepare-failed`. Cleanup errors alert separately from restart errors. |
-| `installing` | The point is durable before checkout, pull, candidate startup, candidate health and symlink activation. Any interruption can restore it after checking its operation identity, hashes, kit pins and every physical volume generation. |
+| `installing` | The previous checkout's `recover-locked` capability is verified before capture; pre-WP3 kits are refused (see the kit README's clean-install migration). The point is durable before candidate checkout, pull, startup, health and symlink activation. Any interruption can restore it after checking its operation identity, hashes, kit pins and every physical volume generation. Backups refuse this and every unresolved upgrade phase. |
 | `healthy-awaiting-handoff` | Candidate writers may be active. Explicit rollback fences every project container, including candidate-only writers, before restoring the retained point. This phase continues to block another upgrade. |
 | `rollback-failed` | Any partial fence, wipe, extraction or database restore is retried while application writers remain absent. A failure after the writer barrier cannot replace that barrier with this replayable phase. |
 | `restored-services-started` | Volume files are flushed and database restore checkpointed before this durable no-replay barrier. Death before/after service startup, health checks or the parent's completion write retries startup and health only. No archive is opened and acknowledged writes survive. |
 | `rolled-back`, `prepare-failed`, `complete` | Upgrade recovery refuses replay. A new upgrade must use a new retained-point path and operation identity. |
 | Backup `service-op: running` | Intent includes exact container IDs before stopping writers. Death before/after stop, dump, plaintext cleanup or restart leaves a safe restart path. After a successful restart this journal is complete before encryption/upload. Pre-stop/final backups keep it pending until successful publication and final stop, or successful failure-path restart. |
-| Restore `service-op: running` | Intent and the unique generation label are installed before Compose creates containers. Death before/after create, extraction, import or startup is recovered by fencing only this generation. Archives are never replayed by `sfctl recover`. |
+| Restore `service-op: running` | Intent and the unique generation label are installed before Compose creates containers. Death before/after create, extraction, import or startup is recovered by fencing only this generation. A completion-write failure also fences the project; the retained running record follows the same abandon-only recovery, including when no containers remain. Archives are never replayed by `sfctl recover`. |
 | `service-op: complete` | No pending service action remains. Death during final bookkeeping cannot cause snapshot replay. The separate `last-op` backup/restore running/failed/complete record is informational. |
 
 A failed snapshot publication must be durably invalidated before that invocation
@@ -109,6 +109,8 @@ container HTTPS URL, canonical UUID-shaped delegation IDs, a 32-byte Base64
 signature, `sr=c`, `sp=cw`, `spr=https`, `sks=b`, and the qualified API versions.
 `st` remains optional; supplied start times must already be active. Expiry and
 key lifetime are checked together using timezone-aware UTC calendar values.
+The SAS signed interval `se - st` is at most seven days, or `se - now` when
+`st` is absent.
 The validator rejects unsupported query constraints instead of silently ignoring
 fields that could make a replacement unusable. This is local validation, not a
 proof of provider-side authorization; the existing canary remains the live test.

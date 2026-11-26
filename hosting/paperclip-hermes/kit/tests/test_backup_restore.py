@@ -792,7 +792,7 @@ class RestoreFlowTests(unittest.TestCase):
               'images': {s: {} for s in ('postgres', *recovery.SERVICES)},
               'image_pins': ['fixture-pin'], 'paperclip_schema': {'applied': [{'id': 1}]}}
 
-    def restore(self, fail_at=None, purge_error=False, import_error=None):
+    def restore(self, fail_at=None, purge_error=False, import_error=None, completion_error=False):
         # Drive restore() with Docker, age and the kit checks stubbed; fail_at
         # names the Compose command that fails, import_error the error the
         # Hermes import raises. Returns what cleanup saw.
@@ -819,6 +819,7 @@ class RestoreFlowTests(unittest.TestCase):
                 raise recovery.RecoveryError(fail_at + ' failed')
             return ''
         compose = MagicMock(side_effect=compose_call)
+        compose.kit, compose.name = target, 'fixture'
         compose.services.return_value = ['postgres', *recovery.SERVICES]
         compose.mount.return_value = volume
         events = seen['events'] = []
@@ -833,7 +834,13 @@ class RestoreFlowTests(unittest.TestCase):
             purge(stage, keep)
             raise OSError('purge failed')
         args = SimpleNamespace(fenced=True, identity=root / 'identity', archive=root / 'backup.age',
-                               target=target, project='fixture', hostname=None, work_dir=work)
+                               target=target, project='fixture', hostname=None, work_dir=work,
+                               command='restore', _track_service_operation=completion_error)
+        atomic_json = recovery.atomic_json
+        def write_journal(path, record):
+            if completion_error and path.name == 'service-op.json' and record['phase'] == 'complete':
+                raise OSError('completion write failed')
+            return atomic_json(path, record)
         output = io.StringIO()
         with patch.object(recovery, 'private_file'), patch.object(recovery, 'run', side_effect=run), \
              patch.object(recovery, 'restore_target', return_value=target), \
@@ -849,6 +856,8 @@ class RestoreFlowTests(unittest.TestCase):
              patch.object(recovery, 'purge', side_effect=failing_purge if purge_error else purge), \
              patch.object(recovery.os, 'chown', create=True), \
              patch.object(recovery.signal, 'signal'), \
+             patch.object(recovery, 'STATE_DIR', root / 'state'), \
+             patch.object(recovery, 'atomic_json', side_effect=write_journal), \
              contextlib.redirect_stdout(output):
             try:
                 recovery.restore(args)
@@ -859,6 +868,7 @@ class RestoreFlowTests(unittest.TestCase):
                     volume=volume,
                     target=sorted(path.name for path in target.iterdir()), work=list(work.iterdir()))
         seen['settings'] = (target / '.secrets/compose.env').read_text() if seen['target'] else None
+        seen['journal'] = json.loads((root / 'state/service-op.json').read_text()) if completion_error else None
         return seen
 
     def test_success_turns_messaging_off_and_prints_the_checked_recovery_point(self):
@@ -881,6 +891,18 @@ class RestoreFlowTests(unittest.TestCase):
         self.assertEqual(len(seeds), 1)
         self.assertEqual(seeds[0][1:8], ('--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', 'hermes', '-ec'))
         self.assertEqual(seeds[0][-1], '. /kit/hermes-secrets.sh; exec ' + recovery.PYTHON + ' /kit/configure-hermes.py')
+
+    def test_completion_write_failure_fences_after_successful_startup(self):
+        seen = self.restore(completion_error=True)
+        self.assertEqual(str(seen['error']), 'completion write failed')
+        self.assertIn(('up', '-d', '--wait', '--wait-timeout', '300'),
+                      [call.args for call in seen['compose']])
+        self.assertEqual(seen['abandoned'], 1)
+        self.assertEqual([event[0] for event in seen['events']],
+                         ['remove import undo', 'remove containers', 'abandon', 'remove import undo'])
+        self.assertNotIn('Restore complete', seen['output'])
+        self.assertEqual(seen['work'], [])
+        self.assertEqual(seen['journal']['phase'], 'running')
 
     def test_failed_database_restore_never_starts_applications(self):
         seen = self.restore(fail_at='exec')
@@ -1144,8 +1166,9 @@ class RestoreGuardTests(unittest.TestCase):
             if args[:3] == ['docker', 'container', 'ls']:
                 return 'oneoff-import\nservice-hermes\n'
             return ''
+        compose = recovery.Compose(Path('/kit'), 'fixture')
         with patch.object(recovery, 'run', side_effect=run):
-            recovery.abandon(recovery.Compose(Path('/kit'), 'fixture'))
+            recovery.abandon(compose)
         self.assertEqual(commands[0], ['docker', 'container', 'ls', '--all', '--quiet', '--filter',
                                        'label=com.docker.compose.project=fixture'])
         self.assertEqual(commands[1], ['docker', 'rm', '--force', '--volumes', 'oneoff-import', 'service-hermes'])
@@ -1167,8 +1190,9 @@ class RestoreGuardTests(unittest.TestCase):
 
 class ComposeTests(unittest.TestCase):
     def test_every_compose_operation_uses_private_env_file(self):
+        compose = recovery.Compose(Path('/kit'), 'fixture')
         with patch.object(recovery, 'run', return_value='') as command:
-            recovery.Compose(Path('/kit'), 'fixture')('ps')
+            compose('ps')
         args = command.call_args.args[0]
         self.assertEqual(args[args.index('--env-file') + 1], '.secrets/compose.env')
         self.assertEqual(args[args.index('--project-name') + 1], 'fixture')
@@ -1190,12 +1214,13 @@ class ComposeTests(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_one_off_removal_filters_by_project_and_one_off_label(self):
+        compose = recovery.Compose(Path('/kit'), 'fixture')
         commands = []
         def run(args, **kwargs):
             commands.append(list(args))
             return 'oneoff-backup\n' if args[1] == 'container' else ''
         with patch.object(recovery, 'run', side_effect=run):
-            recovery.Compose(Path('/kit'), 'fixture').remove_containers(one_off_only=True)
+            compose.remove_containers(one_off_only=True)
         self.assertEqual(commands, [
             ['docker', 'container', 'ls', '--all', '--quiet',
              '--filter', 'label=com.docker.compose.project=fixture',
@@ -1203,7 +1228,7 @@ class ComposeTests(unittest.TestCase):
             ['docker', 'rm', '--force', '--volumes', 'oneoff-backup']])
         commands.clear()
         with patch.object(recovery, 'run', return_value='') as command:
-            recovery.Compose(Path('/kit'), 'fixture').remove_containers()
+            compose.remove_containers()
         self.assertEqual(command.call_count, 1)  # nothing to remove: no docker rm
 
     def test_kit_modified_looks_only_at_the_kit(self):
@@ -1217,8 +1242,9 @@ class ComposeTests(unittest.TestCase):
             self.assertTrue(recovery.kit_modified())
 
     def test_hermes_cli_bypasses_s6_and_uses_private_helper(self):
+        compose = recovery.Compose(Path('/kit'), 'fixture')
         with patch.object(recovery, 'run', return_value='') as command:
-            recovery.Compose(Path('/kit'), 'fixture').hermes(Path('/stage'), 'import',
+            compose.hermes(Path('/stage'), 'import',
                 '/recovery/hermes.zip', '--force', '--keep-host', '--messaging-off')
         args = command.call_args.args[0]
         self.assertIn('/kit/recovery-hermes.py', args)

@@ -81,6 +81,7 @@ services:
       start_period: 30s
 
   hermes:
+    image: software-factory-hermes:${KIT_IMAGE_TAG:-local}
     profiles: [hermes]
     <<: *runtime
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, KILL]
@@ -142,6 +143,7 @@ services:
   # An SSH execution sandbox, deliberately without the Hermes home, provider
   # environment, host directories or Docker socket. Only fixture Git access.
   sandbox:
+    image: software-factory-sandbox:${KIT_IMAGE_TAG:-local}
     profiles: [hermes]
     <<: *runtime
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SYS_CHROOT]

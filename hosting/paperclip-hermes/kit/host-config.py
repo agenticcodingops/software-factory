@@ -37,7 +37,7 @@ def validate_env():
     ]
     allowed = set(secrets) | {'OPENAI_API_KEY', 'TAILSCALE_HOSTNAME',
         'FIXTURE_REPOSITORY', 'HERMES_MODEL', 'DASHBOARD_SUBNET', 'DASHBOARD_GATEWAY',
-        'KIT_MESSAGING_OFF', 'COMPOSE_PROFILES'}
+        'KIT_MESSAGING_OFF', 'KIT_IMAGE_TAG', 'COMPOSE_PROFILES'}
     values = {}
     for line in ENV_FILE.read_text().splitlines():
         line = line.strip()
@@ -53,6 +53,8 @@ def validate_env():
         if re.search(r'''[\s'"\\$#]''', value):
             fail(f'{name}: use a literal value without whitespace or quotes')
         values[name] = value
+    if 'KIT_IMAGE_TAG' in values and not re.fullmatch(r'[a-f0-9]{64}', values['KIT_IMAGE_TAG']):
+        fail('KIT_IMAGE_TAG: require the generated kit image fingerprint')
     for name in secrets:
         secret_path = Path('.secrets') / name.lower().replace('_', '-')
         if name == 'HERMES_GATEWAY_KEY':

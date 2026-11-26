@@ -156,6 +156,9 @@ class Stack:
     def services(self):
         return self.installed
 
+    def preserve_build_images(self):
+        pass  # This stack models volumes and service state, without Docker images.
+
     def __call__(self, *args, **kwargs):
         self.calls.append(args)
         if args[0] == 'start' and '--wait' in args:
@@ -234,10 +237,10 @@ def test_upgrade_dump_failure_never_installs_candidate(tmp_path):
     stack.fail_dump = True
     with patch.object(c.r, 'Compose', return_value=stack), patch.object(c, 'STATE', tmp_path/'status'), \
          patch.object(c, 'required_space', return_value=0), patch.object(c.r, 'kit_commit', return_value='a'*40), \
-         patch.object(c, 'checkout') as checkout, patch.object(c, 'ROLLBACK_ROOT', tmp_path/'points'), \
+         patch.object(c, 'checkout', return_value=KIT) as checkout, patch.object(c, 'ROLLBACK_ROOT', tmp_path/'points'), \
          pytest.raises(r.RecoveryError, match='dump failed'):
         c.upgrade('b'*40, 'run-1', 0)
-    checkout.assert_not_called()
+    checkout.assert_called_once_with('a' * 40)
     assert stack.running == set(stack.installed)
 
 
@@ -372,7 +375,7 @@ def test_upgrade_failed_health_restores_previous_code_and_data(tmp_path, restore
     previous='a'*40
     candidate_sha='b'*40
     candidate=tmp_path/'candidate';candidate.mkdir()
-    old=tmp_path/'old';(old/'.secrets').mkdir(mode=0o700, parents=True)
+    old=tmp_path/'old'; shutil.copytree(KIT, old); (old/'.secrets').mkdir(mode=0o700)
     install=tmp_path/'install';install.mkdir()
     events=[]
     original=r.run
@@ -383,7 +386,7 @@ def test_upgrade_failed_health_restores_previous_code_and_data(tmp_path, restore
             for volume in stack.volumes.values():
                 (volume/'state').write_text('candidate schema')
             raise r.RecoveryError('health failed')
-        if 'recover-locked' in args:
+        if 'recover-locked' in args and '--help' not in args:
             assert (install/'current').resolve()==old
             events.append('previous-activated-before-restore')
             c.recover_point(Path(args[args.index('--point')+1]), stack)
@@ -550,7 +553,7 @@ def test_health_checks_tls_authenticated_endpoint_and_drop_counters(tmp_path,cap
     compose.services.return_value=['postgres','paperclip','hermes','sandbox','caddy']
     def command(*args):
         if args[0]=='ps':
-            return json.dumps([dict(Health='healthy') for _ in range(5)])
+            return json.dumps([dict(Service=service, Health='healthy') for service in compose.services()])
         if args[2]=='caddy':
             assert args[3] == 'curl'
             assert args[args.index('--cacert')+1] == '/public-ca/root.crt'
@@ -674,7 +677,7 @@ def test_hermes_health_uses_verified_curl_status(tmp_path, capsys, tls_status):
     compose.services.return_value = ['hermes', 'sandbox', 'caddy']
     def call(*args):
         if args[0] == 'ps':
-            return json.dumps([{'Health': 'healthy'}] * 3)
+            return json.dumps([{'Service': service, 'Health': 'healthy'} for service in compose.services()])
         assert args[:4] == ('exec', '-T', 'caddy', 'curl')
         assert args[args.index('--cacert') + 1] == '/public-ca/root.crt'
         assert args[-1] == 'https://caddy/health/detailed'
@@ -956,6 +959,7 @@ def test_interrupted_preparation_recovers_inventory_or_complete_point(tmp_path, 
 
     with patch.object(c, 'STATE', state), patch.object(c, 'ROLLBACK_ROOT', tmp_path / 'points'), \
          patch.object(r, 'Compose', return_value=stack), patch.object(c, 'required_space', return_value=0), \
+         patch.object(c, 'checkout', return_value=KIT), \
          patch.object(r, 'kit_commit', return_value='a' * 40), patch.object(r, 'private_stat'), \
          patch.object(r, 'private_directory'):
         def crash():
@@ -1005,7 +1009,7 @@ def test_upgrade_preserves_writer_barrier_when_recovery_completion_fails(tmp_pat
     def execute(args, **kwargs):
         if args[0] == 'bash':
             raise r.RecoveryError('candidate failed')
-        if 'recover-locked' in args:
+        if 'recover-locked' in args and '--help' not in args:
             c.recover_point(Path(args[args.index('--point') + 1]), stack)
             for volume in stack.volumes.values():
                 (volume / 'state').write_text('acknowledged write')
@@ -1068,8 +1072,10 @@ def test_invalid_sas_never_replaces_working_credential(tmp_path, change):
     with patch.object(sys, 'argv', ['sfctl', 'set-backup-credential']), \
          patch.object(r, 'locked', __import__('contextlib').nullcontext), patch.object(r.signal, 'signal'), \
          patch.object(c, 'HOST', host), patch.object(c, 'decrypt_input', return_value=replacement), \
-         pytest.raises(r.RecoveryError):
+         patch.object(r, 'run', return_value='') as age, \
+         pytest.raises(r.RecoveryError, match='container SAS'):
         c.main()
+    age.assert_not_called()
     assert (host / 'backup.env').read_text() == original
 
 
@@ -1192,7 +1198,7 @@ def test_volume_resolution_uses_recorded_name_and_generation(tmp_path, recreated
 def test_health_checks_exact_routes_for_selected_profiles(tmp_path, capsys, selected, broken):
     compose = MagicMock()
     compose.services.return_value = selected
-    compose.side_effect = lambda *args: json.dumps([{'Health': 'healthy'}] * len(selected)) if args[0] == 'ps' else ('401' if args[2] == 'caddy' else '')
+    compose.side_effect = lambda *args: json.dumps([{'Service': service, 'Health': 'healthy'} for service in selected]) if args[0] == 'ps' else ('401' if args[2] == 'caddy' else '')
     daemon = tmp_path / 'daemon.json'; daemon.write_text('{"ipv6":false}')
     config = {'TCP': {}, 'Web': {}}
     for service, port, target in [('paperclip', '443', '3100'), ('hermes', '9443', '9119')]:
@@ -1297,21 +1303,29 @@ def test_restore_flushes_volumes_before_database_and_barrier(tmp_path):
     stack = Stack(tmp_path)
     fields = dict(previous_sha=r.kit_commit(), candidate_sha='b' * 40, run_id='run', operation_id='c' * 64,
                   previous_running=stack.installed, rollback_point=str(tmp_path / 'point'))
-    original = r.run
+    original_run, original_compose = r.run, Stack.__call__
     events = []
     def run(args, **kwargs):
-        events.append(args)
-        return original(args, **kwargs)
+        if args[:2] == ['sync', '-f']:
+            events.append('sync -f')
+        return original_run(args, **kwargs)
+    def compose(self, *args, **kwargs):
+        for command in ('pg_restore', 'CHECKPOINT'):
+            if command in args:
+                events.append(command)
+        return original_compose(self, *args, **kwargs)
     def barrier(phase, **kwargs):
         assert phase == 'restored-services-started'
-        assert len([args for args in events if args[:2] == ['sync', '-f']]) == len(stack.volumes)
-        assert any('CHECKPOINT' in args for args in stack.calls)
+        events.append('barrier')
+        assert events == ['sync -f'] * len(stack.volumes) + ['pg_restore', 'CHECKPOINT', 'barrier']
         assert not set(r.SERVICES) & stack.running
     with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), \
          patch.object(c, 'fence_project', side_effect=stack.fence):
         c.rollback_point('create', tmp_path / 'point', stack, operation=fields)
-        with patch.object(r, 'run', side_effect=run), patch.object(c, 'journal', side_effect=barrier):
+        with patch.object(r, 'run', side_effect=run), patch.object(Stack, '__call__', compose), \
+             patch.object(c, 'journal', side_effect=barrier) as journal:
             c.rollback_point('restore', tmp_path / 'point', stack, operation=fields)
+        journal.assert_called_once()
 
 
 @pytest.mark.parametrize('bad', [{'previous_running': ['--privileged']}, {'operation_id': ''},
@@ -1412,7 +1426,7 @@ def test_partial_recovery_health_does_not_probe_stopped_caddy(tmp_path, capsys):
     stack.services.return_value = ['paperclip', 'postgres', 'caddy']
     def compose(*args):
         if args[0] == 'ps':
-            return json.dumps([{'Health': 'healthy'}] * 2)
+            return json.dumps([{'Service': service, 'Health': 'healthy'} for service in ['postgres', 'paperclip']])
         assert args[:4] == ('exec', '-T', 'paperclip', 'node')
         assert '127.0.0.1:3100' in args[-1]
         return ''
@@ -1427,7 +1441,7 @@ def test_partial_recovery_health_does_not_probe_stopped_caddy(tmp_path, capsys):
 def test_malformed_serve_status_still_returns_bounded_health_json(tmp_path, capsys, serve):
     compose = MagicMock()
     compose.services.return_value = ['paperclip']
-    compose.side_effect = lambda *args: '[{"Health":"healthy"}]' if args[0] == 'ps' else ''
+    compose.side_effect = lambda *args: '[{"Service":"paperclip","Health":"healthy"}]' if args[0] == 'ps' else ''
     with patch.object(r, 'Compose', return_value=compose), patch.object(c, 'probe', return_value=serve), \
          patch.object(c, 'settings', return_value={'TAILSCALE_HOSTNAME': 'fixture'}), \
          patch.object(r, 'schema_state', return_value={'applied': [1]}):
@@ -1505,12 +1519,13 @@ def test_documented_compose_minimum_supports_gateway_priority():
 
 
 def test_persistent_container_lookup_excludes_abandoned_oneoffs():
+    compose = r.Compose(Path('/kit'), 'fixture')
     def docker(args, **kwargs):
         assert 'label=com.docker.compose.project=fixture' in args
         assert 'label=com.docker.compose.service=hermes' in args
         return 'original\n' if 'label=com.docker.compose.oneoff=False' in args else 'original\noneoff\n'
     with patch.object(r, 'run', side_effect=docker):
-        assert r.Compose(Path('/kit'), 'fixture').container('hermes') == 'original'
+        assert compose.container('hermes') == 'original'
 
 
 def test_database_started_for_restore_does_not_escape_recorded_inventory(tmp_path):
@@ -1647,3 +1662,227 @@ def test_snapshot_bound_secrets_cannot_rotate_during_recovery(tmp_path, name, ph
              pytest.raises(r.RecoveryError, match='Recover the interrupted upgrade'):
             c.secret_set(name, True)
         assert (tmp_path / '.secrets' / name).read_bytes() == original
+
+
+@pytest.mark.parametrize('legacy', ['missing', 'no-command', 'broken-import'])
+def test_upgrade_refuses_previous_without_locked_recovery_before_capture(tmp_path, legacy):
+    previous = tmp_path / 'previous'
+    previous.mkdir()
+    if legacy == 'no-command':
+        (previous / 'kit-control.py').write_text(
+            "import argparse\np = argparse.ArgumentParser()\np.add_subparsers().add_parser('status')\np.parse_args()\n")
+    elif legacy == 'broken-import':
+        (previous / 'kit-control.py').write_text('import missing_legacy_dependency\n')
+    stack = Stack(tmp_path)
+    with patch.object(r, 'Compose', return_value=stack), patch.object(r, 'kit_commit', return_value='a' * 40), \
+         patch.object(c, 'required_space', return_value=0), patch.object(c, 'checkout', return_value=previous), \
+         patch.object(c, 'ROLLBACK_ROOT', tmp_path / 'points'), patch.object(c, 'rollback_point') as capture, \
+         pytest.raises(r.RecoveryError, match='Previous kit cannot run recover-locked; pre-WP3.*migration'):
+        c.upgrade('b' * 40, 'first-wp3', 0)
+    capture.assert_not_called()
+    assert not stack.calls
+    assert not (c.STATE / 'last-op.json').exists()
+
+
+def test_current_kit_can_run_locked_recovery_help():
+    c.require_recovery_support(KIT)
+
+
+def test_backup_retry_runbook_resolves_pending_operation_before_restart():
+    text = (KIT / 'README.md').read_text()
+    retry = text[text.index('To re-run a failed backup,'):text.index('The host-level')]
+    assert retry.index('sfctl status') < retry.index('sfctl recover') < retry.index('systemctl start')
+    assert 'no pending\noperation, retry directly' in retry
+
+
+@pytest.mark.parametrize('start,expiry,accepted', [
+    (-2, 6, False), (-1, 6, True), (None, 6, True), (None, 8, False),
+])
+def test_sas_signed_lifetime_is_at_most_seven_days(start, expiry, accepted):
+    now = datetime(2026, 11, 26, tzinfo=timezone.utc)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+    url = delegation(st=None if start is None else (now + timedelta(days=start)).isoformat(),
+                     se=(now + timedelta(days=expiry)).isoformat(),
+                     skt=(now - timedelta(hours=1)).isoformat(),
+                     ske=(now + timedelta(days=6, hours=1)).isoformat())
+    with patch.object(r, 'datetime', Clock):
+        if accepted:
+            assert r.sas_url(url)
+        else:
+            with pytest.raises(r.RecoveryError, match='at most 7 days'):
+                r.sas_url(url)
+
+
+@pytest.mark.parametrize('phase', c.RECOVERY_PHASES)
+def test_backup_refuses_unresolved_upgrade_before_capture_and_preserves_journal(tmp_path, phase):
+    c.journal(phase, previous_sha='a' * 40, candidate_sha='b' * 40)
+    before = (c.STATE / 'last-op.json').read_bytes()
+    with patch.object(r.signal, 'signal'), patch.object(r, 'data_backup') as capture, \
+         patch.object(r, 'Compose') as compose:
+        with pytest.raises(r.RecoveryError, match='unresolved upgrade'):
+            r.main(['backup'])
+        with pytest.raises(r.RecoveryError, match='unresolved upgrade'):
+            r.backup(SimpleNamespace())
+    capture.assert_not_called()
+    compose.assert_not_called()
+    assert (c.STATE / 'last-op.json').read_bytes() == before
+    assert not (c.STATE / 'service-op.json').exists()
+
+
+@pytest.mark.parametrize('phase', c.RESOLVED_PHASES)
+def test_backup_accepts_resolved_upgrade(phase):
+    c.journal(phase)
+    with patch.object(r, 'data_backup', return_value='captured'):
+        assert r.backup(SimpleNamespace()) == 'captured'
+
+
+@pytest.mark.parametrize('rows,healthy', [
+    (['hermes', 'sandbox', 'caddy'], True),
+    (['hermes', 'orphan', 'caddy'], False),
+    (['hermes', 'hermes', 'caddy'], False),
+    (['hermes', 'sandbox', 'caddy', 'orphan'], False),
+    (['hermes', 'caddy'], False),
+])
+def test_health_requires_exact_service_inventory(tmp_path, capsys, rows, healthy):
+    compose = MagicMock()
+    compose.services.return_value = ['hermes', 'sandbox', 'caddy']
+    compose.side_effect = lambda *args: json.dumps(
+        [{'Service': name, 'Health': 'healthy'} for name in rows]) if args[0] == 'ps' else '401'
+    with patch.object(r, 'Compose', return_value=compose), patch.object(c, 'probe', return_value=None):
+        c.health()
+    assert json.loads(capsys.readouterr().out)['checks']['compose'] is healthy
+
+
+@pytest.mark.parametrize('rows', [[], [{'Service': 'orphan', 'Health': 'healthy'}]])
+def test_empty_recovery_inventory_checks_only_that_project_is_stopped(capsys, rows):
+    compose = MagicMock(return_value=json.dumps(rows))
+    compose.services.return_value = []
+    with patch.object(r, 'Compose', return_value=compose), patch.object(c, 'probe') as probe:
+        assert c.health([]) is (not rows)
+        probe.assert_not_called()
+        assert compose.call_count == 1
+    assert json.loads(capsys.readouterr().out)['healthy'] is (not rows)
+    with patch.object(r, 'Compose', return_value=compose), patch.object(c, 'probe', return_value=None):
+        assert not c.health()  # Ordinary health remains strict even with an empty model.
+
+
+def test_stopped_hermes_rollback_completes_and_unblocks_upgrade(tmp_path, capsys):
+    stack = Stack(tmp_path, paperclip=False)
+    stack.running.clear()
+    point = tmp_path / 'point'
+    fields = dict(previous_sha='a' * 40, candidate_sha='b' * 40, run_id='stopped', operation_id='c' * 64,
+                  previous_running=[], rollback_point=str(point))
+    with patch.object(r, 'kit_commit', return_value='a' * 40), \
+         patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), \
+         patch.object(c, 'fence_project', side_effect=stack.fence):
+        c.rollback_point('create', point, stack, operation=fields)
+        c.journal('installing', **fields)
+        # Stack.ps emits an empty string when stopped, as Compose does.
+        with r.locked() as fd, patch.object(sys, 'argv', [
+                'sfctl', 'recover-locked', '--point', str(point), '--lock-fd', str(fd)]), \
+             patch.object(r.signal, 'signal'), patch.object(r, 'Compose', return_value=stack):
+            assert c.main() == 0
+    assert json.loads((c.STATE / 'last-op.json').read_text())['phase'] == 'rolled-back'
+    assert not stack.running
+    assert not any(args[0] == 'up' for args in stack.calls)
+    r.require_resolved_upgrade()
+
+
+def test_kit_build_images_are_distinct_and_recovery_uses_previous_tag(tmp_path, monkeypatch):
+    previous, candidate = tmp_path / 'previous', tmp_path / 'candidate'
+    for kit in (previous, candidate):
+        shutil.copytree(KIT, kit)
+        (kit / '.secrets').mkdir(mode=0o700)
+        c.atomic_secret(kit / '.secrets/compose.env', b'COMPOSE_PROFILES=hermes\nKIT_IMAGE_TAG=stale\n')
+    with (candidate / 'Dockerfile.hermes').open('a') as stream:
+        stream.write('\nLABEL candidate=true\n')
+    monkeypatch.setenv('KIT_IMAGE_TAG', 'inherited-candidate')
+    old, new = r.Compose(previous, 'fixture'), r.Compose(candidate, 'fixture')
+    assert old.image_tag != new.image_tag
+    old_model, new_model = [json.loads(compose('config', '--format', 'json')) for compose in (old, new)]
+    for service in ('hermes', 'sandbox'):
+        assert old_model['services'][service]['image'] == 'software-factory-' + service + ':' + old.image_tag
+        assert new_model['services'][service]['image'] != old_model['services'][service]['image']
+    c.journal('restored-services-started', previous_sha='a' * 40, candidate_sha='b' * 40,
+              run_id='run', operation_id='c' * 64, previous_running=['hermes'],
+              rollback_point=str(tmp_path / 'missing'))
+    with patch.object(r, 'run', return_value='') as execute, patch.object(c, 'rollback_point') as replay:
+        c.recover_point(tmp_path / 'missing', old)
+    replay.assert_not_called()
+    command = execute.call_args.args[0]
+    assert '--no-build' in command and command[-1] == 'hermes'
+    assert execute.call_args.kwargs['env']['KIT_IMAGE_TAG'] == old.image_tag
+
+
+def test_restore_completion_failure_running_record_recovers_with_no_containers(tmp_path, capsys):
+    # A failed completion write leaves running intent after the fencing handler.
+    r.atomic_json(c.STATE / 'service-op.json', {
+        'protocol': 1, 'operation': 'restore', 'phase': 'running', 'run_id': 'c' * 32,
+        'kit_commit': r.kit_commit(), 'project': 'fixture', 'stage': None,
+    })
+    commit = r.kit_commit()
+    with patch.object(r, 'run', return_value='') as execute, patch.object(r, 'restart_services') as restart, \
+         patch.object(r, 'kit_commit', return_value=commit):
+        assert c.recover_service_operation()
+        assert not c.recover_service_operation()
+    assert execute.call_count == 1  # Only list the generation: it is already fenced.
+    restart.assert_not_called()
+    assert json.loads((c.STATE / 'service-op.json').read_text())['phase'] == 'complete'
+    assert 'Interrupted restore fenced' in capsys.readouterr().out
+
+
+def test_identical_code_from_distinct_kit_commits_has_distinct_image_tags(tmp_path):
+    previous, restored = tmp_path / 'previous', tmp_path / 'restored'
+    previous.mkdir()
+    (previous / 'compose.yaml').write_text('services: {}\n')
+    files = {name: r.digest(path) for name, path in r.kit_files(previous, r.CODE).items()}
+    r.atomic_json(previous / '.kit-provenance.json', {'kit_commit': 'a' * 40, 'files': files})
+    shutil.copytree(previous, restored)
+    assert r.kit_image_tag(previous) == r.kit_image_tag(restored)
+    r.atomic_json(restored / '.kit-provenance.json', {'kit_commit': 'b' * 40, 'files': files})
+    assert r.kit_image_tag(previous) != r.kit_image_tag(restored)
+
+
+def test_previous_builds_are_tagged_from_actual_container_images_even_when_stopped():
+    compose = r.Compose(KIT, 'fixture')
+    def docker(args, **kwargs):
+        if args[:2] == ['docker', 'inspect']:
+            return 'sha256:' + ('a' if args[-1] == 'hermes-container' else 'b') * 64
+        return ''
+    with patch.object(compose, 'services', return_value=['hermes', 'sandbox', 'caddy']), \
+         patch.object(compose, 'container', side_effect=lambda name: name + '-container'), \
+         patch.object(r, 'run', side_effect=docker) as execute:
+        compose.preserve_build_images()
+    assert [call.args[0] for call in execute.call_args_list] == [
+        ['docker', 'inspect', '--format', '{{.Image}}', 'hermes-container'],
+        ['docker', 'image', 'tag', 'sha256:' + 'a' * 64, 'software-factory-hermes:' + compose.image_tag],
+        ['docker', 'inspect', '--format', '{{.Image}}', 'sandbox-container'],
+        ['docker', 'image', 'tag', 'sha256:' + 'b' * 64, 'software-factory-sandbox:' + compose.image_tag],
+    ]
+
+
+@pytest.mark.parametrize('tagging_fails', [False, True])
+def test_upgrade_preserves_previous_build_before_snapshot(tmp_path, tagging_fails):
+    stack = Stack(tmp_path, paperclip=False)
+    events = []
+    def preserve():
+        events.append('preserve')
+        assert stack.running == set(stack.installed)
+        if tagging_fails:
+            raise r.RecoveryError('tag failed')
+    def capture(*args, **kwargs):
+        events.append('capture')
+        raise r.RecoveryError('capture reached')
+    with patch.object(r, 'Compose', return_value=stack), patch.object(r, 'kit_commit', return_value='a' * 40), \
+         patch.object(c, 'required_space', return_value=0), patch.object(c, 'checkout', return_value=KIT), \
+         patch.object(c, 'ROLLBACK_ROOT', tmp_path / 'points'), \
+         patch.object(stack, 'preserve_build_images', side_effect=preserve), \
+         patch.object(c, 'rollback_point', side_effect=capture), \
+         pytest.raises(r.RecoveryError, match='tag failed' if tagging_fails else 'capture reached'):
+        c.upgrade('b' * 40, 'preserve', 0)
+    assert events == (['preserve'] if tagging_fails else ['preserve', 'capture'])
+    assert (c.STATE / 'last-op.json').exists() is (not tagging_fails)
+    assert stack.running == set(stack.installed)

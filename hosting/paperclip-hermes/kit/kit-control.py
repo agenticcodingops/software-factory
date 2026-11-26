@@ -441,6 +441,9 @@ def copy_secrets(source, destination):
                 r.fail('Secrets transfer requires regular files')
             atomic_secret(destination / '.secrets' / path.name, path.read_bytes(),
                           mode=0o644 if path.name.endswith('.pub') else 0o600)
+        values = settings(destination)
+        values['KIT_IMAGE_TAG'] = r.kit_image_tag(destination)
+        atomic_secret(destination / '.secrets/compose.env', ''.join(f'{k}={v}\n' for k, v in values.items()).encode())
 
 
 def activate(kit):
@@ -449,6 +452,16 @@ def activate(kit):
     temporary.symlink_to(kit)
     os.replace(temporary, INSTALL / 'current')
     r.sync_directory(INSTALL)
+
+
+def require_recovery_support(kit):
+    try:
+        help_text = r.run(['python3', kit / 'kit-control.py', 'recover-locked', '--help'], cwd=kit)
+        if '--lock-fd' not in help_text or '--point' not in help_text:
+            r.fail('Locked recovery command is unavailable')
+    except (r.RecoveryError, OSError):
+        r.fail('Previous kit cannot run recover-locked; pre-WP3 upgrades are unsupported. '
+               'Follow the pre-WP3 migration in the kit README before upgrading')
 
 
 def upgrade(sha, run_id, lock_fd):
@@ -475,6 +488,9 @@ def upgrade(sha, run_id, lock_fd):
         r.fail('Previous kit commit is unknown')
     if r.kit_modified() is not False:
         r.fail('Previous kit must match its recorded commit before upgrade')
+    previous_kit = checkout(previous)
+    require_recovery_support(previous_kit)
+    compose.preserve_build_images()
     fields = {'previous_sha': previous, 'candidate_sha': sha, 'rollback_point': str(point), 'run_id': run_id,
               'previous_running': compose('ps', '--services', '--status', 'running').split(),
               'operation_id': secrets.token_hex(32)}
@@ -527,7 +543,17 @@ def health(expected=None):
         rows = compose('ps', '--format', 'json').strip()
         data = json.loads(rows) if rows.startswith('[') else [json.loads(line) for line in rows.splitlines()]
         installed = compose.services() if expected is None else expected
-        checks['compose'] = all(row.get('Health') == 'healthy' for row in data) and len(data) == len(installed)
+        observed = [row.get('Service') for row in data]
+        checks['compose'] = (len(observed) == len(installed)
+                             and len(observed) == len(set(observed))
+                             and set(observed) == set(installed)
+                             and all(row.get('Health') == 'healthy' for row in data)
+                             and (bool(installed) or expected == []))
+        if expected == []:
+            # A stopped recovery inventory has no application routes to probe.
+            result = {'healthy': checks['compose'], 'checks': checks}
+            print(json.dumps(result, separators=(',', ':')))
+            return checks['compose']
         if 'paperclip' in installed:
             health_url = ('fetch("http://127.0.0.1:3100/api/health", {headers: {host: process.env.PAPERCLIP_ALLOWED_HOSTNAMES}})'
                           if expected is not None and 'caddy' not in installed else 'fetch("https://paperclip.caddy/api/health")')
@@ -646,6 +672,7 @@ def join_tailnet(receipt):
 
 def prepare_config():
     values = settings()
+    values['KIT_IMAGE_TAG'] = r.kit_image_tag(KIT)
     profiles = values.setdefault('COMPOSE_PROFILES', 'paperclip,hermes').split(',')
     if not profiles or not set(profiles) <= {'paperclip', 'hermes'}:
         r.fail('Invalid COMPOSE_PROFILES')
