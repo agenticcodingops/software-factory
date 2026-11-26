@@ -188,10 +188,17 @@ def sas_url(value):
         url = urlsplit(value)
         query = parse_qs(url.query, keep_blank_values=True, strict_parsing=True)
         now = datetime.now(timezone.utc)
-        when = lambda name: datetime.fromisoformat(query[name][0].replace('Z', '+00:00'))
-        if (url.scheme != 'https' or not url.hostname or url.username or url.password
+        def when(name):
+            value = query[name][0]
+            if not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?(?:Z|\+00:00)', value):
+                fail('Invalid container SAS timestamp')
+            return datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if (url.scheme != 'https' or not url.hostname
+                or not re.fullmatch(r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', url.hostname)
+                or url.username or url.password
                 or url.port not in (None, 443) or url.fragment
                 or not re.fullmatch(r'/[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', url.path)
+                or '--' in url.path
                 or any(len(values) != 1 for values in query.values())
                 or query.get('sr') != ['c'] or query.get('sp') != ['cw']
                 or any(name in query for name in ('si', 'ss', 'srt'))
@@ -200,8 +207,20 @@ def sas_url(value):
                 or query.get('sks') != ['b'] or query.get('spr') != ['https']
                 or not now < when('ske') <= now + timedelta(days=7)
                 or not now < when('se') <= when('ske')
+                or ('st' in query and when('st') > now)
                 or when('skt') > now or when('ske') - when('skt') > timedelta(days=7)):
             fail('Invalid container SAS settings; require a write-only user-delegation SAS, at most 7 days')
+        for name in ('skoid', 'sktid'):
+            if not re.fullmatch(r'[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}', query[name][0]):
+                fail('Invalid container SAS identity')
+        # Support the version used by the pinned uploader. Unknown service
+        # versions need explicit qualification before replacing a working grant.
+        if any(query[name][0] != '2023-11-03' for name in ('sv', 'skv')):
+            fail('Unsupported container SAS version; require 2023-11-03')
+        if set(query) - {'sv', 'sr', 'sp', 'spr', 'sig', 'skoid', 'sktid', 'skt', 'ske', 'sks', 'skv', 'se', 'st'}:
+            fail('Unsupported container SAS fields')
+        if len(base64.b64decode(query['sig'][0], validate=True)) != 32:
+            fail('Invalid container SAS signature')
         return url
     except (ValueError, TypeError, KeyError, OverflowError):
         raise RecoveryError('Invalid container SAS settings') from None
@@ -315,8 +334,14 @@ def upload(container, archive, name, metadata=None):
 def restart_services(compose, services):
     # Compose 2.38 (the CI runner) has no `start --wait`. Use the loaded
     # project model and health wait without replacing containers or images.
-    compose('up', '-d', '--no-recreate', '--no-build', '--pull', 'never',
-            '--wait', '--wait-timeout', '300', *services)
+    if not services:
+        return
+    try:
+        compose('up', '-d', '--no-recreate', '--no-build', '--pull', 'never',
+                '--no-deps', '--wait', '--wait-timeout', '300', *services)
+    except BaseException:
+        print('ops-alert: service restart failed', file=sys.stderr)
+        raise
 
 
 def sync_directory(path):
@@ -379,6 +404,10 @@ def run(args, *, cwd=KIT, output=None, input_file=None, pass_fds=()):
     # application/provider diagnostics into journald. No secret in args either.
     kwargs = {'cwd': cwd, 'stdout': output if output is not None else subprocess.PIPE,
               'stderr': subprocess.PIPE, 'stdin': input_file or subprocess.DEVNULL, 'pass_fds': pass_fds}
+    if str(args[0]) == 'git':
+        # Host operations always name the intended checkout explicitly. Inherited
+        # Git context must not redirect its repository, index or configuration.
+        kwargs['env'] = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
     try:
         result = subprocess.run([str(arg) for arg in args], check=False, **kwargs)
     except OSError:
@@ -411,7 +440,12 @@ class Compose:
         return self('config', '--services').split()
 
     def container(self, service):
-        ids = self('ps', '--all', '--quiet', service).split()
+        # Compose ps can include a run container left by a killed client.
+        # Identify the persistent service independently of those one-offs.
+        ids = run(['docker', 'container', 'ls', '--all', '--quiet', '--filter',
+                   'label=com.docker.compose.project=' + self.name, '--filter',
+                   'label=com.docker.compose.service=' + service, '--filter',
+                   'label=com.docker.compose.oneoff=False']).split()
         if len(ids) != 1:
             fail('Expected exactly one container for ' + service)
         return ids[0]
@@ -457,7 +491,9 @@ class Compose:
     def hermes(self, stage, *args):
         # Bypass s6/the gateway completely. Only a one-shot CLI owns the stopped
         # home; neither backup nor import can start the application entrypoint.
-        return self('run', '--rm', '--no-deps', '-T', '--user', '10000:10000',
+        labels = (['--label', 'org.software-factory.recovery-run=' + self.recovery_run]
+                  if hasattr(self, 'recovery_run') else [])
+        return self('run', '--rm', '--no-deps', '-T', *labels, '--user', '10000:10000',
                     '--volume', str(stage) + ':/recovery',
                     '--env', 'HERMES_HOME=/opt/data', '--env', 'HOME=/opt/data',
                     '--entrypoint', PYTHON, 'hermes', '/kit/recovery-hermes.py', *args)
@@ -549,10 +585,23 @@ def utc():
     return datetime.now(timezone.utc).isoformat()
 
 
+def validate_staging_parent(parent):
+    # A private child is insufficient if another uid can rename it through a
+    # writable parent. Standard root-owned sticky /tmp and /var/tmp are safe.
+    parent = Path(parent).resolve(strict=True)
+    for directory in (parent, *parent.parents):
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            fail('Staging ancestors must be root-owned and protected against renames')
+    return parent
+
+
 @contextmanager
 def staging(parent):
     # A root-only tree on host storage. Nothing below it is mounted into an
     # application; only the one-shot Hermes CLI sees its own uid-owned subdir.
+    parent = validate_staging_parent(parent)
     with tempfile.TemporaryDirectory(prefix='paperclip-hermes-recovery-', dir=parent) as directory:
         os.chmod(directory, 0o700)
         try:
@@ -598,6 +647,7 @@ def purge(stage, keep=()):
 def clear_stale(parent):
     # Called under the lock: a root-owned staging tree is a remnant of a run
     # that could not clean up (SIGKILL, power loss). Other owners' are not ours.
+    parent = validate_staging_parent(parent)
     for path in parent.glob('paperclip-hermes-recovery-*'):
         info = path.lstat()
         if stat.S_ISDIR(info.st_mode) and info.st_uid == 0:
@@ -677,6 +727,32 @@ def wait_stack(compose):
          + ('; not running: ' + ', '.join(missing) if missing else '; some are not healthy'))
 
 
+def service_operation(args, compose, running=None, stage=None):
+    if not getattr(args, '_track_service_operation', False):
+        return
+    record = {'protocol': 1, 'operation': args.command, 'phase': 'running',
+              'run_id': uuid.uuid4().hex, 'kit_commit': kit_commit(),
+              'kit_path': str(compose.kit.resolve()), 'project': compose.name,
+              'previous_running': running or [],
+              'containers': {name: compose.container(name) for name in (running or [])},
+              'stage': str(stage) if stage is not None else None}
+    atomic_json(STATE_DIR / 'service-op.json', record)
+    args._service_operation = record
+    compose.recovery_run = record['run_id']
+
+
+def finish_service_operation(args):
+    record = getattr(args, '_service_operation', None)
+    if record is not None:
+        atomic_json(STATE_DIR / 'service-op.json', {**record, 'phase': 'complete'})
+
+
+def require_no_service_operation():
+    path = STATE_DIR / 'service-op.json'
+    if path.exists() and json.loads(read_private(path)).get('phase') != 'complete':
+        fail('Recover the interrupted backup/restore before another operation')
+
+
 def backup(args):
     args._restart_services = None
     try:
@@ -688,6 +764,7 @@ def backup(args):
             compose, writers = args._restart_services
             with deferred_signals():
                 restart_services(compose, writers)
+            finish_service_operation(args)
         raise
 
 
@@ -712,11 +789,17 @@ def data_backup(args):
     args.vm_id = getattr(args, 'vm_id', None) or config.get('vm_id') or ('local' if not container else None)
     if not args.target or not args.vm_id:
         fail('Off-site backup requires target and VM identity, from arguments or host config.json')
-    if not re.fullmatch(r'[A-Za-z0-9_-]+', args.target):
+    for value in (args.target, args.vm_id):
+        if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_./:-]{1,512}', value):
+            fail('Invalid backup target or VM identity')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,255}', args.target):
         fail('Invalid backup target name')
     reason = 'canary' if getattr(args, 'canary', False) else getattr(args, 'reason', 'nightly')
     if reason in ('pre-stop', 'final') and not getattr(args, 'stop_operation_id', None):
         fail('Pre-stop/final backups require --stop-operation-id')
+    stop_id = getattr(args, 'stop_operation_id', None)
+    if stop_id is not None and not re.fullmatch(r'[A-Za-z0-9_-]{1,255}', stop_id):
+        fail('Invalid stop operation identity')
     if reason == 'canary':
         return canary(args, public_key, container)
     validate_config(KIT)
@@ -735,6 +818,7 @@ def data_backup(args):
         # failure; a partial stop also takes this path. A restart error fails.
         # On an error or signal, staged plaintext is deleted before the restart.
         try:
+            service_operation(args, compose, running, stage)
             if reason in ('pre-stop', 'final'):
                 args._restart_services = (compose, [s for s in SERVICES if s in running])
             compose('stop', '--timeout', '90', *(s for s in SERVICES if s in running))
@@ -777,6 +861,7 @@ def data_backup(args):
             if reason not in ('pre-stop', 'final'):
                 with deferred_signals():
                     restart_services(compose, [service for service in SERVICES if service in running])
+                    finish_service_operation(args)
         # No plaintext aggregate archive is written: stream tar directly to age.
         with open(stage / 'backup.age', 'xb') as encrypted:
             process = subprocess.Popen(['age', '--encrypt', '--recipient', public_key],
@@ -798,12 +883,27 @@ def data_backup(args):
         receipt = publish_backup(args, public_key, container, stage / 'backup.age', name, record)
         if reason in ('pre-stop', 'final'):
             compose('stop', '--timeout', '90', *(s for s in SERVICES if s in running))
+        finish_service_operation(args)
         print('Backup published: ' + receipt['blob'])
 
 
+def durable_private_directory(path):
+    missing = []
+    for directory in (path, *path.parents):
+        if directory.exists():
+            break
+        missing.append(directory)
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+        sync_directory(directory.parent)
+    private_directory(path)
+    # Also covers retry after a previous mkdir's parent fsync failed.
+    for directory in (path, *path.parents):
+        sync_directory(directory)
+
+
 def atomic_json(path, record):
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    private_directory(path.parent)
+    durable_private_directory(path.parent)
     descriptor, name = tempfile.mkstemp(prefix='.status-', dir=path.parent)
     try:
         with os.fdopen(descriptor, 'w') as stream:
@@ -894,6 +994,12 @@ def unpack_bundle(bundle, stage):
             or not all(isinstance(record.get(key), str) and UTC_TIME.fullmatch(record[key])
                        for key in ('started_at', 'completed_at'))):
         fail('Unsupported or incomplete recovery manifest')
+    try:
+        started, completed = (datetime.fromisoformat(record[key]) for key in ('started_at', 'completed_at'))
+        if completed < started:
+            fail('Recovery manifest timestamps are reversed')
+    except ValueError:
+        raise RecoveryError('Invalid recovery manifest timestamp') from None
     if any(digest(stage / name) != record['files'][name] for name in PAYLOADS):
         fail('Recovery payload checksum mismatch')
     return record
@@ -1136,6 +1242,14 @@ def restore(args):
         home = None
         installed = set(record['images'])
         try:
+            service_operation(args, compose, stage=stage)
+            intent = getattr(args, '_service_operation', None)
+            if intent is not None:
+                # Generation label survives the ephemeral volume override.
+                override_config = json.loads(override.read_text())
+                for item in override_config['services'].values():
+                    item['labels'] = {'org.software-factory.recovery-run': intent['run_id']}
+                override.write_text(json.dumps(override_config))
             compose('create', '--build')
             # The policy is this kit's; defence in depth: check it against the
             # validator's own safety baseline with the pinned image's YAML
@@ -1207,7 +1321,8 @@ def restore(args):
                 if home is not None:
                     remove_import_undo(home)
             raise
-        # Nothing below can fail: the manifest was checked by unpack_bundle.
+        finish_service_operation(args)
+        # The manifest was checked before applications started.
         print('Restore complete; messaging is off until you remove KIT_MESSAGING_OFF. '
               'Recovery point: ' + record['completed_at'])
         print('Reauthenticate OAuth logins and reconcile in-flight run IDs before submitting work.')
@@ -1229,6 +1344,8 @@ def main(argv=None):
         signal.signal(number, interrupted)
     with locked():
         if args.command in ('backup', 'restore'):
+            require_no_service_operation()
+            args._track_service_operation = True
             status = {'protocol': 1, 'operation': args.command, 'phase': 'running', 'started_at': utc()}
             old = STATE_DIR / 'last-op.json'
             prior = json.loads(read_private(old)) if old.exists() else {}
@@ -1254,6 +1371,11 @@ def main(argv=None):
                 if not preserve:
                     atomic_json(old, {**status, 'completed_at': utc()})
         elif args.command == 'rollback-point':
+            require_no_service_operation()
+            prior_path = STATE_DIR / 'last-op.json'
+            prior = json.loads(read_private(prior_path)) if prior_path.exists() else {}
+            if prior.get('operation') == 'upgrade' and prior.get('phase') not in ('complete', 'rolled-back', 'prepare-failed'):
+                fail('Recover the interrupted upgrade before standalone rollback-point actions')
             spec = importlib.util.spec_from_file_location('kit_control', KIT / 'kit-control.py')
             control = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(control)

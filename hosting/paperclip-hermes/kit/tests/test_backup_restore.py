@@ -35,12 +35,12 @@ def public_key():
 
 def signed_url(**changes):
     query = {'sv': '2023-11-03', 'sr': 'c', 'sp': 'cw', 'spr': 'https',
-             'skoid': secrets.token_hex(16), 'sktid': secrets.token_hex(16),
+             'skoid': str(__import__('uuid').uuid4()), 'sktid': str(__import__('uuid').uuid4()),
              'skt': (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
              'ske': (datetime.now(timezone.utc) + timedelta(days=6)).isoformat(),
              'se': (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(),
              'sks': 'b', 'skv': '2023-11-03',
-             'sig': secrets.token_hex(32)}
+             'sig': __import__('base64').b64encode(secrets.token_bytes(32)).decode()}
     query.update(changes)
     return 'https://storage.example.test/recovery?' + urllib.parse.urlencode(query)
 
@@ -469,7 +469,8 @@ class BundleTests(unittest.TestCase):
         # manifest must fail in unpack_bundle, before anything is created.
         changes = [('completed_at', None), ('completed_at', 7), ('started_at', None),
                    ('completed_at', '2026-11-26T00:15:00+00:00\x1b]0;x\x07'),
-                   ('completed_at', 'yesterday'), ('paperclip_schema', ['applied']),
+                   ('completed_at', 'yesterday'), ('completed_at', '2026-99-01T00:00:00+00:00'),
+                   ('completed_at', '2000-01-01T00:00:00+00:00'), ('paperclip_schema', ['applied']),
                    ('files', ['database.dump']), ('images', None)]
         for key, value in changes:
             with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as directory:
@@ -598,11 +599,11 @@ class BackupFailureTests(unittest.TestCase):
                     self.assertIn('hermes.zip', staged_at_removal[0])
                 calls = fake.mock_calls
                 self.assertLess(calls.index(unittest.mock.call.remove_containers(True)),
-                                calls.index(unittest.mock.call('up', '-d', '--no-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300',
+                                calls.index(unittest.mock.call('up', '-d', '--no-recreate', '--no-build', '--pull', 'never', '--no-deps', '--wait', '--wait-timeout', '300',
                                                                *recovery.SERVICES)))
             self.assertEqual(list(work.iterdir()), [])
             self.assertEqual(list(upload.iterdir()), [])
-            self.assertIn(unittest.mock.call('up', '-d', '--no-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', *recovery.SERVICES), fake.call_args_list)
+            self.assertIn(unittest.mock.call('up', '-d', '--no-recreate', '--no-build', '--pull', 'never', '--no-deps', '--wait', '--wait-timeout', '300', *recovery.SERVICES), fake.call_args_list)
             if failure in ('dump', 'tar', 'hermes'):
                 # Plaintext is deleted before waiting on the service restart.
                 self.assertEqual(staged_at_restart, [])
@@ -1092,10 +1093,12 @@ class RootPathTests(unittest.TestCase):
         os.chmod(shared, 0o755)
         link = parent / 'link'
         link.symlink_to(parent / 'elsewhere')
-        with tempfile.TemporaryDirectory() as world:  # under /tmp, mode 1777 parent
-            for target in (nonempty, shared, link, Path(world) / 'restored'):
-                with self.subTest(target=target.name), self.assertRaises(recovery.RecoveryError):
-                    recovery.restore_target(target)
+        world = parent / 'world'
+        world.mkdir(mode=0o700)
+        world.chmod(0o777)
+        for target in (nonempty, shared, link, world / 'restored'):
+            with self.subTest(target=target.name), self.assertRaises(recovery.RecoveryError):
+                recovery.restore_target(target)
         self.assertFalse((parent / 'elsewhere').exists())
 
     def test_lock_is_root_only_and_refuses_links_and_overlap(self):

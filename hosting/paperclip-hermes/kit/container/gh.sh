@@ -7,7 +7,7 @@ set -eu
 # token placed here by root before the service drops privileges.
 if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ] \
     && [ -z "${PAPERCLIP_GITHUB_OPERATION_ACTIVE:-}" ]; then
-    GH_TOKEN=$(cat /run/kit/github-token)
+    GH_TOKEN=$(cat "/run/kit/github-token")
 fi
 if [ -n "${GH_TOKEN:-}" ]; then
     export GH_TOKEN

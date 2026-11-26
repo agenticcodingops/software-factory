@@ -54,7 +54,7 @@ future work. Ops credentials require owner-authorized exact workflow identities;
 federation is unavailable. Live token-exchange and controller acceptance still block deployment release.
 The `kit-e2e` workflow exercises container upgrade rollback and cross-version restore.
 Azure and GitHub settings checks require later packages and operator infrastructure.
-Install Docker Compose v2 or later for the unit-test profile matrix (no daemon needed).
+Install Docker Compose v2.33.1 or later for the unit-test profile matrix (no daemon needed).
 The kit unit tests use sudo when needed to exercise root-only ownership protections.
 
 ## Releases and protection

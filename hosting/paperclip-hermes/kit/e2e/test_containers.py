@@ -23,6 +23,9 @@ REPO = SOURCE.parents[2]
 
 
 def run(*args, **kwargs):
+    if str(args[0]) == 'git' and 'env' not in kwargs:
+        kwargs['env'] = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        kwargs['env'].update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
     return subprocess.run(list(map(str,args)), check=True, capture_output=True, text=True, **kwargs).stdout.strip()
 
 
@@ -46,7 +49,8 @@ def installation():
                              'https://caddy {\n\trespond /health/detailed 401'))
         run('git','init',old)
         author=run('git','-C',REPO,'log','-1','--format=%an%n%ae').splitlines()
-        env={**os.environ,'GIT_AUTHOR_NAME':author[0],'GIT_AUTHOR_EMAIL':author[1],
+        env={**{key: value for key, value in os.environ.items() if not key.startswith('GIT_')},
+             'GIT_CONFIG_GLOBAL':os.devnull,'GIT_CONFIG_NOSYSTEM':'1','GIT_AUTHOR_NAME':author[0],'GIT_AUTHOR_EMAIL':author[1],
              'GIT_COMMITTER_NAME':author[0],'GIT_COMMITTER_EMAIL':author[1]}
         run('git','-C',old,'add','.')
         run('git','-C',old,'commit','-m','test: previous kit fixture',env=env)
@@ -268,7 +272,9 @@ def test_cross_version_restore(installation):
     recipient=run('age-keygen','-y',identity)
     uploads=root/'uploads';uploads.mkdir(mode=0o700)
     r=c.r
-    r.backup(r.parser().parse_args(['backup','--local-dir',str(uploads),'--recipient',recipient,'--work-dir',str(root)]))
+    backup_args = r.parser().parse_args(['backup','--local-dir',str(uploads),'--recipient',recipient,'--work-dir',str(root)])
+    backup_args._track_service_operation = True
+    r.backup(backup_args)
     archive=next(uploads.glob('*.age'))
     candidate_control=load(candidate)
     args=candidate_control.r.parser().parse_args(['restore','--fenced','--archive',str(archive),'--identity',str(identity),'--target',str(root/'wrong'),'--project','sf-e2e-wrong','--work-dir',str(root)])
@@ -276,9 +282,15 @@ def test_cross_version_restore(installation):
         candidate_control.r.restore(args)
     args=r.parser().parse_args(['restore','--fenced','--archive',str(archive),'--identity',str(identity),'--target',str(root/'restored'),'--project','sf-e2e-restored','--work-dir',str(root)])
     compose('stop','--timeout','90')
+    args._track_service_operation = True
     r.restore(args)  # The backup's own commit, not the candidate's code.
     restored=r.Compose(root/'restored','sf-e2e-restored')
     assert sentinel(restored)=='previous'
+    intent = json.loads((root / 'state/service-op.json').read_text())
+    assert intent['phase'] == 'complete'
+    for service in restored.services():
+        assert run('docker', 'inspect', '--format', '{{index .Config.Labels "org.software-factory.recovery-run"}}',
+                   restored.container(service)) == intent['run_id']
     assert 'KIT_MESSAGING_OFF=1' in (root/'restored/.secrets/compose.env').read_text()
     assert r.image_pins(root/'restored')==r.image_pins(old)
 
@@ -305,6 +317,7 @@ def test_cross_version_restore(installation):
             return ''
         return commands(args, **kwargs)
     with patch.object(restored_control, 'STATE', root / 'restored-state'), \
+         patch.object(restored_control.r, 'STATE_DIR', root / 'restored-state'), \
          patch.object(restored_control, 'ROLLBACK_ROOT', root / 'restored-points'), \
          patch.object(restored_control, 'INSTALL', root / 'installation'), \
          patch.object(restored_control, 'checkout', side_effect=lambda sha: rollback_kit if sha == previous else candidate), \
@@ -324,3 +337,35 @@ def test_paperclip_tini_forwards_sigterm(installation):
     state = json.loads(run('docker', 'inspect', container))[0]['State']
     assert state['ExitCode'] in (0, 143)  # No EPERM or forced SIGKILL.
     assert 'Operation not permitted' not in compose('logs', '--no-color', 'paperclip')
+
+
+def test_recovery_barrier_resumes_exact_inventory_and_preserves_new_writes(installation):
+    root, old, candidate, previous, candidate_sha, c, compose = installation
+    compose('stop', 'caddy')
+    running = compose('ps', '--services', '--status', 'running').split()
+    assert set(running) == {'paperclip', 'postgres'}
+    point = root / 'barrier-point'
+    fields = dict(previous_sha=previous, candidate_sha=candidate_sha, rollback_point=str(point),
+                  run_id='barrier', operation_id=secrets.token_hex(32), previous_running=running)
+    c.journal('creating-rollback-point', **fields)
+    c.rollback_point('create', point, compose, operation=fields)
+    c.journal('installing', **fields)
+    original = c.journal
+    def die_before_start(phase, **values):
+        result = original(phase, **values)
+        if phase == 'restored-services-started':
+            raise RuntimeError('process died before startup')
+        return result
+    with patch.object(c, 'journal', side_effect=die_before_start), pytest.raises(RuntimeError):
+        c.recover_point(point, compose)
+    assert set(compose('ps', '--services', '--status', 'running').split()) <= {'postgres'}
+    # The barrier can resume without archives; it must never replay data again.
+    shutil.rmtree(point)
+    c.recover_point(point, compose)
+    assert set(compose('ps', '--services', '--status', 'running').split()) == set(running)
+    compose('exec', '-T', 'postgres', 'psql', '-U', 'paperclip', '-d', 'paperclip', '-c',
+            "UPDATE wp3_sentinel SET value='acknowledged-after-barrier';")
+    with patch.object(c, 'fence_project', side_effect=AssertionError('must not fence after barrier')):
+        c.recover_point(point, compose)
+    assert sentinel(compose) == 'acknowledged-after-barrier'
+    assert set(compose('ps', '--services', '--status', 'running').split()) == {'paperclip', 'postgres'}

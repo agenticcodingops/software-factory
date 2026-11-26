@@ -244,14 +244,18 @@ pm-cli read key | tailscale ssh admin@host sudo /opt/software-factory/current/sf
 ```
 
 Without `--stdin`, a non-TTY is refused and the interactive prompt never echoes.
-`secret set github-token` obtains the actual expiry from GitHub's response header.
+`secret set github-token` obtains and validates the expiry from GitHub's response header.
+Status reports an unknown expiry if the receipt does not match the installed token.
 Secret names and the backup allowlist are defined by `SECRET_NAMES` and
 `SECRET_FILES` in `backup-restore.py`. Secrets never become Compose interpolation
 values; restart the affected service through the approved operation after delivery.
 
 Other commands:
 
-- `status`: non-secret journal, backup receipt and worker-token expiry.
+- `status`: non-secret operation/service journals, backup receipt and worker-token expiry.
+- `recover`: resume an interrupted upgrade or service operation. Backup recovery
+  checks original container IDs before restarting. Interrupted off-site restores
+  are fenced by their unique generation label; use a fresh project for a new restore.
 - `claim-url`: the Paperclip claim URL, for the operator's private terminal.
 - `delivery-recipient`: the public recipient of the host's 0600 delivery key.
 - `set-backup-credential`: envelope ciphertext on stdin; validates a replacement
@@ -744,6 +748,10 @@ The approved deployment creates the destination in a separate failure boundary
 with versioning and time-based immutability. Keep Shared Key off. The validator
 accepts only a container-scoped **user-delegation SAS**, with `skoid`, `sktid`,
 `skt`, `ske`, `sks=b`, `skv`, `se`, `sr=c`, `spr=https` and `sp=cw`.
+Signing and key versions (`sv`, `skv`) must be the qualified `2023-11-03` version.
+Delegation IDs must be UUIDs and the signature must encode 32 bytes in Base64.
+Optional `st` must be a valid, already active UTC time; omitted `st` is accepted.
+Unsupported fields or versions are rejected before replacing the credential.
 Write permission is required for the pinned block-upload API version. Both expiries must be valid and at most seven days
 away, and the SAS cannot outlive its delegation key; the key's lifetime must not
 exceed seven days. Service, account, stored-policy, duplicate-field, expired and

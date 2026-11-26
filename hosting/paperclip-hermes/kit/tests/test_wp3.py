@@ -1,5 +1,7 @@
 """WP3 host contracts and failure recovery; all credentials generated in memory."""
 import argparse
+import base64
+import uuid
 from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime, timedelta, timezone
 import importlib.util
@@ -25,10 +27,20 @@ spec.loader.exec_module(c)
 r = c.r
 
 
+@pytest.fixture(autouse=True)
+def isolate_host_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(r, 'STATE_DIR', tmp_path / 'default-state')
+    monkeypatch.setattr(c, 'STATE', tmp_path / 'default-state')
+    monkeypatch.setattr(r, 'LOCK_DIR', tmp_path / 'default-lock')
+    monkeypatch.setattr(c, 'HOST', tmp_path / 'default-host')
+    # Upgrade fixtures model an installed immutable checkout, not this edit tree.
+    monkeypatch.setattr(r, 'kit_modified', lambda: False)
+
+
 def delegation(**changes):
     now = datetime.now(timezone.utc)
-    query = dict(sv='2023-11-03', sr='c', sp='cw', spr='https', sig=secrets.token_hex(32),
-                 skoid=secrets.token_hex(16), sktid=secrets.token_hex(16), sks='b', skv='2023-11-03',
+    query = dict(sv='2023-11-03', sr='c', sp='cw', spr='https', sig=base64.b64encode(secrets.token_bytes(32)).decode(),
+                 skoid=str(uuid.uuid4()), sktid=str(uuid.uuid4()), sks='b', skv='2023-11-03',
                  skt=(now - timedelta(minutes=1)).isoformat(),
                  ske=(now + timedelta(days=6)).isoformat(), se=(now + timedelta(days=5)).isoformat())
     for key, value in changes.items():
@@ -128,6 +140,11 @@ class Stack:
             self.volumes[name] = path
         self.fail_dump = self.fail_restart = self.fail_restore = False
 
+    @property
+    def inventory(self):
+        return {name: {'name': 'fixture_' + name, 'mountpoint': str(path), 'created_at': 'fixture-generation'}
+                for name, path in self.volumes.items()}
+
     def fence(self, compose):
         assert compose is self
         self.calls.append(('fence-project',))
@@ -150,7 +167,8 @@ class Stack:
         if args[0] == 'start' or args[0] == 'up':
             if self.fail_restart:
                 raise r.RecoveryError('restart failed')
-            self.running = {'postgres'} if '--no-deps' in args else set(self.installed)
+            selected = [arg for arg in args[2:] if arg in self.installed]
+            self.running.update(selected if '--no-deps' in args else self.installed)
         if 'pg_restore' in args:
             assert self.running == {'postgres'}
             assert kwargs['input_file'].read() == b'database dump'
@@ -171,7 +189,7 @@ class Stack:
 def test_rollback_point_sequence_and_restore_data(tmp_path, paperclip):
     stack = Stack(tmp_path, paperclip)
     point = tmp_path/'rollback'
-    with patch.object(c, 'volume_map', return_value=stack.volumes), patch.object(c, 'fence_project', side_effect=stack.fence):
+    with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), patch.object(c, 'fence_project', side_effect=stack.fence):
         record = c.rollback_point('create', point, stack)
         assert not stack.running
         assert point.stat().st_mode & 0o777 == 0o700
@@ -198,7 +216,7 @@ def test_dump_failure_restores_old_stack_and_prevents_archives(tmp_path):
     volumes.assert_not_called()
     assert stack.running == set(stack.installed)
     assert ('stop','--timeout','90','postgres') not in stack.calls
-    assert any(args[:7] == ('up','-d','--no-recreate','--no-build','--pull','never','--wait')
+    assert any(args[:7] == ('up','-d','--no-recreate','--no-build','--pull','never','--no-deps')
                for args in stack.calls)
     assert not (tmp_path/'rollback').exists()
 
@@ -237,7 +255,7 @@ def test_space_refusal_precedes_stop_or_checkout(tmp_path):
 def test_space_requirement_volumes_plus_database_times_2_2(tmp_path):
     stack = Stack(tmp_path)
     size = sum((path/'state').stat().st_size for path in stack.volumes.values())
-    with patch.object(c, 'volume_map', return_value=stack.volumes), patch.object(c, 'fence_project', side_effect=stack.fence):
+    with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), patch.object(c, 'fence_project', side_effect=stack.fence):
         assert c.required_space(stack) == __import__('math').ceil((size+100)*2.2)
 
 
@@ -255,7 +273,8 @@ def test_profile_matrix_compose_config(tmp_path, profiles, expected):
     root=tmp_path/'kit'; shutil.copytree(KIT, root)
     (root/'.secrets').mkdir()
     (root/'.secrets/compose.env').write_text('COMPOSE_PROFILES='+profiles+'\n')
-    result=subprocess.run(['docker','compose','--env-file','.secrets/compose.env','config','--format','json'],cwd=root,capture_output=True,text=True,check=True)
+    env = {name: value for name, value in os.environ.items() if not name.startswith('COMPOSE_')}
+    result=subprocess.run(['docker','compose','--env-file','.secrets/compose.env','config','--format','json'],cwd=root,env=env,capture_output=True,text=True,check=True)
     config=json.loads(result.stdout)
     assert set(config['services']) == expected
 
@@ -294,8 +313,13 @@ def test_non_tty_refused_without_stdin_and_atomic_secret_with_stdin(tmp_path):
     assert not (tmp_path/'.secrets/compose.env').exists()
 
 
-def test_secret_cli_rejects_non_tty():
-    result=subprocess.run([str(KIT/'sfctl'),'secret','set','openai-api-key'],input='generated-fixture',text=True,capture_output=True)
+def test_secret_cli_rejects_non_tty(tmp_path):
+    copied = tmp_path / 'kit'
+    shutil.copytree(KIT, copied)
+    recovery = copied / 'backup-restore.py'
+    recovery.write_text(recovery.read_text().replace("LOCK_DIR = Path('/run/paperclip-hermes')",
+                                                    'LOCK_DIR = Path(' + repr(str(tmp_path / 'lock')) + ')'))
+    result=subprocess.run([str(copied/'sfctl'),'secret','set','openai-api-key'],input='generated-fixture',text=True,capture_output=True)
     assert result.returncode == 1
     assert '--stdin' in result.stderr
     assert 'generated-fixture' not in result.stderr
@@ -348,7 +372,7 @@ def test_upgrade_failed_health_restores_previous_code_and_data(tmp_path, restore
     previous='a'*40
     candidate_sha='b'*40
     candidate=tmp_path/'candidate';candidate.mkdir()
-    old=tmp_path/'old';(old/'.secrets').mkdir(parents=True)
+    old=tmp_path/'old';(old/'.secrets').mkdir(mode=0o700, parents=True)
     install=tmp_path/'install';install.mkdir()
     events=[]
     original=r.run
@@ -367,7 +391,7 @@ def test_upgrade_failed_health_restores_previous_code_and_data(tmp_path, restore
         return original(args,**kwargs)
     with patch.object(c,'KIT',old),patch.object(c,'INSTALL',install),patch.object(c,'STATE',tmp_path/'status'), \
          patch.object(c,'ROLLBACK_ROOT',tmp_path/'points'),patch.object(c.r,'kit_commit',return_value=previous), \
-         patch.object(c,'volume_map',return_value=stack.volumes),patch.object(c,'required_space',return_value=0), \
+         patch.object(c,'volume_map',side_effect=lambda *args: stack.inventory),patch.object(c,'required_space',return_value=0), \
          patch.object(c,'fence_project',side_effect=stack.fence), \
          patch.object(c.r,'Compose',side_effect=compose_factory),patch.object(c,'checkout',side_effect=lambda sha: old if sha==previous else candidate), \
          patch.object(c.r,'run',side_effect=execute),pytest.raises(r.RecoveryError,match=error):
@@ -501,9 +525,10 @@ def test_staged_restore_identity_removed_even_on_failure(tmp_path):
     key=Path('/run')/('wp3-test-'+secrets.token_hex(8))
     key.write_text('generated ephemeral fixture');key.chmod(0o600)
     argv=['backup-restore.py','restore','--fenced','--staged','--archive',str(tmp_path/'blob'),'--identity',str(key),'--target',str(tmp_path/'restore')]
-    with patch.object(sys,'argv',argv),patch.object(r,'locked',__import__('contextlib').nullcontext),patch.object(r,'restore',side_effect=r.RecoveryError('restore failed')),patch.object(r.signal,'signal'),pytest.raises(r.RecoveryError,match='restore failed'):
+    with patch.object(sys,'argv',argv),patch.object(r,'locked',__import__('contextlib').nullcontext),patch.object(r,'STATE_DIR',tmp_path/'state'),patch.object(r,'restore',side_effect=r.RecoveryError('restore failed')),patch.object(r.signal,'signal'),pytest.raises(r.RecoveryError,match='restore failed'):
         r.main()
     assert not key.exists()
+    assert json.loads((tmp_path / 'state/last-op.json').read_text())['phase'] == 'failed'
 
 
 def test_canary_preserves_last_successful_data_receipt(tmp_path):
@@ -536,8 +561,9 @@ def test_health_checks_tls_authenticated_endpoint_and_drop_counters(tmp_path,cap
     def probe(args):
         if args[0]=='iptables':
             return '1 64 DROP all -- * * 0.0.0.0/0 169.254.169.254\n2 128 DROP tcp -- * * 0.0.0.0/0 168.63.129.16 tcp dpt:80\n3 192 DROP tcp -- * * 0.0.0.0/0 168.63.129.16 tcp dpt:32526'
-        return '{"Web":{"fixture:443":{}}}'
-    with patch.object(c.r,'Compose',return_value=compose),patch.object(c,'probe',side_effect=probe),patch.object(c,'DOCKER_DAEMON',daemon),patch.object(c.r,'schema_state',return_value={'applied':[1]}):
+        return json.dumps({'TCP': {'443': {'HTTPS': True}, '9443': {'HTTPS': True}}, 'Web': {'fixture:443': {'Handlers': {'/': {'Proxy': 'http://127.0.0.1:3100'}}},
+                                   'fixture:9443': {'Handlers': {'/': {'Proxy': 'http://127.0.0.1:9119'}}}}})
+    with patch.object(c.r,'Compose',return_value=compose),patch.object(c,'probe',side_effect=probe),patch.object(c,'settings',return_value={'TAILSCALE_HOSTNAME':'fixture'}),patch.object(c,'DOCKER_DAEMON',daemon),patch.object(c.r,'schema_state',return_value={'applied':[1]}):
         assert c.health()
     output=capsys.readouterr().out
     assert len(output.encode())<4096
@@ -560,7 +586,7 @@ def test_pre_stop_failure_after_shutdown_restarts_previous_writers():
     with patch.object(r,'data_backup',side_effect=stopped),pytest.raises(r.RecoveryError,match='dump failed'):
         r.backup(args)
     stack.assert_called_once_with('up','-d','--no-recreate','--no-build','--pull','never',
-                                  '--wait','--wait-timeout','300','paperclip','caddy')
+                                  '--no-deps','--wait','--wait-timeout','300','paperclip','caddy')
 
 
 @pytest.mark.parametrize('command', ['backup','restore'])
@@ -622,7 +648,7 @@ def test_verify_staging_refuses_kit_directory():
 def test_rollback_inventory_allows_candidate_volumes_but_requires_originals(tmp_path, missing):
     stack = Stack(tmp_path)
     point = tmp_path / 'rollback'
-    with patch.object(c, 'volume_map', return_value=stack.volumes), patch.object(c, 'fence_project', side_effect=stack.fence):
+    with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), patch.object(c, 'fence_project', side_effect=stack.fence):
         c.rollback_point('create', point, stack)
         original = dict(stack.volumes)
         added = tmp_path / 'candidate_only'
@@ -666,19 +692,21 @@ def test_hermes_health_uses_verified_curl_status(tmp_path, capsys, tls_status):
 def test_checkout_under_private_umask_is_container_readable(tmp_path):
     source = tmp_path / 'source'
     source.mkdir()
-    subprocess.run(['git', 'init', str(source)], check=True, capture_output=True)
+    git_env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
+    subprocess.run(['git', 'init', str(source)], env=git_env, check=True, capture_output=True)
     container = source / 'hosting/paperclip-hermes/kit/container'
     container.mkdir(parents=True)
     (container / 'gitconfig').write_text('[credential]\n')
     (container / 'gh.sh').write_text('#!/bin/sh\nexit 0\n')
     (container / 'gh.sh').chmod(0o755)
-    subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(source), 'add', '.'], env=git_env, check=True)
     # Reuse the repository identity without changing any Git configuration.
-    identity = subprocess.check_output(['git', '-C', str(KIT), 'log', '-1', '--format=%an%n%ae'], text=True).splitlines()
-    env = {**os.environ, 'GIT_AUTHOR_NAME': identity[0], 'GIT_AUTHOR_EMAIL': identity[1],
+    identity = subprocess.check_output(['git', '-C', str(KIT), 'log', '-1', '--format=%an%n%ae'], env=git_env, text=True).splitlines()
+    env = {**git_env, 'GIT_AUTHOR_NAME': identity[0], 'GIT_AUTHOR_EMAIL': identity[1],
            'GIT_COMMITTER_NAME': identity[0], 'GIT_COMMITTER_EMAIL': identity[1]}
     subprocess.run(['git', '-C', str(source), 'commit', '-m', 'test: checkout fixture'], env=env, check=True, capture_output=True)
-    sha = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+    sha = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], env=git_env, text=True).strip()
     original = r.run
     def local_fetch(args, **kwargs):
         args = [str(a) for a in args]
@@ -758,7 +786,7 @@ def test_fence_project_includes_stopped_and_candidate_only_containers():
 
 
 @pytest.mark.parametrize('command', ['rollback', 'recover'])
-@pytest.mark.parametrize('phase', ['complete', 'rolled-back', 'prepare-failed', 'restored-services-started', 'failed', None])
+@pytest.mark.parametrize('phase', ['complete', 'rolled-back', 'prepare-failed', 'failed', None])
 def test_recovery_rejects_resolved_or_other_journals_before_checkout(tmp_path, command, phase):
     r.atomic_json(tmp_path / 'state/last-op.json', {'operation': 'upgrade', 'phase': phase})
     with patch.object(sys, 'argv', ['sfctl', command, '--point', str(tmp_path / 'point')]), \
@@ -781,10 +809,10 @@ def test_recovery_accepts_only_unresolved_upgrades_and_copies_restored_secrets(t
     previous = tmp_path / 'previous'
     previous.mkdir()
     fields = dict(previous_sha='a' * 40, candidate_sha='b' * 40, rollback_point=str(tmp_path / 'point'), run_id='fixture')
-    r.atomic_json(tmp_path / 'state/last-op.json', {'operation': 'upgrade', 'phase': phase, **fields})
+    r.atomic_json(tmp_path / 'state/last-op.json', {'protocol': 1, 'operation': 'upgrade', 'phase': phase, 'operation_id': 'c' * 64, 'previous_running': [], **fields})
     with patch.object(sys, 'argv', ['sfctl', command]), patch.object(r, 'locked', return_value=__import__('contextlib').nullcontext(7)), \
          patch.object(r.signal, 'signal'), patch.object(c, 'STATE', tmp_path / 'state'), patch.object(c, 'KIT', source), \
-         patch.object(c, 'checkout', return_value=previous), patch.object(c, 'activate') as activate, patch.object(r, 'run') as run:
+         patch.object(c, 'checkout', return_value=previous), patch.object(c, 'activate') as activate, patch.object(r, 'run') as run, patch.object(c, 'validate_point'):
         c.main()
     activate.assert_called_once_with(previous)
     assert (previous / '.secrets/key').read_bytes() == b'restored secret'
@@ -804,7 +832,7 @@ def test_recovery_rejects_non_upgrade_operation(tmp_path):
 def test_fencing_failure_prevents_volume_wipe(tmp_path):
     stack = Stack(tmp_path)
     point = tmp_path / 'point'
-    with patch.object(c, 'volume_map', return_value=stack.volumes):
+    with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory):
         c.rollback_point('create', point, stack)
         for volume in stack.volumes.values():
             (volume / 'state').write_text('candidate data')
@@ -833,13 +861,14 @@ def test_interrupted_rollback_never_replays_after_writer_barrier(tmp_path, inter
     point = tmp_path / 'point'
     state = tmp_path / 'state'
     fields = dict(previous_sha='a' * 40, candidate_sha='b' * 40,
-                  rollback_point=str(point), run_id='crash', previous_running=stack.installed)
+                  rollback_point=str(point), run_id='crash', operation_id='c' * 64, previous_running=stack.installed)
     original_journal = c.journal
     original_compose = Stack.__call__
-    with patch.object(c, 'STATE', state), patch.object(r, 'private_stat'), \
-         patch.object(r, 'private_directory'), patch.object(c, 'volume_map', return_value=stack.volumes), \
+    with patch.object(c, 'STATE', state), patch.object(r, 'private_stat'), patch.object(r, 'kit_commit', return_value='a' * 40), \
+         patch.object(r, 'private_directory'), patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), \
          patch.object(c, 'fence_project', side_effect=stack.fence):
-        c.rollback_point('create', point, stack)
+        with patch.object(r, 'kit_commit', return_value=fields['previous_sha']):
+            c.rollback_point('create', point, stack, operation=fields)
         c.journal('installing', **fields)
 
         def journal(phase, **values):
@@ -872,16 +901,13 @@ def test_interrupted_rollback_never_replays_after_writer_barrier(tmp_path, inter
         assert json.loads((state / 'last-op.json').read_text())['phase'] == 'restored-services-started'
         expected = 'old-data' if interruption == 'before-services' else 'acknowledged post-rollback write'
         stack.calls.clear()
-        for command in ('rollback', 'recover'):
-            with patch.object(sys, 'argv', ['sfctl', command]), \
-                 patch.object(r, 'locked', __import__('contextlib').nullcontext), \
-                 patch.object(r.signal, 'signal'), patch.object(c, 'checkout') as checkout, \
-                 pytest.raises(r.RecoveryError, match='unresolved upgrade'):
-                c.main()
-            checkout.assert_not_called()
-        with pytest.raises(r.RecoveryError, match='unresolved upgrade'):
+        # Resume startup repeatedly, with no archive replay or fencing.
+        with patch.object(c, 'rollback_point') as restore, patch.object(c, 'fence_project') as fence:
             c.recover_point(point, stack)
-        assert not stack.calls
+            c.recover_point(point, stack)
+        restore.assert_not_called()
+        fence.assert_not_called()
+        assert stack.running == set(stack.installed)
         assert all((volume / 'state').read_text() == expected for volume in stack.volumes.values())
 
 
@@ -908,7 +934,7 @@ def test_interrupted_preparation_recovers_inventory_or_complete_point(tmp_path, 
         assert inventory['previous_running'] == previous_running
         if interruption == 'after-postgres-stop':
             os._exit(73)
-        return stack.volumes
+        return stack.inventory
 
     def atomic(path, record):
         if path.name == 'rollback.json' and interruption == 'before-manifest':
@@ -945,7 +971,7 @@ def test_interrupted_preparation_recovers_inventory_or_complete_point(tmp_path, 
         stack.calls.clear()
         for volume in stack.volumes.values():
             (volume / 'state').write_text('current data')
-        with patch.object(c, 'volume_map', return_value=stack.volumes) as mapped, \
+        with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory) as mapped, \
              patch.object(c, 'fence_project', side_effect=stack.fence) as fence:
             c.recover_point(point, stack)
         phase = json.loads((state / 'last-op.json').read_text())['phase']
@@ -958,8 +984,9 @@ def test_interrupted_preparation_recovers_inventory_or_complete_point(tmp_path, 
             mapped.assert_not_called()
             fence.assert_not_called()
             assert stack.calls == [('up', '-d', '--no-recreate', '--no-build', '--pull', 'never',
-                                    '--wait', '--wait-timeout', '300', *previous_running)]
+                                    '--no-deps', '--wait', '--wait-timeout', '300', *previous_running)]
             expected = 'current data'
+        assert stack.running == set(previous_running)
         assert all((volume / 'state').read_text() == expected for volume in stack.volumes.values())
 
 
@@ -993,7 +1020,7 @@ def test_upgrade_preserves_writer_barrier_when_recovery_completion_fails(tmp_pat
          patch.object(r, 'private_directory'), patch.object(c, 'checkout', return_value=KIT), \
          patch.object(c, 'activate'), patch.object(c, 'copy_secrets'), patch.object(r, 'run', side_effect=execute), \
          patch.object(c, 'journal', side_effect=journal), \
-         patch.object(c, 'volume_map', return_value=stack.volumes), \
+         patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), \
          patch.object(c, 'fence_project', side_effect=stack.fence) as fence, \
          pytest.raises(r.RecoveryError, match='injected completion failure'):
         c.upgrade('b' * 40, 'crash', 7)
@@ -1008,15 +1035,615 @@ def test_incomplete_preparation_restart_failure_remains_recoverable(tmp_path):
     stack = Stack(tmp_path)
     point = tmp_path / 'incomplete'
     fields = dict(previous_sha='a' * 40, candidate_sha='b' * 40,
-                  rollback_point=str(point), run_id='crash', previous_running=stack.installed)
+                  rollback_point=str(point), run_id='crash', operation_id='c' * 64, previous_running=stack.installed)
     with patch.object(c, 'STATE', tmp_path / 'state'), patch.object(r, 'private_stat'), \
          patch.object(r, 'private_directory'), patch.object(c, 'rollback_point') as restore:
         c.journal('creating-rollback-point', **fields)
         stack.fail_restart = True
         with pytest.raises(r.RecoveryError, match='restart failed'):
             c.recover_point(point, stack)
-        assert json.loads((tmp_path / 'state/last-op.json').read_text())['phase'] == 'creating-rollback-point'
+        assert json.loads((tmp_path / 'state/last-op.json').read_text())['phase'] == 'preparation-restarting'
         stack.fail_restart = False
         c.recover_point(point, stack)
         assert json.loads((tmp_path / 'state/last-op.json').read_text())['phase'] == 'prepare-failed'
     restore.assert_not_called()
+
+
+@pytest.mark.parametrize('change', [
+    {'st': (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()},
+    {'st': '2026-99-01T00:00:00Z'}, {'st': ''}, {'st': '2026-01-01'},
+    {'se': '2026-99-01T00:00:00Z'}, {'skt': '2026-01-01T00:00:00+01:00'},
+    {'sv': '2023-99-99'}, {'sv': '2099-01-01'}, {'skv': 'nonsense'},
+    {'skoid': 'bad-id'}, {'sktid': 'bad-id'}, {'sig': 'not-base64'},
+    {'sig': base64.b64encode(b'short').decode()}, {'sp': 'cw '},
+    {'sr': 'b'}, {'spr': 'https,http'}, {'sduoid': str(uuid.uuid4())},
+])
+def test_invalid_sas_never_replaces_working_credential(tmp_path, change):
+    host = tmp_path / 'host'
+    host.mkdir(mode=0o700)
+    original = ('BACKUP_AGE_RECIPIENT=age1' + secrets.token_hex(29) + '\n'
+                + 'BACKUP_CONTAINER_SAS_URL=' + delegation() + '\n')
+    c.atomic_secret(host / 'backup.env', original.encode())
+    replacement = original.split('BACKUP_CONTAINER_SAS_URL=')[0] + 'BACKUP_CONTAINER_SAS_URL=' + delegation(**change) + '\n'
+    with patch.object(sys, 'argv', ['sfctl', 'set-backup-credential']), \
+         patch.object(r, 'locked', __import__('contextlib').nullcontext), patch.object(r.signal, 'signal'), \
+         patch.object(c, 'HOST', host), patch.object(c, 'decrypt_input', return_value=replacement), \
+         pytest.raises(r.RecoveryError):
+        c.main()
+    assert (host / 'backup.env').read_text() == original
+
+
+@pytest.mark.parametrize('start', [None, (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat(),
+                                   (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()])
+def test_sas_optional_active_start(start):
+    assert r.sas_url(delegation(st=start))
+
+
+@pytest.mark.parametrize('cleanup', ['remove', 'sync'])
+@pytest.mark.parametrize('restart_fails', [False, True])
+def test_dump_cleanup_failure_still_restarts_and_alerts(tmp_path, capsys, cleanup, restart_fails):
+    stack = Stack(tmp_path)
+    stack.fail_dump = True
+    stack.fail_restart = restart_fails
+    target = 'rmtree' if cleanup == 'remove' else 'sync_directory'
+    owner = shutil if cleanup == 'remove' else r
+    def cleanup_failure(*args):
+        if stack.running == {'postgres'}:
+            raise OSError('cleanup failed')
+    with patch.object(owner, target, side_effect=cleanup_failure), \
+         pytest.raises(r.RecoveryError, match='restart failed' if restart_fails else 'dump failed'):
+        c.rollback_point('create', tmp_path / 'point', stack)
+    assert stack.running == ({'postgres'} if restart_fails else set(stack.installed))
+    alert = capsys.readouterr().err
+    assert 'ops-alert: rollback point cleanup failed' in alert
+    assert ('ops-alert: previous stack restart failed' in alert) == restart_fails
+
+
+def test_uncertain_manifest_invalidation_never_restarts_writers(tmp_path, capsys):
+    stack = Stack(tmp_path)
+    atomic = r.atomic_json
+    published = False
+    def publish_then_fail(path, record):
+        nonlocal published
+        atomic(path, record)
+        published = True
+        raise OSError('publication durability uncertain')
+    def sync(path):
+        if published and path.name == 'point':
+            raise OSError('invalidation failed')
+    with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), \
+         patch.object(r, 'atomic_json', side_effect=publish_then_fail), \
+         patch.object(r, 'sync_directory', side_effect=sync), \
+         pytest.raises(OSError):
+        c.rollback_point('create', tmp_path / 'point', stack)
+    assert not stack.running
+    assert 'ops-alert: rollback point invalidation failed' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('wrong', ['run_id', 'operation_id', 'candidate_sha', 'previous_running'])
+def test_point_bound_to_run_before_activation_and_in_child(tmp_path, wrong):
+    stack = Stack(tmp_path)
+    stack.name = 'paperclip-hermes'
+    point = tmp_path / 'point'
+    fields = dict(previous_sha=r.kit_commit(), candidate_sha='b' * 40, run_id='run-b',
+                  operation_id='c' * 64, previous_running=stack.installed, rollback_point=str(point))
+    with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), \
+         patch.object(c, 'STATE', tmp_path / 'state'), patch.object(r, 'LOCK_DIR', tmp_path / 'lock'):
+        c.rollback_point('create', point, stack, operation=fields)
+        bad = {**fields, wrong: [] if wrong == 'previous_running' else ('d' * 40 if wrong == 'candidate_sha' else 'other')}
+        manifest = json.loads((point / 'rollback.json').read_text())
+        manifest['operation'] = bad
+        r.atomic_json(point / 'rollback.json', manifest)
+        c.journal('installing', **fields)
+        for command in ('recover', 'recover-locked'):
+            with r.locked() as fd:
+                argv = ['sfctl', command, '--point', str(point)]
+                if command == 'recover-locked':
+                    argv += ['--lock-fd', str(fd)]
+                with patch.object(sys, 'argv', argv), patch.object(r.signal, 'signal'), \
+                     patch.object(r, 'locked', __import__('contextlib').nullcontext), \
+                     patch.object(c, 'checkout') as checkout, patch.object(c, 'activate') as activate, \
+                     patch.object(r, 'Compose', return_value=stack), \
+                     pytest.raises(r.RecoveryError, match='does not belong'):
+                    c.main()
+                checkout.assert_not_called()
+                activate.assert_not_called()
+
+
+def test_matching_point_can_be_relocated(tmp_path):
+    stack = Stack(tmp_path)
+    fields = dict(previous_sha=r.kit_commit(), candidate_sha='b' * 40, run_id='run', operation_id='c' * 64,
+                  previous_running=stack.installed, rollback_point=str(tmp_path / 'point'))
+    with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory):
+        c.rollback_point('create', tmp_path / 'point', stack, operation=fields)
+    (tmp_path / 'point').rename(tmp_path / 'relocated')
+    c.validate_point(tmp_path / 'relocated', {**fields, 'phase': 'installing'})
+
+
+@pytest.mark.parametrize('recreated', [False, True])
+def test_volume_resolution_uses_recorded_name_and_generation(tmp_path, recreated):
+    original = tmp_path / 'original'
+    candidate = tmp_path / 'candidate'
+    original.mkdir(); candidate.mkdir()
+    model = MagicMock(name='compose')
+    model.name = 'fixture'
+    model.return_value = json.dumps({'volumes': {'paperclip': {'name': 'original'}}})
+    volumes = {'original': dict(Name='original', Mountpoint=str(original), CreatedAt='generation-a',
+                Labels={'com.docker.compose.project': 'fixture', 'com.docker.compose.volume': 'paperclip'}),
+               'candidate': dict(Name='candidate', Mountpoint=str(candidate), CreatedAt='generation-b',
+                Labels={'com.docker.compose.project': 'fixture', 'com.docker.compose.volume': 'paperclip'})}
+    def docker(args, **kwargs):
+        if args[1:3] == ['volume', 'ls']:
+            return 'original\ncandidate\n'
+        return json.dumps([volumes[args[-1]]])
+    with patch.object(r, 'run', side_effect=docker):
+        captured = c.volume_map(model)
+        assert captured['paperclip']['name'] == 'original'
+        if recreated:
+            volumes['original']['CreatedAt'] = 'generation-new'
+            with pytest.raises(r.RecoveryError, match='inventory changed'):
+                c.volume_map(model, captured)
+        else:
+            assert c.volume_map(model, captured) == captured
+
+
+@pytest.mark.parametrize('selected', [['paperclip'], ['hermes'], ['paperclip', 'hermes']])
+@pytest.mark.parametrize('broken', [None, 'missing', 'wrong-proxy', 'http-only'])
+def test_health_checks_exact_routes_for_selected_profiles(tmp_path, capsys, selected, broken):
+    compose = MagicMock()
+    compose.services.return_value = selected
+    compose.side_effect = lambda *args: json.dumps([{'Health': 'healthy'}] * len(selected)) if args[0] == 'ps' else ('401' if args[2] == 'caddy' else '')
+    daemon = tmp_path / 'daemon.json'; daemon.write_text('{"ipv6":false}')
+    config = {'TCP': {}, 'Web': {}}
+    for service, port, target in [('paperclip', '443', '3100'), ('hermes', '9443', '9119')]:
+        if service in selected:
+            config['TCP'][port] = {'HTTPS': True}
+            config['Web']['fixture:' + port] = {'Handlers': {'/': {'Proxy': 'http://127.0.0.1:' + target}}}
+    port = '9443' if 'hermes' in selected else '443'
+    if broken == 'missing':
+        del config['Web']['fixture:' + port]
+    elif broken == 'wrong-proxy':
+        config['Web']['fixture:' + port]['Handlers']['/']['Proxy'] = 'http://127.0.0.1:9999'
+    elif broken == 'http-only':
+        config['TCP'][port]['HTTPS'] = False
+    def probe(args):
+        return json.dumps(config) if args[0] == 'tailscale' else '1 1 DROP 169.254.169.254\n1 1 DROP 168.63.129.16 dpt:80\n1 1 DROP 168.63.129.16 dpt:32526'
+    with patch.object(r, 'Compose', return_value=compose), patch.object(c, 'probe', side_effect=probe), \
+         patch.object(c, 'settings', return_value={'TAILSCALE_HOSTNAME': 'fixture'}), \
+         patch.object(c, 'DOCKER_DAEMON', daemon), patch.object(r, 'schema_state', return_value={'applied': [1]}):
+        assert c.health() == (broken is None)
+    assert json.loads(capsys.readouterr().out)['checks']['tailscale_serve'] == (broken is None)
+
+
+@pytest.mark.parametrize('crash', ['receipt-published', 'token-published'])
+def test_token_expiry_matches_installed_generation_after_crash(tmp_path, capsys, crash):
+    old = secrets.token_hex(32).encode(); new = secrets.token_hex(32).encode()
+    response = MagicMock()
+    response.__enter__.return_value.headers = {'github-authentication-token-expiration': '2099-01-01 00:00:00 UTC'}
+    original_json, original_secret = r.atomic_json, c.atomic_secret
+    with patch.object(c, 'KIT', tmp_path), patch.object(c, 'STATE', tmp_path / 'state'), patch.object(r.signal, 'signal'):
+        c.atomic_secret(tmp_path / '.secrets/github-token', old + b'\n')
+        def publish_receipt(path, record):
+            original_json(path, record)
+            if crash == 'receipt-published':
+                os._exit(73)
+        def publish_token(path, value):
+            original_secret(path, value)
+            os._exit(73)
+        def rotate():
+            with patch.object(r, 'atomic_json', side_effect=publish_receipt), \
+                 patch.object(c, 'atomic_secret', side_effect=publish_token), \
+                 patch.object(c.urllib.request, 'urlopen', return_value=response), \
+                 patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(new))):
+                c.secret_set('github-token', True)
+        run_until_crash(rotate)
+        with patch.object(sys, 'argv', ['sfctl', 'status']):
+            c.main()
+    receipt = json.loads(capsys.readouterr().out)['github-token']
+    assert receipt['expires_at'] == ('2099-01-01 00:00:00 UTC' if crash == 'token-published' else None)
+
+
+def test_empty_restart_inventory_does_not_start_entire_project():
+    compose = MagicMock()
+    r.restart_services(compose, [])
+    compose.assert_not_called()
+
+
+@pytest.mark.parametrize('expiry', ['not a date', '2099-99-01 00:00:00 UTC', '2000-01-01 00:00:00 UTC'])
+def test_invalid_github_expiry_preserves_token_and_receipt(tmp_path, expiry):
+    response = MagicMock(); response.__enter__.return_value.headers = {'github-authentication-token-expiration': expiry}
+    with patch.object(c, 'KIT', tmp_path), patch.object(c, 'STATE', tmp_path / 'state'):
+        c.atomic_secret(tmp_path / '.secrets/github-token', b'old-token\n')
+        with patch.object(c.urllib.request, 'urlopen', return_value=response), \
+             patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(secrets.token_hex(32).encode()))), \
+             pytest.raises(r.RecoveryError):
+            c.secret_set('github-token', True)
+    assert (tmp_path / '.secrets/github-token').read_bytes() == b'old-token\n'
+    assert not (tmp_path / 'state/github-token.json').exists()
+
+
+@pytest.mark.parametrize('phase', ['restored-services-started', 'preparation-restarting'])
+def test_no_replay_phases_block_another_upgrade(tmp_path, phase):
+    with patch.object(c, 'STATE', tmp_path / 'state'), patch.object(c, 'ROLLBACK_ROOT', tmp_path / 'points'), \
+         patch.object(r, 'STATE_DIR', tmp_path / 'state'), patch.object(r, 'Compose') as compose:
+        c.journal(phase)
+        with pytest.raises(r.RecoveryError, match='previous upgrade'):
+            c.upgrade('a' * 40, 'new-run', 7)
+    compose.assert_not_called()
+
+
+def test_preparation_restart_has_durable_barrier_before_writer_start(tmp_path):
+    stack = Stack(tmp_path)
+    point = tmp_path / 'point'
+    fields = dict(previous_sha=r.kit_commit(), candidate_sha='b' * 40, run_id='run', operation_id='c' * 64,
+                  previous_running=stack.installed, rollback_point=str(point))
+    with patch.object(c, 'STATE', tmp_path / 'state'):
+        c.journal('creating-rollback-point', **fields)
+        def start(compose, running):
+            assert json.loads((tmp_path / 'state/last-op.json').read_text())['phase'] == 'preparation-restarting'
+            # A failure after writers start must remain resumable without replay.
+            (tmp_path / 'paperclip/state').write_text('new acknowledged write')
+            raise r.RecoveryError('interrupted restart')
+        with patch.object(r, 'restart_services', side_effect=start), pytest.raises(r.RecoveryError):
+            c.recover_point(point, stack)
+        # Even if an old manifest reappears, this phase never reads it.
+        point.mkdir(); (point / 'rollback.json').write_text('stale manifest')
+        c.recover_point(point, stack)
+        assert (tmp_path / 'paperclip/state').read_text() == 'new acknowledged write'
+        assert json.loads((tmp_path / 'state/last-op.json').read_text())['phase'] == 'prepare-failed'
+
+
+def test_restore_flushes_volumes_before_database_and_barrier(tmp_path):
+    stack = Stack(tmp_path)
+    fields = dict(previous_sha=r.kit_commit(), candidate_sha='b' * 40, run_id='run', operation_id='c' * 64,
+                  previous_running=stack.installed, rollback_point=str(tmp_path / 'point'))
+    original = r.run
+    events = []
+    def run(args, **kwargs):
+        events.append(args)
+        return original(args, **kwargs)
+    def barrier(phase, **kwargs):
+        assert phase == 'restored-services-started'
+        assert len([args for args in events if args[:2] == ['sync', '-f']]) == len(stack.volumes)
+        assert any('CHECKPOINT' in args for args in stack.calls)
+        assert not set(r.SERVICES) & stack.running
+    with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), \
+         patch.object(c, 'fence_project', side_effect=stack.fence):
+        c.rollback_point('create', tmp_path / 'point', stack, operation=fields)
+        with patch.object(r, 'run', side_effect=run), patch.object(c, 'journal', side_effect=barrier):
+            c.rollback_point('restore', tmp_path / 'point', stack, operation=fields)
+
+
+@pytest.mark.parametrize('bad', [{'previous_running': ['--privileged']}, {'operation_id': ''},
+                                  {'run_id': '../old'}, {'candidate_sha': 'HEAD'},
+                                  {'rollback_point': 'relative'}])
+def test_invalid_operation_fields_fail_before_checkout(tmp_path, bad):
+    fields = dict(previous_sha='a' * 40, candidate_sha='b' * 40, run_id='run', operation_id='c' * 64,
+                  previous_running=['paperclip'], rollback_point=str(tmp_path / 'point'))
+    with patch.object(c, 'STATE', tmp_path / 'state'), patch.object(r, 'STATE_DIR', tmp_path / 'state'):
+        c.journal('restored-services-started', **{**fields, **bad})
+        with patch.object(sys, 'argv', ['sfctl', 'recover']), patch.object(r.signal, 'signal'), \
+             patch.object(r, 'locked', __import__('contextlib').nullcontext), \
+             patch.object(c, 'checkout') as checkout, pytest.raises(r.RecoveryError, match='Invalid upgrade'):
+            c.main()
+        checkout.assert_not_called()
+
+
+@pytest.mark.parametrize('operation', ['backup', 'restore'])
+@pytest.mark.parametrize('crash_at', ['before-side-effect', 'after-side-effect'])
+def test_interrupted_service_operation_recovers_without_data_replay(tmp_path, operation, crash_at):
+    stack = Stack(tmp_path)
+    stack.container = lambda service: 'container-' + service
+    stack.kit = tmp_path
+    args = SimpleNamespace(command=operation, _track_service_operation=True)
+    with patch.object(r, 'STATE_DIR', tmp_path / 'state'), patch.object(c, 'STATE', tmp_path / 'state'), \
+         patch.object(c, 'KIT', tmp_path), patch.object(r, 'kit_commit', return_value='a' * 40), patch.object(r, 'Compose', return_value=stack):
+        def crash():
+            r.service_operation(args, stack, ['paperclip'] if operation == 'backup' else None)
+            if crash_at == 'after-side-effect':
+                (tmp_path / 'paperclip/state').write_text('new data')
+            os._exit(73)
+        run_until_crash(crash)
+        expected = 'new data' if crash_at == 'after-side-effect' else 'old-data'
+        if operation == 'backup':
+            stack.running.remove('paperclip')
+            with patch.object(r, 'run', return_value=''):
+                c.recover_service_operation()
+            assert 'paperclip' in stack.running
+        else:
+            with patch.object(r, 'run', side_effect=['restore-container', '', '']) as run:
+                c.recover_service_operation()
+            assert 'label=org.software-factory.recovery-run=' in ' '.join(run.call_args_list[0].args[0])
+            assert run.call_args_list[-1].args[0] == ['docker', 'container', 'rm', '--volumes', 'restore-container']
+        assert (tmp_path / 'paperclip/state').read_text() == expected
+        assert not c.recover_service_operation()
+
+
+def test_backup_recovery_rejects_replaced_container(tmp_path):
+    stack = Stack(tmp_path)
+    stack.container = lambda service: 'original-container'
+    stack.kit = tmp_path
+    args = SimpleNamespace(command='backup', _track_service_operation=True)
+    with patch.object(r, 'STATE_DIR', tmp_path / 'state'), patch.object(c, 'STATE', tmp_path / 'state'), \
+         patch.object(c, 'KIT', tmp_path), patch.object(r, 'kit_commit', return_value='a' * 40), patch.object(r, 'Compose', return_value=stack):
+        r.service_operation(args, stack, ['paperclip'])
+        stack.container = lambda service: 'replacement-container'
+        with pytest.raises(r.RecoveryError, match='generation changed'):
+            c.recover_service_operation()
+        assert not stack.calls
+
+
+@pytest.mark.parametrize('command', [['messaging', 'on'], ['set-hostname', 'host.example.ts.net']])
+def test_other_startup_commands_cannot_bypass_pending_recovery(tmp_path, command):
+    c.journal('rollback-failed')
+    with patch.object(sys, 'argv', ['sfctl', *command]), patch.object(r.signal, 'signal'), \
+         patch.object(r, 'locked', __import__('contextlib').nullcontext), patch.object(c, 'update_settings') as update, \
+         patch.object(r, 'Compose') as compose, pytest.raises(r.RecoveryError, match='before changing'):
+        c.main()
+    update.assert_not_called()
+    compose.assert_not_called()
+
+
+def test_secret_transfer_failure_keeps_previous_complete_file(tmp_path):
+    source, destination = tmp_path / 'source', tmp_path / 'destination'
+    c.atomic_secret(source / '.secrets/key', b'new-generation')
+    c.atomic_secret(destination / '.secrets/key', b'old-generation')
+    with patch.object(os, 'replace', side_effect=OSError('replacement failed')), pytest.raises(OSError):
+        c.copy_secrets(source, destination)
+    assert (destination / '.secrets/key').read_bytes() == b'old-generation'
+    assert list((destination / '.secrets').iterdir()) == [destination / '.secrets/key']
+
+
+def test_locked_barrier_recovery_records_completion_after_health(tmp_path):
+    stack = Stack(tmp_path)
+    fields = dict(previous_sha='a' * 40, candidate_sha='b' * 40, run_id='run', operation_id='c' * 64,
+                  previous_running=['postgres', 'paperclip'], rollback_point=str(tmp_path / 'missing'))
+    c.journal('restored-services-started', **fields)
+    with r.locked() as fd, patch.object(sys, 'argv', ['sfctl', 'recover-locked', '--point', fields['rollback_point'], '--lock-fd', str(fd)]), \
+         patch.object(r.signal, 'signal'), patch.object(r, 'Compose', return_value=stack), \
+         patch.object(c, 'health', return_value=True) as health:
+        assert c.main() == 0
+    health.assert_called_once_with(['postgres', 'paperclip'])
+    assert json.loads((c.STATE / 'last-op.json').read_text())['phase'] == 'rolled-back'
+
+
+def test_partial_recovery_health_does_not_probe_stopped_caddy(tmp_path, capsys):
+    stack = MagicMock()
+    stack.services.return_value = ['paperclip', 'postgres', 'caddy']
+    def compose(*args):
+        if args[0] == 'ps':
+            return json.dumps([{'Health': 'healthy'}] * 2)
+        assert args[:4] == ('exec', '-T', 'paperclip', 'node')
+        assert '127.0.0.1:3100' in args[-1]
+        return ''
+    stack.side_effect = compose
+    with patch.object(r, 'Compose', return_value=stack), patch.object(c, 'probe', return_value=None), \
+         patch.object(r, 'schema_state', return_value={'applied': [1]}):
+        c.health(['postgres', 'paperclip'])
+    assert json.loads(capsys.readouterr().out)['checks']['paperclip']
+
+
+@pytest.mark.parametrize('serve', ['[]', '{"Web":[]}', '{"Web":{"fixture:443":[]}}', '{"TCP":[]}'])
+def test_malformed_serve_status_still_returns_bounded_health_json(tmp_path, capsys, serve):
+    compose = MagicMock()
+    compose.services.return_value = ['paperclip']
+    compose.side_effect = lambda *args: '[{"Health":"healthy"}]' if args[0] == 'ps' else ''
+    with patch.object(r, 'Compose', return_value=compose), patch.object(c, 'probe', return_value=serve), \
+         patch.object(c, 'settings', return_value={'TAILSCALE_HOSTNAME': 'fixture'}), \
+         patch.object(r, 'schema_state', return_value={'applied': [1]}):
+        assert not c.health()
+    output = capsys.readouterr().out
+    assert len(output.encode()) < 4096 and len(output.splitlines()) == 1
+    assert not json.loads(output)['checks']['tailscale_serve']
+
+
+@pytest.mark.parametrize('phase', ['restored-services-started', 'preparation-restarting'])
+def test_barrier_rejects_changing_point_identity(tmp_path, phase):
+    with pytest.raises(r.RecoveryError, match='Cannot change rollback point'):
+        c.validate_point(tmp_path / 'old-run', {'phase': phase, 'rollback_point': str(tmp_path / 'this-run')})
+
+
+@pytest.mark.parametrize('field,value', [('target', 'bad target'), ('vm_id', 'bad\r\nheader'),
+                                        ('vm_id', 'v' * 513), ('stop_operation_id', '../old')])
+def test_invalid_backup_identifiers_fail_before_downtime(tmp_path, field, value):
+    args = SimpleNamespace(local_dir=None, recipient=None, env_file=tmp_path / 'backup.env',
+                           target='fixture', vm_id='fixture-vm', reason='pre-stop', stop_operation_id='stop')
+    setattr(args, field, value)
+    with patch.object(r, 'BACKUP_ENV_FILE', tmp_path / 'backup.env'), \
+         patch.object(r, 'backup_settings', return_value=('age1' + secrets.token_hex(29), r.sas_url(delegation()))), \
+         patch.object(r, 'Compose') as compose, pytest.raises(r.RecoveryError, match='Invalid'):
+        r.data_backup(args)
+    compose.assert_not_called()
+
+
+@pytest.mark.parametrize('cleanup_fails', [False, True])
+def test_interrupted_backup_removes_oneoffs_before_cleanup_and_restart(tmp_path, cleanup_fails, capsys):
+    stack = Stack(tmp_path)
+    stack.kit = tmp_path
+    stack.container = lambda service: 'original'
+    stage = tmp_path / 'paperclip-hermes-recovery-generation'
+    stage.mkdir(mode=0o700); (stage / 'plaintext').write_text('private')
+    args = SimpleNamespace(command='backup', _track_service_operation=True)
+    with patch.object(c, 'KIT', tmp_path), patch.object(r, 'kit_commit', return_value='a' * 40), \
+         patch.object(r, 'Compose', return_value=stack):
+        r.service_operation(args, stack, ['paperclip'], stage)
+        events = []
+        original = shutil.rmtree
+        def remove(path):
+            events.append('purge')
+            assert events[:2] == ['list', 'rm']
+            if cleanup_fails:
+                raise OSError('purge failed')
+            original(path)
+        def docker(argv, **kwargs):
+            events.append('list' if argv[1:3] == ['container', 'ls'] else 'rm')
+            if events[-1] == 'list':
+                assert 'label=org.software-factory.recovery-run=' + args._service_operation['run_id'] in argv
+                return 'oneoff'
+            assert argv == ['docker', 'rm', '--force', '--volumes', 'oneoff']
+            return ''
+        with patch.object(r, 'run', side_effect=docker), patch.object(shutil, 'rmtree', side_effect=remove), \
+             patch.object(r, 'restart_services', side_effect=lambda *args: events.append('restart')):
+            if cleanup_fails:
+                with pytest.raises(OSError):
+                    c.recover_service_operation()
+            else:
+                c.recover_service_operation()
+        assert events == ['list', 'rm', 'purge', 'restart']
+    assert ('ops-alert: interrupted backup plaintext cleanup failed' in capsys.readouterr().err) == cleanup_fails
+
+
+def test_documented_compose_minimum_supports_gateway_priority():
+    import re
+    readme = (KIT.parents[2] / 'README.md').read_text()
+    version = re.search(r'Docker Compose v([0-9]+)\.([0-9]+)\.([0-9]+) or later', readme)
+    assert version and tuple(map(int, version.groups())) >= (2, 33, 1)
+    assert 'no daemon needed' in readme
+    assert any('gw_priority' in network for service in yaml.safe_load((KIT / 'compose.yaml').read_text())['services'].values()
+               if isinstance(service.get('networks'), dict)
+               for network in service['networks'].values() if isinstance(network, dict))
+
+
+def test_persistent_container_lookup_excludes_abandoned_oneoffs():
+    def docker(args, **kwargs):
+        assert 'label=com.docker.compose.project=fixture' in args
+        assert 'label=com.docker.compose.service=hermes' in args
+        return 'original\n' if 'label=com.docker.compose.oneoff=False' in args else 'original\noneoff\n'
+    with patch.object(r, 'run', side_effect=docker):
+        assert r.Compose(Path('/kit'), 'fixture').container('hermes') == 'original'
+
+
+def test_database_started_for_restore_does_not_escape_recorded_inventory(tmp_path):
+    stack = Stack(tmp_path)
+    point = tmp_path / 'point'
+    with patch.object(c, 'volume_map', side_effect=lambda *args: stack.inventory), \
+         patch.object(c, 'fence_project', side_effect=stack.fence):
+        record = c.rollback_point('create', point, stack)
+        record['running'].remove('postgres')
+        r.atomic_json(point / 'rollback.json', record)
+        c.rollback_point('restore', point, stack)
+    assert stack.running == {'paperclip', 'caddy'}
+
+
+@pytest.mark.parametrize('old,new', [('storage.example.test', 'bad%00host.example.test'),
+                                    ('storage.example.test', '-bad.example.test'),
+                                    ('storage.example.test', 'bad..example.test'),
+                                    ('/backups?', '/bad--container?')])
+def test_invalid_sas_resource_uri_is_rejected(old, new):
+    with pytest.raises(r.RecoveryError):
+        r.sas_url(delegation().replace(old, new))
+
+
+@pytest.mark.parametrize('action', ['create', 'restore'])
+def test_standalone_points_cannot_bypass_pending_upgrade(action, tmp_path):
+    c.journal('restored-services-started')
+    with patch.object(r.signal, 'signal'), patch.object(r, 'locked', __import__('contextlib').nullcontext), \
+         pytest.raises(r.RecoveryError, match='before standalone'):
+        r.main(['rollback-point', action, '--path', str(tmp_path / 'point')])
+
+
+def test_failed_preparation_journal_cannot_skip_safe_restart(tmp_path, capsys):
+    stack = Stack(tmp_path)
+    stack.fail_dump = True
+    fields = dict(previous_running=stack.installed)
+    with patch.object(c, 'journal', side_effect=OSError('state disk failed')), \
+         pytest.raises(r.RecoveryError, match='dump failed'):
+        c.rollback_point('create', tmp_path / 'point', stack, operation=fields)
+    assert stack.running == set(stack.installed)
+    assert 'ops-alert: preparation restart journal failed' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('modified', [True, 'unknown'])
+def test_upgrade_refuses_source_that_cannot_be_recovered_from_its_commit(tmp_path, modified):
+    with patch.object(r, 'kit_modified', return_value=modified), patch.object(r, 'Compose', return_value=Stack(tmp_path)) as compose, \
+         patch.object(c, 'required_space', return_value=0), patch.object(c, 'ROLLBACK_ROOT', tmp_path / 'points'), \
+         patch.object(c, 'rollback_point') as snapshot, pytest.raises(r.RecoveryError, match='recorded commit'):
+        c.upgrade('b' * 40, 'run', 7)
+    snapshot.assert_not_called()
+    assert not compose.return_value.calls
+
+
+@pytest.mark.parametrize('unsafe', ['writable', 'other-owner'])
+def test_staging_and_stale_cleanup_refuse_renameable_ancestors(tmp_path, unsafe):
+    parent = tmp_path / 'parent'
+    parent.mkdir(mode=0o700)
+    work = parent / 'work'; work.mkdir(mode=0o700)
+    stale = work / 'paperclip-hermes-recovery-retained'; stale.mkdir(mode=0o700)
+    (stale / 'sentinel').write_text('retained')
+    if unsafe == 'writable':
+        parent.chmod(0o777)
+    else:
+        os.chown(parent, 10000, 10000)
+    with pytest.raises(r.RecoveryError, match='protected against renames'):
+        with r.staging(work):
+            pytest.fail('unsafe staging was entered')
+    with pytest.raises(r.RecoveryError, match='protected against renames'):
+        r.clear_stale(work)
+    assert (stale / 'sentinel').read_text() == 'retained'
+
+
+def test_host_git_commands_cannot_touch_inherited_repository_or_index(tmp_path):
+    victim = tmp_path / 'victim'; victim.mkdir()
+    index = tmp_path / 'host-index'; index.write_bytes(b'preserve host index')
+    intended = tmp_path / 'intended'
+    with patch.dict(os.environ, GIT_DIR=str(victim), GIT_WORK_TREE=str(victim), GIT_INDEX_FILE=str(index)):
+        r.run(['git', 'init', intended])
+        (intended / 'file').write_text('fixture')
+        r.run(['git', '-C', intended, 'add', 'file'])
+    assert index.read_bytes() == b'preserve host index'
+    assert not list(victim.iterdir())
+    assert (intended / '.git/index').is_file()
+
+
+def test_staging_uses_validated_canonical_parent_even_if_input_link_changes(tmp_path):
+    secure = tmp_path / 'secure'; secure.mkdir(mode=0o700)
+    unsafe = tmp_path / 'unsafe'; unsafe.mkdir(mode=0o777); unsafe.chmod(0o777)
+    link = tmp_path / 'link'; link.symlink_to(secure)
+    original = r.tempfile.TemporaryDirectory
+    def swap_link(**kwargs):
+        link.unlink(); link.symlink_to(unsafe)
+        return original(**kwargs)
+    with patch.object(r.tempfile, 'TemporaryDirectory', side_effect=swap_link):
+        with r.staging(link) as stage:
+            assert stage.parent == secure
+    assert not list(unsafe.iterdir())
+
+
+@pytest.mark.parametrize('recipient_usable', [False, True])
+def test_backup_recipient_must_encrypt_before_credential_replacement(tmp_path, recipient_usable):
+    host = tmp_path / 'host'; host.mkdir(mode=0o700)
+    original = b'working credential'
+    c.atomic_secret(host / 'backup.env', original)
+    public = 'age1' + secrets.token_hex(29)
+    replacement = 'BACKUP_AGE_RECIPIENT=' + public + '\nBACKUP_CONTAINER_SAS_URL=' + delegation() + '\n'
+    def encrypt(args, **kwargs):
+        assert (host / 'backup.env').read_bytes() == original
+        assert args == ['age', '--encrypt', '--recipient', public]
+        assert kwargs['output'].tell() == 0
+        assert 'sig=' not in repr(args)
+        if not recipient_usable:
+            raise r.RecoveryError('invalid age recipient')
+        kwargs['output'].write(b'encrypted empty payload')
+        return ''
+    with patch.object(c, 'HOST', host), patch.object(c, 'decrypt_input', return_value=replacement), \
+         patch.object(sys, 'argv', ['sfctl', 'set-backup-credential']), patch.object(r.signal, 'signal'), \
+         patch.object(r, 'run', side_effect=encrypt), patch.object(r, 'locked', __import__('contextlib').nullcontext):
+        if recipient_usable:
+            c.main()
+        else:
+            with pytest.raises(r.RecoveryError, match='invalid age recipient'):
+                c.main()
+    assert (host / 'backup.env').read_bytes() == (replacement.encode() if recipient_usable else original)
+
+
+@pytest.mark.parametrize('name', ['postgres-password', 'paperclip-secrets-master-key'])
+@pytest.mark.parametrize('phase', ['installing', 'restored-services-started'])
+def test_snapshot_bound_secrets_cannot_rotate_during_recovery(tmp_path, name, phase):
+    c.journal(phase)
+    original = secrets.token_hex(32).encode() + b'\n'
+    with patch.object(c, 'KIT', tmp_path):
+        c.atomic_secret(tmp_path / '.secrets' / name, original)
+        with patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(secrets.token_hex(32).encode()))), \
+             pytest.raises(r.RecoveryError, match='Recover the interrupted upgrade'):
+            c.secret_set(name, True)
+        assert (tmp_path / '.secrets' / name).read_bytes() == original
