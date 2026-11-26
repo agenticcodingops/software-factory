@@ -17,11 +17,49 @@ setup() {
   TARGET_SUB=$(python3 -c "import uuid; print(uuid.uuid5(uuid.NAMESPACE_DNS, 'target.example.test'))")
   python3 "$BATS_TEST_DIRNAME/fixture.py" init
   touch "$CALLS"
+  # Capture fake CLI controls out of band; production children receive an allowlist.
+  eval "$(declare -f run | sed '1s/run /bats_run /')"
+  # shellcheck disable=SC2317 # Bats invokes this harness wrapper indirectly.
+  run() {
+    python3 - <<'PYENV'
+import json, os
+from pathlib import Path
+(Path(os.environ['BATS_TEST_TMPDIR']) / 'bin/fixture-environment.json').write_text(json.dumps(dict(os.environ)))
+PYENV
+    bats_run "$@"
+  }
 }
 
 boot() { bash "$bootstrap" "$@" --attempts 1 --retry-delay 0; }
 trust() { boot trust --target primary --vault-subscription "$VAULT_SUB" --subscription "$TARGET_SUB" --resource-group rg-example --location example-region "$@"; }
-init() { boot init --org sample --instance-repo instance --reviewer first --probe-run 1 "$@"; }
+init() { reviewed_boot init --org sample --instance-repo instance --reviewer first --probe-run 1 "$@"; }
+# Simulate the operator's CODEOWNER-approved merge; bootstrap itself never merges.
+merge_bootstrap_pr() {
+  python3 - <<'PYMERGE'
+import json, os
+from pathlib import Path
+p = Path(os.environ['FAKE_DB']); cloud = json.loads(p.read_text())
+pr = cloud['pulls'][-1]
+cloud['files'] = cloud['branches'][pr['head']]
+cloud['pulls'].pop()
+p.write_text(json.dumps(cloud))
+PYMERGE
+}
+reviewed_boot() {
+  local result code attempt
+  for ((attempt=0; attempt<3; attempt++)); do
+    if result=$(boot "$@" 2>&1); then
+      printf '%s\n' "$result"
+      return 0
+    else
+      code=$?
+      printf '%s\n' "$result"
+    fi
+    if [[ "$result" != *'Merge bootstrap pull request'* ]]; then return "$code"; fi
+    merge_bootstrap_pr
+  done
+  return 1
+}
 assert_clean() {
   python3 - <<'PY'
 import json, os
@@ -74,7 +112,7 @@ assert_no_secrets() {
 }
 
 @test 'two distinct reviewers enable self-review prevention' {
-  run boot init --org sample --instance-repo instance --reviewer first,second --probe-run 1 --apply
+  run reviewed_boot init --org sample --instance-repo instance --reviewer first,second --probe-run 1 --apply
   [ "$status" -eq 0 ]
   rg '"prevent_self_review": true' "$CALLS"
 }
@@ -397,6 +435,8 @@ PYCODE
 }
 
 @test 'all remaining modes default to dry-run without key generation or remote mutations' {
+  run boot --revoke
+  [ "$status" -eq 0 ]
   run boot age-key --custody vault --escrow-cmd escrow
   [ "$status" -eq 0 ]
   run boot tailscale --token-stdin
@@ -415,7 +455,7 @@ PYCODE
 }
 
 @test 'init dispatches pinned per-environment probe but leaves setup incomplete until reviewers wait' {
-  run boot init --org sample --instance-repo instance --reviewer first --source-repo sample/source --release-sha "$(printf 'a%.0s' {1..40})" --apply
+  run reviewed_boot init --org sample --instance-repo instance --reviewer first --source-repo sample/source --release-sha "$(printf 'a%.0s' {1..40})" --apply
   [ "$status" -eq 1 ]
   [[ "$output" == *'Setup incomplete'* ]]
   rg 'sf-bootstrap-probe.yml/dispatches' "$CALLS"
@@ -767,7 +807,9 @@ home=Path(os.environ['SF_INSTANCE_DIR']);v=json.loads((home/'config/instance.tfv
 assert set(v['targets'])=={'primary'} and v['role_home_target']=='primary'
 r=json.loads((home/'config/targets/beta.json').read_text());assert r['status']=='removed'
 line=next(l for l in Path(os.environ['CALLS']).read_text().splitlines() if l.startswith('terraform '))
-root=Path(shlex.split(line)[1].split('=',1)[1]);providers=json.loads((root/'workload-subscriptions.tf.json').read_text())['provider']['azapi']
+root=Path(shlex.split(line)[1].split('=',1)[1]);assert not root.exists()
+snapshots=[json.loads(l[len('TF_RENDER '):]) for l in Path(os.environ['CALLS']).read_text().splitlines() if l.startswith('TF_RENDER ')]
+providers=next(s for s in snapshots if s['directory']==str(root))['workload-subscriptions.tf.json']['provider']['azapi']
 assert {p['subscription_id'] for p in providers}=={os.environ['SECOND_SUB'],os.environ['TARGET_SUB']}
 PY
   assert_clean
@@ -785,5 +827,187 @@ PY
   refute_match 'provider register|assignment create|^terraform ' "$CALLS"
   run trust --role-home-target primary --apply
   [ "$status" -eq 0 ]
+  assert_clean
+}
+
+@test 'admin bypass true or missing refuses init and federation' {
+  for bypass in true missing; do
+    export ADMIN_BYPASS="$bypass"
+    run init --apply
+    [ "$status" -eq 1 ]
+    [[ "$output" == *'admin bypass must be disabled'* ]]
+    run boot tailscale --print-subject
+    [ "$status" -eq 1 ]
+  done
+}
+
+@test 'init stages owned CODEOWNERS in a PR and preserves the previous gate receipt' {
+  run boot init --org sample --instance-repo instance --reviewer first --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Merge bootstrap pull request'* ]]
+  python3 - <<'PY'
+import base64, json, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR']); x=json.loads(Path(os.environ['FAKE_DB']).read_text())
+assert json.loads((home/'config/receipts/bootstrap.json').read_text())['gates_verified']
+assert '.github/CODEOWNERS' not in x['files']
+pr=x['pulls'][-1]
+text=base64.b64decode(x['branches'][pr['head']]['.github/CODEOWNERS']).decode()
+for line in text.splitlines():
+ assert len(line.split()) >= 2 and all(owner.startswith('@') for owner in line.split()[1:])
+assert text.splitlines()[-1] == '.github/workflows/ph-*.yml @first'
+PY
+}
+
+@test 'org merge gate retains previously covered repositories and excludes source' {
+  run boot rulesets --source-repo sample/source --release-sha "$(printf 'a%.0s' {1..40})" --apply
+  [ "$status" -eq 0 ]
+  run boot rulesets --instance-repo instance-b --source-repo sample/source --release-sha "$(printf 'a%.0s' {1..40})" --apply
+  [ "$status" -eq 0 ]
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+cloud=json.loads(Path(os.environ['FAKE_DB']).read_text())
+r=next(iter(cloud['rulesets']['orgs/sample/rulesets'].values()))
+assert set(r['conditions']['repository_name']['include']) == {'instance','instance-b'}
+assert 'source' in r['conditions']['repository_name']['exclude']
+PY
+}
+
+@test 'tailscale withdraws removed refs and replaces changed release claims' {
+  run bash -c 'printf "%s" tskey-api-fixture-secret | bash "$1" tailscale --token-stdin --apply' _ "$bootstrap"
+  [ "$status" -eq 0 ]
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR']); v=json.loads((home/'config/instance.tfvars.json').read_text()); c=json.loads((home/'config/receipts/oidc.json').read_text())
+v['workflow_refs']['plan']={}
+ref=c['claims']['deploy']['bootstrap']['job_workflow_ref'].replace('a'*40,'b'*40)
+v['workflow_refs']['deploy']['bootstrap']=ref
+c['claims']['deploy']['bootstrap']={'job_workflow_ref':ref,'sub':c['sub_claim_prefix']+':environment:production:job_workflow_ref:'+ref}
+(home/'config/instance.tfvars.json').write_text(json.dumps(v)); (home/'config/receipts/oidc.json').write_text(json.dumps(c))
+PY
+  run bash -c 'printf "%s" tskey-api-fixture-secret | bash "$1" tailscale --token-stdin --apply' _ "$bootstrap"
+  [ "$status" -eq 0 ]
+  run boot --print-subject
+  [ "$status" -eq 0 ]
+  [[ "$output" != *'environment:plan:'* ]]
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+x=json.loads(Path(os.environ['FAKE_DB']).read_text())
+assert len(x['federations']) == 1
+f=next(iter(x['federations'].values()))
+assert f['description']=='sf-production-bootstrap' and f['subject'].endswith('b'*40)
+assert 'TAILSCALE_SF_PLAN_BOOTSTRAP' not in x['variables']
+PY
+}
+
+@test 'backup migration requests metadata and policy and refuses missing recipient fingerprint' {
+  export MISSING_METADATA=1
+  run boot vault-move --phase backups --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'missing recipient_fp metadata'* ]]
+  rg -- '--include vmi' "$CALLS"
+  refute_match 'HTTP PUT.*destinationbackups' "$CALLS"
+  assert_clean
+}
+
+@test 'pending state migration retries empty destination and verifies source receipt' {
+  export FAIL='init -migrate-state'
+  run boot vault-move --phase state --apply
+  [ "$status" -eq 1 ]
+  assert_clean
+  unset FAIL
+  run boot vault-move --phase state --apply
+  [ "$status" -eq 0 ]
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+x=json.loads((Path(os.environ['SF_INSTANCE_DIR'])/'config/receipts/vault-move.json').read_text())
+assert all(s['status']=='verified' for s in x['states'].values())
+PY
+  assert_clean
+}
+
+@test 'age publication resumes after variable failure without generating another key' {
+  export FAIL='--method POST repos/sample/instance/actions/variables'
+  run boot age-key --custody operator --escrow-cmd escrow --apply
+  [ "$status" -eq 1 ]
+  unset FAIL
+  : > "$CALLS"
+  run boot age-key --custody operator --escrow-cmd escrow --apply
+  [ "$status" -eq 0 ]
+  refute_match '^age-keygen|^escrow ' "$CALLS"
+  rg 'AGE_RECIPIENT|AGE_FINGERPRINT' "$CALLS"
+}
+
+@test 'closed stdout plus HUP and repeated interruptions still revoke token and roles' {
+  export SIGNAL_TS=1
+  run python3 - "$bootstrap" <<'PYCLOSE'
+import subprocess, sys
+p=subprocess.Popen(['bash',sys.argv[1],'tailscale','--token-stdin','--apply'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+p.stdin.write(b'tskey-api-fixture-secret'); p.stdin.close(); p.stdin=None
+for line in p.stdout:
+ if line.startswith(b'READ curl '):
+  p.stdout.close(); p.stdout=None; break
+else:
+ raise AssertionError('Never reached token-authenticated request')
+p.communicate(timeout=20)
+assert p.returncode == 1
+PYCLOSE
+  [ "$status" -eq 0 ]
+  rg 'HTTP DELETE.*/keys/fixture' "$CALLS"
+  assert_clean
+}
+
+@test 'closed stdout plus repeated signals still removes recorded grants' {
+  export SIGNAL_GRANT=HUP
+  run python3 - "$bootstrap" <<'PYCLOSE'
+import subprocess, sys
+p=subprocess.Popen(['bash',sys.argv[1],'age-key','--custody','vault','--escrow-cmd','escrow','--apply'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+for line in p.stdout:
+ if line.startswith(b'APPLY az role assignment create '):
+  p.stdout.close(); p.stdout=None; break
+else:
+ raise AssertionError('Never reached temporary grant')
+p.communicate(timeout=20)
+assert p.returncode == 1
+PYCLOSE
+  [ "$status" -eq 0 ]
+  rg 'assignment delete' "$CALLS"
+  assert_clean
+}
+
+@test 'age escrow pending fingerprint recovers the same key after a lost response' {
+  export FAIL='secret set'
+  run boot age-key --custody vault --escrow-cmd escrow --apply
+  [ "$status" -eq 1 ]
+  unset FAIL
+  : > "$CALLS"
+  run boot age-key --custody vault --escrow-cmd escrow --key-cmd key-reader --apply
+  [ "$status" -eq 0 ]
+  refute_match '^age-keygen[[:space:]]*$' "$CALLS"
+  rg '^key-reader ' "$CALLS"
+  assert_clean
+}
+
+@test 'pending migration refuses changed source before retrying the copy' {
+  export FAIL='init -migrate-state'
+  run boot vault-move --phase state --apply
+  [ "$status" -eq 1 ]
+  unset FAIL
+  python3 - <<'PYSTATE'
+import json, os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); cloud=json.loads(p.read_text())
+cloud['backend_states']['sourcestate/trust.tfstate']['serial'] += 1
+p.write_text(json.dumps(cloud))
+PYSTATE
+  : > "$CALLS"
+  run boot vault-move --phase state --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Source state changed since pending migration'* ]]
+  refute_match 'init -migrate-state' "$CALLS"
   assert_clean
 }

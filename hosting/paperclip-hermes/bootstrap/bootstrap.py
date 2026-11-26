@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Operator-only bootstrap. No cloud credentials, key values or state are persisted.
+"""Operator-only bootstrap. No cloud credentials or key values are persisted.
 
 Only non-secret configuration/receipts and a crash-recovery assignment ledger are
 written, in an explicitly selected private directory outside this checkout.
+Terraform fallback state is isolated for explicit recovery; working trees are removed.
 Subprocess diagnostics are captured: SDK errors can echo secret request bodies.
 """
 import argparse
@@ -17,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -36,6 +38,33 @@ REF = re.compile(r"[\w.-]+/[\w.-]+/\.github/workflows/[\w-]+\.ya?ml@[a-f0-9]{40}
 TRUST_VARIABLES = {"prefix", "location", "vault_subscription_id", "vault_tenant_id", "target_tenant_id", "targets", "role_home_target", "target_client_id", "operator_object_id", "state_account_name", "sub_claim_prefix", "workflow_refs", "custody", "pilot_end_date", "container_retention_fallback"}
 HOST_VARIABLES = {"name", "resource_group_name", "subscription_resource_id", "location", "rg_managed_by", "ssh_public_key", "bootstrap_custom_data", "protocol_tags", "apps", "vm_size", "shutdown_time", "backup_time", "timezone", "allow_disk_destroy", "parked", "tags", "deallocator_role_id", "operator_email", "tenant_id", "alert_application", "pilot_monthly_cap", "headroom", "override_cost", "monthly_credit", "billing_month_verified"}
 PROVIDERS = ("Microsoft.Compute", "Microsoft.Network", "Microsoft.Logic", "Microsoft.Insights", "Microsoft.Consumption", "Microsoft.DevTestLab", "Microsoft.ManagedIdentity", "Microsoft.Storage", "Microsoft.KeyVault")
+INTERRUPTS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+CHILD_ENV = {"PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "XDG_CONFIG_HOME", "AZURE_CONFIG_DIR"}
+OUTPUT_FAILED = False
+
+
+def progress(*args, **kwargs):
+    """Logging must never prevent a mutation or its cleanup after terminal loss."""
+    global OUTPUT_FAILED
+    if OUTPUT_FAILED:
+        return
+    stream = kwargs.get("file", sys.stdout)
+    try:
+        print(*args, **{**kwargs, "flush": True})
+    except OSError:
+        OUTPUT_FAILED = True
+        # Interpreter shutdown also flushes stdout. Redirect its descriptor so
+        # a broken pipe cannot fail that final flush after successful cleanup.
+        try:
+            with open(os.devnull, "w", encoding="utf-8") as sink:
+                os.dup2(sink.fileno(), stream.fileno())
+        except (OSError, ValueError):
+            pass
+
+
+def child_environment(adapter=False):
+    allowed = {"PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ"} if adapter else CHILD_ENV
+    return {k: v for k, v in os.environ.items() if k in allowed}
 
 
 class Refusal(Exception):
@@ -90,6 +119,8 @@ class Bootstrap:
         self.tf_trees = {}
         self.tf_run = None
         self.trust_inventory = None
+        self.gh_verified = False
+        self.pending_files = {}
 
     def load(self, name, default=None):
         path = self.home / name
@@ -120,13 +151,13 @@ class Bootstrap:
             temporary.unlink(missing_ok=True)
 
     def run(self, *args, data=None, change=False, raw=False, pass_fds=(), env=None):
-        print(("APPLY " if change else "READ ") + shlex.join(map(str, args)) +
+        progress(("APPLY " if change else "READ ") + shlex.join(map(str, args)) +
               (" < [in-memory stdin]" if data is not None else ""), flush=True)
         if change and not self.a.apply:
             return b"" if raw else {}
-        environment = (env if env is not None else os.environ).copy()
-        environment.pop("GH_DEBUG", None)
-        environment.update(AZURE_LOGGING_ENABLE_LOG_FILE="false", AZURE_CORE_COLLECT_TELEMETRY="false")
+        environment = child_environment() if env is None else env.copy()
+        if args[0] in ("az", "terraform"):
+            environment.update(AZURE_LOGGING_ENABLE_LOG_FILE="false", AZURE_CORE_COLLECT_TELEMETRY="false")
         proc = subprocess.run(list(map(str, args)), input=data, stdin=subprocess.DEVNULL if data is None else None, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, check=False, pass_fds=pass_fds, env=environment)
         require(proc.returncode == 0, f"{args[0]} operation failed (diagnostics withheld; may contain secrets)")
@@ -138,7 +169,14 @@ class Bootstrap:
         return self.run("az", *args, "--only-show-errors", "--output", "json", **kwargs)
 
     def gh(self, path, method="GET", body=None, raw=False):
+        if method != "GET" and not self.gh_verified:
+            expected = self.cfg("operator_login")
+            user = self.run("gh", "api", "--hostname", "github.com", "user")
+            require(user.get("type") == "User" and user.get("login", "").casefold() == expected.casefold(),
+                    "GitHub operator login mismatch; use the operator's own gh auth login")
+            self.gh_verified = True
         args = ["gh", "api", "--method", method, path]
+        args += ["--hostname", "github.com"]
         if body is not None:
             args += ["--input", "/dev/stdin"]
         return self.run(*args, data=pack(body) if body is not None else None,
@@ -225,7 +263,7 @@ class Bootstrap:
             for entry in reversed(self.ledger):
                 self.az("role", "assignment", "delete", "--ids", entry["id"], "--subscription", entry["subscription"], change=True)
             if self.ledger:
-                print("DRY-RUN: read back removal of every temporary assignment; retain ledger if cleanup fails")
+                progress("DRY-RUN: read back removal of every temporary assignment; retain ledger if cleanup fails")
             return
         failures = []
         for entry in list(reversed(self.ledger)):
@@ -259,6 +297,7 @@ class Bootstrap:
             if env == "plan":
                 require(policy is None, "plan must have no branch restriction")
             else:
+                require(result.get("can_admins_bypass") is False, "Environment admin bypass must be disabled")
                 require(policy == {"protected_branches": False, "custom_branch_policies": True}, "Branch protection readback mismatch")
                 branches = self.gh(f"repos/{self.repo()}/environments/{env}/deployment-branch-policies")["branch_policies"]
                 require([(b["name"], b.get("type", "branch")) for b in branches] == [("main", "branch")], "Only main may deploy")
@@ -288,15 +327,13 @@ class Bootstrap:
         require(allowed, "Change org Actions allowed_actions to explicitly allow the pinned source workflows")
         reviewers = [self.gh(f"users/{u}")["id"] for u in self.cfg("reviewer").split(",")]
         require(1 <= len(reviewers) <= 6 and len(reviewers) == len(set(reviewers)), "Select one to six distinct reviewers")
-        if self.a.apply:
-            self.save("config/receipts/bootstrap.json", {"gates_verified": False})
         existing = self.gh(f"orgs/{org}/repos?per_page=100")
         require(len(existing) < 100, "Paginate the organization inventory before bootstrap (ambiguous repo existence)")
         matches = [r for r in existing if r["name"] == self.cfg("instance_repo")]
         if not matches:
             self.gh(f"orgs/{org}/repos", "POST", {"name": self.cfg("instance_repo"), "private": True, "auto_init": True})
             if not self.a.apply:
-                print("DRY-RUN: create missing template files, CODEOWNERS, immutable OIDC template; configure plan/ops/production/restore; read back protections and dispatch reviewer probe")
+                progress("DRY-RUN: create missing template files, CODEOWNERS, immutable OIDC template; configure plan/ops/production/restore; read back protections and dispatch reviewer probe")
                 return
         if self.a.apply:
             repo = self.gh(f"repos/{self.repo()}")
@@ -308,7 +345,7 @@ class Bootstrap:
                 self.gh(f"repos/{self.repo()}/branches/{repo['default_branch']}/rename", "POST", {"new_name": "main"})
                 repo = self.gh(f"repos/{self.repo()}")
             require(repo.get("default_branch") == "main", "Instance default branch must be main")
-            self.config.update(org=org, instance_repo=self.cfg("instance_repo"))
+            self.config.update(org=org, instance_repo=self.cfg("instance_repo"), operator_login=self.cfg("operator_login"))
             for key in ("source_repo", "release_sha"):
                 if getattr(self.a, key):
                     self.config[key] = getattr(self.a, key)
@@ -319,11 +356,14 @@ class Bootstrap:
             if self.load("config/instance.tfvars.json") is None:
                 self.save("config/instance.tfvars.json", json.loads((ROOT / "templates/instance/config/instance.tfvars.json").read_text()))
             owners = " ".join("@" + u for u in self.cfg("reviewer").split(","))
-            self.put_file(".github/CODEOWNERS", f".github/** {owners}\nconfig/** {owners}\n.github/workflows/ph-*.yml\n")
+            self.put_file(".github/CODEOWNERS", f".github/** {owners}\nconfig/** {owners}\n.github/workflows/ph-*.yml {owners}\n")
+            self.publish_files()
         self.setting(f"repos/{self.repo()}/actions/oidc/customization/sub",
                      {"use_default": False, "include_claim_keys": CLAIMS, "use_immutable_subject": True})
         for env in ENV.values():
             body = {"deployment_branch_policy": None if env == "plan" else {"protected_branches": False, "custom_branch_policies": True}}
+            if env != "plan":
+                body["can_admins_bypass"] = False
             if env in ("production", "restore"):
                 body.update(reviewers=[{"type": "User", "id": u} for u in reviewers],
                             prevent_self_review=len(reviewers) >= 2)
@@ -335,7 +375,7 @@ class Bootstrap:
                 if not branches:
                     self.gh(path, "POST", {"name": "main", "type": "branch"})
         if not self.a.apply:
-            print("DRY-RUN: verify environment readbacks, reviewer wait probe, then completed OIDC probes; no receipt")
+            progress("DRY-RUN: verify environment readbacks, reviewer wait probe, then completed OIDC probes; no receipt")
             return
         self.check_environments(reviewers)
         # Required workflows are a separate capability from environment reviewers.
@@ -350,6 +390,7 @@ class Bootstrap:
         self.save("config/receipts/setup.json", {"reviewers": reviewers, "merge_mode": merge_mode})
         if not self.a.probe_run:
             self.dispatch_probe(initial=True)
+            self.save("config/receipts/bootstrap.json", {"gates_verified": False})
             raise Refusal("Setup incomplete: rerun init --probe-run RUN after both production and restore are waiting for review")
         run = self.probe_metadata(self.a.probe_run)
         pending = self.gh(f"repos/{self.repo()}/actions/runs/{run['id']}/pending_deployments")
@@ -357,7 +398,7 @@ class Bootstrap:
         require(all(p.get("reviewers") for p in pending), "Reviewer probe has no reviewers")
         self.save("config/receipts/bootstrap.json", {"gates_verified": True, "reviewers": reviewers,
                                                      "probe_run": run["id"], "merge_mode": merge_mode})
-        print("Reviewer gates verified. Approve the harmless probe, then run oidc-probe --probe-run RUN to collect claims.")
+        progress("Reviewer gates verified. Approve the harmless probe, then run oidc-probe --probe-run RUN to collect claims.")
 
     def put_file(self, path, content, create_only=False):
         endpoint = f"repos/{self.repo()}/contents/{path}"
@@ -372,18 +413,48 @@ class Bootstrap:
             current = self.gh(endpoint + "?ref=main")
             if base64.b64decode(current["content"]) == content.encode():
                 return
-        body = {"message": "chore: configure operator bootstrap probe", "content": encoded, "branch": "main"}
-        if old:
-            body["sha"] = old["sha"]
-        self.gh(endpoint, "PUT", body)
-        if self.a.apply:
-            require(base64.b64decode(self.gh(endpoint + "?ref=main")["content"]) == content.encode(), "Probe file readback mismatch")
+        self.pending_files[path] = encoded
+
+    def publish_files(self):
+        """Stage a deterministic PR and resume only once its contents are on main."""
+        if not self.pending_files:
+            return
+        files = self.pending_files
+        self.pending_files = {}
+        branch = "sf-bootstrap-" + digest(pack(files))[:20]
+        endpoint = f"repos/{self.repo()}"
+        refs = self.gh(f"{endpoint}/git/matching-refs/heads/{branch}")
+        if not any(r["ref"] == "refs/heads/" + branch for r in refs):
+            main = self.gh(f"{endpoint}/git/ref/heads/main")["object"]["sha"]
+            self.gh(f"{endpoint}/git/refs", "POST", {"ref": "refs/heads/" + branch, "sha": main})
+        tree = self.gh(f"{endpoint}/git/trees/{branch}?recursive=1")
+        require(not tree.get("truncated"), "Bootstrap PR tree is truncated")
+        entries = {e["path"]: e for e in tree["tree"]}
+        for path, encoded in files.items():
+            body = {"message": "chore: configure operator bootstrap", "content": encoded, "branch": branch}
+            if path in entries:
+                current = self.gh(f"{endpoint}/contents/{path}?ref={branch}")
+                if base64.b64decode(current["content"]) == base64.b64decode(encoded):
+                    continue
+                body["sha"] = entries[path]["sha"]
+            self.gh(f"{endpoint}/contents/{path}", "PUT", body)
+            if self.a.apply:
+                require(base64.b64decode(self.gh(f"{endpoint}/contents/{path}?ref={branch}")["content"]) == base64.b64decode(encoded),
+                        "Bootstrap PR file readback mismatch")
+        pulls = self.gh(f"{endpoint}/pulls?state=open&head={self.cfg('org')}:{branch}&base=main")
+        if not pulls:
+            self.gh(f"{endpoint}/pulls", "POST", {"title": "chore: configure operator bootstrap", "head": branch, "base": "main",
+                    "body": "Review the bootstrap configuration and pinned probe caller, then merge through the repository rules. Rerun bootstrap after merging."})
+        raise Refusal(f"Merge bootstrap pull request from {branch} into main, then rerun the same command")
 
     def dispatch_probe(self, initial=False):
         refs = ({i: {"bootstrap": f"{self.cfg('source_repo')}/.github/workflows/sf-oidc-probe.yml@{self.cfg('release_sha')}"} for i in ENV}
                 if initial else self.load("config/instance.tfvars.json", {}).get("workflow_refs", {}))
         require(refs, "Owner must supply workflow_refs before probing")
-        nonce = str(uuid.uuid4())
+        pending = self.load("probe-pending.json", {})
+        nonce = pending["nonce"] if pending.get("refs") == refs else str(uuid.uuid4())
+        if self.a.apply:
+            self.save("probe-pending.json", {"nonce": nonce, "refs": refs})
         jobs = []
         for identity, entries in refs.items():
             require(identity in ENV and len(entries) <= 20, "Unknown identity or too many federations")
@@ -393,11 +464,14 @@ class Bootstrap:
                 jobs.append(f"  {identity}-{key}:\n    permissions:\n      contents: read\n      id-token: write\n    uses: {ref} # v1.0.0\n    with:\n      environment: {ENV[identity]}\n      probe_only: true\n      nonce: {nonce}\n")
         text = "name: Bootstrap OIDC probe\non: workflow_dispatch\npermissions: {}\njobs:\n" + "".join(jobs)
         self.put_file(".github/workflows/sf-bootstrap-probe.yml", text)
+        self.publish_files()
         if self.a.apply:
             caller = self.gh(f"repos/{self.repo()}/git/ref/heads/main")["object"]["sha"]
             self.save("probe-request.json", {"nonce": nonce, "refs": refs, "caller_sha": caller})
         self.gh(f"repos/{self.repo()}/actions/workflows/sf-bootstrap-probe.yml/dispatches", "POST", {"ref": "main"})
-        print("Probe dispatched on main. Inspect its run ID; no federation is enabled yet.")
+        if self.a.apply:
+            (self.home / "probe-pending.json").unlink(missing_ok=True)
+        progress("Probe dispatched on main. Inspect its run ID; no federation is enabled yet.")
 
     def probe_metadata(self, run_id):
         run = self.gh(f"repos/{self.repo()}/actions/runs/{run_id}")
@@ -473,13 +547,14 @@ class Bootstrap:
                 require(REF.fullmatch(ref) and claim.get("job_workflow_ref") == ref and
                         claim.get("sub") == f"{receipt['sub_claim_prefix']}:environment:{ENV[identity]}:job_workflow_ref:{ref}",
                         "Owner allowlist differs from real probe claims; re-probe before federation")
+        receipt["claims"] = {i: {k: receipt["claims"][i][k] for k in entries} for i, entries in refs.items()}
         return receipt, variables
 
     def print_subject(self):
         receipt, _ = self.federation()
         for identity in ("plan", "deploy"):
             for claim in receipt["claims"].get(identity, {}).values():
-                print(json.dumps(dict(claim, environment=ENV[identity], scopes=self.ts_scopes(identity),
+                progress(json.dumps(dict(claim, environment=ENV[identity], scopes=self.ts_scopes(identity),
                                       tags=[] if identity == "plan" else ["tag:pc-deployer"])))
 
     @staticmethod
@@ -487,11 +562,8 @@ class Bootstrap:
         return (["policy_file:read", "devices:core:read"] if identity == "plan" else
                 ["policy_file", "devices:posture_attributes", "devices:core:read", "auth_keys", "devices:core"])
 
-    def tf(self, stack, *args, data=None, change=False):
-        environment = os.environ.copy()
-        for key in list(environment):
-            if key.startswith(("ARM_", "TF_VAR_", "TF_CLI_ARGS")) or key in ("TF_LOG", "TF_LOG_PATH"):
-                environment.pop(key)
+    def tf(self, stack, *args, data=None, variables=None, change=False):
+        environment = child_environment()
         environment.update(ARM_USE_CLI="true", ARM_USE_OIDC="false", ARM_USE_MSI="false", ARM_STORAGE_USE_AZUREAD="true", TF_IN_AUTOMATION="true")
         session = self.tf_session or "operator"
         if self.a.apply:
@@ -515,8 +587,56 @@ class Bootstrap:
             directory = self.tf_trees[session] / "stacks" / stack
         else:
             directory = ROOT / "hosting/paperclip-hermes/terraform/stacks" / stack
-            print("DRY-RUN: render fresh contained Terraform tree with all target subscriptions; preserve disk protection")
-        return self.run("terraform", f"-chdir={directory}", *args, data=data, change=change, env=environment, raw=True)
+            progress("DRY-RUN: render fresh contained Terraform tree with all target subscriptions; preserve disk protection")
+        var_path = None
+        try:
+            if variables is not None:
+                if not self.a.apply:
+                    progress("DRY-RUN: supply variables using a private 0600 .tfvars.json file, then delete it")
+                    return self.run("terraform", f"-chdir={directory}", *args, change=True, env=environment, raw=True)
+                fd, name = tempfile.mkstemp(suffix=".tfvars.json", dir=self.tf_run)
+                var_path = Path(name)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(pack(variables))
+                args = (*args, "-var-file=" + name)
+                data = None
+            try:
+                return self.run("terraform", f"-chdir={directory}", *args, data=data, change=change, env=environment, raw=True)
+            except (Refusal, OSError, subprocess.SubprocessError):
+                self.recover_errored_state(directory)
+                raise
+        finally:
+            if var_path:
+                var_path.unlink(missing_ok=True)
+
+    def recover_errored_state(self, directory):
+        state = directory / "errored.tfstate"
+        if state.exists():
+            recovery = self.home / "recovery" / uuid.uuid4().hex
+            recovery.mkdir(parents=True, mode=0o700)
+            os.chmod(recovery.parent, 0o700)
+            destination = recovery / "errored.tfstate"
+            state.rename(destination)
+            os.chmod(destination, 0o600)
+            raise Refusal(f"Terraform could not persist state. Recovery required: terraform state push {destination} against the intended backend, then securely delete that file before continuing")
+
+    def remove_tf_tree(self):
+        if self.tf_run is not None:
+            recovery_failure = None
+            try:
+                # Catch fallback state even when a signal interrupted the call.
+                for state in self.tf_run.rglob("errored.tfstate"):
+                    try:
+                        self.recover_errored_state(state.parent)
+                    except Refusal as exc:
+                        recovery_failure = exc
+                        progress("REFUSED: " + str(exc), file=sys.stderr)
+            finally:
+                shutil.rmtree(self.tf_run)
+                self.tf_run = None
+                self.tf_trees.clear()
+            if recovery_failure:
+                raise recovery_failure
 
     def trust_vars(self, variables):
         return {k: v for k, v in variables.items() if k in TRUST_VARIABLES}
@@ -650,24 +770,24 @@ class Bootstrap:
                 require(host_vars.get("rg_managed_by") == "host" and host_vars.get("resource_group_name") == self.cfg("resource_group")
                         and host_vars.get("subscription_resource_id") == f"/subscriptions/{sub}", "Host RG bootstrap configuration mismatch")
                 self.tf("trust", "apply", "-input=false", "-auto-approve", "-target=module.trust.azurerm_role_definition.target",
-                        "-var-file=/dev/stdin", data=pack(tfvars), change=True)
+                        variables=tfvars, change=True)
                 if self.a.apply:
                     role_id = json.loads(self.tf("trust", "output", "-json", "deallocator_role_id"))
                     require(isinstance(role_id, str) and role_id.startswith("/subscriptions/"), "Invalid deallocator role ID")
                     host_vars["deallocator_role_id"] = role_id
                     self.save(f"config/host-{target}.tfvars.json", host_vars)
                 else:
-                    print("DRY-RUN: record trust deallocator_role_id in private host inputs before host RG initialization")
+                    progress("DRY-RUN: record trust deallocator_role_id in private host inputs before host RG initialization")
                 self.backend("host", host_backend)
                 self.tf("host", "apply", "-input=false", "-auto-approve", "-target=module.host.module.workload_rg[0]",
-                        "-var-file=/dev/stdin", data=pack(host_vars), change=True)
+                        variables=host_vars, change=True)
                 if self.a.apply:
                     require(self.az("group", "show", "--name", self.cfg("resource_group"), "--subscription", sub).get("name") == self.cfg("resource_group"),
                             "Host RG creation readback failed")
-        self.tf("trust", "apply", "-input=false", "-auto-approve", "-var-file=/dev/stdin", data=pack(tfvars), change=True)
+        self.tf("trust", "apply", "-input=false", "-auto-approve", variables=tfvars, change=True)
         if self.a.apply:
             # A no-diff refresh plan reads all settings back through the providers.
-            self.tf("trust", "plan", "-input=false", "-detailed-exitcode", "-var-file=/dev/stdin", data=pack(tfvars))
+            self.tf("trust", "plan", "-input=false", "-detailed-exitcode", variables=tfvars)
             auth = json.loads(self.tf("trust", "output", "-json", "authorization"))
             for identity, entries in variables["workflow_refs"].items():
                 for key in entries:
@@ -703,7 +823,7 @@ class Bootstrap:
         if self.a.close_pilot:
             self.close_pilot(variables, vault)
         usage = self.az("vm", "list-usage", "--location", self.cfg("location"), "--subscription", sub)
-        print("vCPU headroom: " + json.dumps([{ "family": x["name"]["value"], "available": x["limit"] - x["currentValue"]} for x in usage]))
+        progress("vCPU headroom: " + json.dumps([{ "family": x["name"]["value"], "available": x["limit"] - x["currentValue"]} for x in usage]))
         # Fail closed on absent cost data; never report zero for auth errors.
         cost = self.az("rest", "--method", "post", "--url", f"https://management.azure.com/subscriptions/{sub}/providers/Microsoft.CostManagement/forecast?api-version=2025-03-01",
                        "--body", "@/dev/stdin", data=pack(self.load("cost-query.json", {})))
@@ -712,7 +832,7 @@ class Bootstrap:
         columns = cost["properties"].get("columns", [])
         amounts = [i for i, c in enumerate(columns) if c.get("name", "").lower() in ("cost", "totalcost", "pretaxcost")]
         require(len(amounts) == 1, "Forecast must identify exactly one cost amount column")
-        print(f"Cost headroom: {variables['monthly_credit'] - sum(float(row[amounts[0]]) for row in rows):.2f}")
+        progress(f"Cost headroom: {variables['monthly_credit'] - sum(float(row[amounts[0]]) for row in rows):.2f}")
 
     def pilot_config(self, variables):
         from datetime import datetime, timezone
@@ -735,7 +855,7 @@ class Bootstrap:
         scope = f"/subscriptions/{vault}/resourceGroups/rg-{variables['prefix']}-vault"
         self.storage_grant(scope, "Storage Blob Data Owner", vault)
         if not self.a.apply:
-            print("DRY-RUN: enumerate all retained versions, lock unexpired Unlocked policies preserving expiry, verify complete inventory; keep uploads paused until cleanup")
+            progress("DRY-RUN: enumerate all retained versions, lock unexpired Unlocked policies preserving expiry, verify complete inventory; keep uploads paused until cleanup")
             return
         account = variables["prefix"] + "backups"
         def request(method, path, headers):
@@ -797,12 +917,19 @@ class Bootstrap:
                 stanza = (f"  {key}:\n    if: inputs.target == '{target}'\n    permissions:\n      contents: read\n      id-token: write\n    uses: {ref} # {releases[0]}\n    with:\n      target: {target}\n")
                 # Insert before the mapping ends, preserving every other byte,
                 # including comments and each other target's literal workflow SHA.
-                line = jobs.end_mark.line
+                line = jobs.end_mark.line if isinstance(jobs, yaml.MappingNode) else jobs.start_mark.line + 1
                 lines = text.splitlines(keepends=True)
                 lines.insert(line, stanza)
                 text = "".join(lines)
+            try:
+                result = yaml.safe_load(text)
+            except yaml.YAMLError as exc:
+                raise Refusal("Staged caller YAML is invalid") from exc
+            require(isinstance(result.get("jobs"), dict) and
+                    (key not in result["jobs"] if removing else result["jobs"].get(key, {}).get("uses") == refs[workflow]),
+                    "Staged caller job readback mismatch")
             self.save(path, text, plain=True)
-        print("Static caller changes staged in the private instance directory; submit them for CODEOWNER review.")
+        progress("Static caller changes staged in the private instance directory; submit them for CODEOWNER review.")
 
     def vault_info(self, side=None):
         value = self.config if side is None else self.load("migration.json", {}).get(side, {})
@@ -839,7 +966,26 @@ class Bootstrap:
         custody = self.a.custody or self.load("config/instance.tfvars.json", {}).get("custody", "operator")
         require(self.a.escrow_cmd, "--escrow-cmd required: private keys must never be printed")
         variables = self.load("config/instance.tfvars.json", {})
-        require(not variables.get("age_recipient") or self.a.rotate, "An age key already exists; use --rotate (historical keys stay enabled)")
+        pending = self.load("config/age-pending.json", {})
+        keys = self.load("config/age-keys.json", {})
+        if (pending and pending.get("status") == "escrow" and pending.get("operation") and
+                keys.get(pending["fingerprint"], {}).get("operation") == pending["operation"]):
+            variables.update(age_recipient=pending["recipient"], age_fingerprint=pending["fingerprint"], custody=pending["custody"])
+            pending["status"] = "publish"
+            if self.a.apply:
+                self.save("config/instance.tfvars.json", variables)
+                self.save("config/age-pending.json", pending)
+        resuming = pending and pending.get("status") == "escrow"
+        if pending and pending.get("status") != "publish":
+            require(self.a.key_cmd, "Pending age escrow: retrieve the recorded fingerprint using --key-cmd to resume the same key; no new key was generated")
+            custody = pending["custody"]
+        if not resuming and (pending or (variables.get("age_recipient") and not self.a.rotate)):
+            recipient = pending.get("recipient", variables.get("age_recipient"))
+            fingerprint = digest(recipient.encode())
+            require(keys.get(fingerprint, {}).get("recipient") == recipient and keys[fingerprint].get("enabled") is True,
+                    "Existing age recipient has no enabled fingerprint inventory")
+            self.publish_age(recipient, fingerprint, pending.get("rotate", False))
+            return
         vault = self.vault_info() if custody == "vault" else None
         if vault:
             self.grant(vault["key_vault_id"], "Key Vault Secrets Officer", vault["subscription"])
@@ -847,28 +993,39 @@ class Bootstrap:
                 # Verify data-plane propagation without exposing any key values.
                 self.retry(lambda: self.az("keyvault", "secret", "list", "--vault-name", vault["key_vault_name"], "--subscription", vault["subscription"]))
         if not self.a.apply:
-            print("DRY-RUN: age-keygen in memory -> escrow stdin -> verify escrow-derived recipient; publish public recipient/fingerprint")
+            progress("DRY-RUN: age-keygen in memory -> escrow stdin -> verify escrow-derived recipient; publish public recipient/fingerprint")
             if vault:
                 self.az("keyvault", "secret", "set", "--vault-name", vault["key_vault_name"], "--file", "/dev/stdin", change=True)
             return
-        key = self.run("age-keygen", raw=True)
+        key = (self.run(*shlex.split(self.a.key_cmd), raw=True, env=child_environment(adapter=True)) if resuming else
+               self.run("age-keygen", raw=True))
         recipient = self.age_recipient(key)
         fingerprint = digest(recipient.encode())
+        require(not resuming or (pending["recipient"] == recipient and pending["fingerprint"] == fingerprint), "Recovered escrow key differs from pending fingerprint")
+        rotate = pending.get("rotate", self.a.rotate)
+        operation = pending.get("operation", uuid.uuid4().hex)
+        self.save("config/age-pending.json", {"status": "escrow", "recipient": recipient, "fingerprint": fingerprint, "custody": custody, "rotate": rotate, "operation": operation})
         # The escrow adapter must store stdin and return ONLY the public recipient
         # after retrieving/deriving it. This provides readback without disclosure.
-        returned = self.run(*shlex.split(self.a.escrow_cmd), data=key, raw=True, change=True)
+        returned = self.run(*shlex.split(self.a.escrow_cmd), data=key, raw=True, change=True, env=child_environment(adapter=True))
         require(returned.decode().strip() == recipient, "Escrow readback must return the stored key's public recipient")
         uri = self.key_write(vault, key, fingerprint, recipient) if vault else None
         keys = self.load("config/age-keys.json", {})
-        keys[fingerprint] = {"recipient": recipient, "version_uri": uri, "enabled": True}
+        keys[fingerprint] = {"recipient": recipient, "version_uri": uri, "enabled": True, "operation": operation}
         self.save("config/age-keys.json", keys)
         variables.update(age_recipient=recipient, age_fingerprint=fingerprint, custody=custody)
         self.save("config/instance.tfvars.json", variables)
+        self.save("config/age-pending.json", {"status": "publish", "recipient": recipient, "rotate": rotate})
+        self.publish_age(recipient, fingerprint, rotate)
+
+    def publish_age(self, recipient, fingerprint, rotate):
         for name, value in (("AGE_RECIPIENT", recipient), ("AGE_FINGERPRINT", fingerprint)):
             self.setting(f"repos/{self.repo()}/actions/variables/{name}", {"name": name, "value": value})
-        if self.a.rotate:
+        if rotate:
             self.gh(f"repos/{self.repo()}/actions/workflows/ph-rotate-age.yml/dispatches", "POST", {"ref": "main"})
-        print("Public recipient: " + recipient + "; fingerprint: " + fingerprint)
+        if self.a.apply:
+            (self.home / "config/age-pending.json").unlink(missing_ok=True)
+        progress("Public recipient: " + recipient + "; fingerprint: " + fingerprint)
 
     def http(self, method, url, token, body=None, headers=None, change=False, binary=False, status_only=False, response_headers=False):
         # curl receives BOTH authentication and request data via anonymous pipes.
@@ -876,7 +1033,7 @@ class Bootstrap:
         import threading
         require(url.startswith("https://") and not any(c in url for c in '\r\n"'), "Invalid HTTPS endpoint")
         require(not any(c in token for c in '\r\n"'), "Invalid bearer token encoding")
-        print(f"{'APPLY' if change else 'READ'} HTTPS {method} " + url.split("?", 1)[0], flush=True)
+        progress(f"{'APPLY' if change else 'READ'} HTTPS {method} " + url.split("?", 1)[0], flush=True)
         if change and not self.a.apply:
             return b"" if binary else {}
         settings = [f'url = "{url}"', f'request = "{method}"', f'header = "Authorization: Bearer {token}"']
@@ -948,13 +1105,26 @@ class Bootstrap:
         receipt, _ = self.federation()
         require(self.a.token_stdin, "tailscale requires --token-stdin")
         if not self.a.apply:
-            print("DRY-RUN: read short-lived API token from stdin; GET settings/DNS; create/read exact federations; revoke/read token")
+            progress("DRY-RUN: read short-lived API token from stdin; GET settings/DNS; create/read exact federations; revoke/read token")
             return
         self.token = sys.stdin.read().strip()
         require(re.fullmatch(r"tskey-api-[A-Za-z0-9]+-[A-Za-z0-9]+", self.token), "Expected short-lived Tailscale API access token")
         require(self.ts("tailnet/-/settings").get("httpsEnabled") is True, "HTTPS certificates must be enabled")
         require(self.ts("tailnet/-/dns/preferences").get("magicDNS") is True, "MagicDNS must be enabled")
         existing = [self.ts(f"tailnet/-/keys/{entry['id']}") for entry in self.ts("tailnet/-/keys").get("keys", [])]
+        authorized = {"sf-" + ENV[i] + "-" + key for i in ("plan", "deploy") for key in receipt["claims"].get(i, {})}
+        for key in existing:
+            description = key.get("description", "")
+            if description.startswith(("sf-plan-", "sf-production-")) and description not in authorized:
+                self.ts(f"tailnet/-/keys/{key['id']}", "DELETE")
+                require(not any(k["id"] == key["id"] for k in self.ts("tailnet/-/keys").get("keys", [])), "Withdrawn federation deletion readback mismatch")
+                variable = "TAILSCALE_" + re.sub(r"\W", "_", description).upper()
+                variables_path = f"repos/{self.repo()}/actions/variables"
+                inventory = self.gh(variables_path + "?per_page=100")
+                require(inventory.get("total_count", 0) < 100, "Variable inventory needs pagination")
+                if any(v["name"] == variable for v in inventory.get("variables", [])):
+                    self.gh(f"{variables_path}/{variable}", "DELETE")
+                require(not any(v["name"] == variable for v in self.gh(variables_path + "?per_page=100").get("variables", [])), "Withdrawn federation variable deletion readback mismatch")
         result = {}
         for identity in ("plan", "deploy"):
             for key, claim in receipt["claims"].get(identity, {}).items():
@@ -964,6 +1134,10 @@ class Bootstrap:
                         "customClaimRules": {"job_workflow_ref": claim["job_workflow_ref"]}}
                 matches = [k for k in existing if k.get("description") == description]
                 require(len(matches) <= 1, "Ambiguous federated identity")
+                if matches and not subset(body, matches[0]):
+                    self.ts(f"tailnet/-/keys/{matches[0]['id']}", "DELETE")
+                    require(not any(k["id"] == matches[0]["id"] for k in self.ts("tailnet/-/keys").get("keys", [])), "Obsolete federation deletion readback mismatch")
+                    matches = []
                 if not matches:
                     # No policy write or tag ownership changes, even on API rejection.
                     created = self.ts("tailnet/-/keys", "POST", body)
@@ -973,6 +1147,9 @@ class Bootstrap:
                 readback = self.ts(f"tailnet/-/keys/{key_id}")
                 require(subset(body, readback) and readback.get("audience"), "Tailscale federation readback mismatch; use --print-subject fallback")
                 result[description] = {"client_id": key_id, "audience": readback["audience"], **claim}
+        remaining = self.ts("tailnet/-/keys").get("keys", [])
+        managed = [k for k in remaining if k.get("description", "").startswith(("sf-plan-", "sf-production-"))]
+        require({k["id"] for k in managed} == {v["client_id"] for v in result.values()}, "Managed Tailscale federation inventory readback mismatch")
         self.save("config/tailnet/federation.json", result)
         for name, value in result.items():
             variable = "TAILSCALE_" + re.sub(r"\W", "_", name).upper()
@@ -1001,6 +1178,13 @@ class Bootstrap:
             matches = [r for r in current if r["name"] == body["name"]]
             require(len(matches) <= 1, "Duplicate managed ruleset name")
             existing = self.gh(f"{endpoint}/{matches[0]['id']}") if matches else None
+            if template == "org-merge-gate":
+                selector = body["conditions"]["repository_name"]
+                if existing:
+                    previous = existing["conditions"]["repository_name"]
+                    selector["include"] = sorted(set(previous["include"]) | {self.cfg("instance_repo")})
+                    selector["exclude"] = list(previous.get("exclude", []))
+                selector["exclude"] = sorted(set(selector["exclude"]) | {source.split("/")[1]})
             if existing is None or not subset(body, existing):
                 result = self.gh(f"{endpoint}/{matches[0]['id']}" if matches else endpoint,
                                  "PUT" if matches else "POST", body)
@@ -1045,9 +1229,9 @@ class Bootstrap:
         require(fp in keys and keys[fp].get("enabled") is True and digest(keys[fp]["recipient"].encode()) == fp,
                 "Unknown/unreadable historical recipient fingerprint")
         if not self.a.apply:
-            print("DRY-RUN: ciphertext download | age decrypt with key pipe | age encrypt to ephemeral | restore-staging upload; verify ciphertext hash")
+            progress("DRY-RUN: ciphertext download | age decrypt with key pipe | age encrypt to ephemeral | restore-staging upload; verify ciphertext hash")
             return
-        key = self.run(*shlex.split(self.a.key_cmd), raw=True)
+        key = self.run(*shlex.split(self.a.key_cmd), raw=True, env=child_environment(adapter=True))
         require(self.age_recipient(key) == keys[fp]["recipient"], "Historical key recipient mismatch")
         token = self.blob_token(self.cfg("subscription"))
         encrypted = self.blob(self.cfg("backup_account"), "backups", source, token, version=self.a.version)
@@ -1068,9 +1252,9 @@ class Bootstrap:
         os.write(identity_write, key)
         os.close(identity_write)
         decrypt = subprocess.Popen(["age", "-d", "-i", f"/dev/fd/{identity_read}"], pass_fds=(identity_read,),
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=child_environment(adapter=True))
         os.close(identity_read)
-        encrypt = subprocess.Popen(["age", "-r", recipient], stdin=decrypt.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        encrypt = subprocess.Popen(["age", "-r", recipient], stdin=decrypt.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=child_environment(adapter=True))
         decrypt.stdout.close()
         def feed():
             try:
@@ -1131,12 +1315,21 @@ class Bootstrap:
                 stack = "host" if state_key.startswith("host") else state_key
                 self.tf_session = "migration-" + state_key
                 old, new = src["backends"][state_key], dst["backends"][state_key]
+                if not self.a.apply:
+                    progress(f"DRY-RUN: {state_key}: inspect destination/source lineage, serial and inventory; migrate only matching source into empty destination and verify")
+                    continue
                 prior = receipt["states"].get(state_key)
                 if prior:
-                    # Never point back to the source after a possibly completed
-                    # migration. Inspect only the recorded destination on resume.
+                    require(prior["backend"] == new, "Migration destination changed from receipt")
                     self.backend(stack, new)
                     summary = prior
+                    right = json.loads(self.tf(stack, "state", "pull") or b"{}")
+                    if not right.get("lineage") and right.get("serial") is None:
+                        require(prior.get("status") == "pending", "Previously verified destination state is missing")
+                        self.backend(stack, old)
+                        left = json.loads(self.tf(stack, "state", "pull"))
+                        require(self.state_matches(summary, left), "Source state changed since pending migration; workflows must stay paused")
+                        self.backend(stack, new, migrate=True)
                 else:
                     self.backend(stack, old)
                     before = self.tf(stack, "state", "pull")
@@ -1149,8 +1342,7 @@ class Bootstrap:
                     self.backend(stack, new, migrate=True)
                 if self.a.apply:
                     right = json.loads(self.tf(stack, "state", "pull"))
-                    require(summary["lineage"] == right.get("lineage") and summary["serial"] == right.get("serial") and
-                            summary["inventory_hash"] == digest(pack(right.get("resources"))),
+                    require(self.state_matches(summary, right),
                             "Migrated state lineage/serial/inventory mismatch; workflows must stay paused")
                     receipt["states"][state_key] = dict(summary, status="verified")
                     self.save("config/receipts/vault-move.json", receipt)
@@ -1160,14 +1352,15 @@ class Bootstrap:
             for side in (src, dst):
                 if self.a.apply:
                     self.retry(lambda side=side: self.az("storage", "blob", "list", "--account-name", side["backup_account"], "--container-name", "backups", "--auth-mode", "login", "--subscription", side["subscription"]))
-            blobs = self.az("storage", "blob", "list", "--account-name", src["backup_account"], "--container-name", "backups", "--include", "v", "--num-results", "*", "--auth-mode", "login", "--subscription", src["subscription"])
+            blobs = self.az("storage", "blob", "list", "--account-name", src["backup_account"], "--container-name", "backups", "--include", "vmi", "--num-results", "*", "--auth-mode", "login", "--subscription", src["subscription"])
             if not self.a.apply:
-                print("DRY-RUN: copy every retained blob/version; compare both ciphertext hashes and destination WORM; preserve metadata and source")
+                progress("DRY-RUN: copy every retained blob/version; compare both ciphertext hashes and destination WORM; preserve metadata and source")
                 return
             source_token, destination_token = self.blob_token(src["subscription"]), self.blob_token(dst["subscription"])
             destination_inventory = self.az("storage", "blob", "list", "--account-name", dst["backup_account"], "--container-name", "backups", "--num-results", "*", "--auth-mode", "login", "--subscription", dst["subscription"])
             existing_names = {blob["name"] for blob in destination_inventory}
             for blob in blobs:
+                require(blob.get("metadata", {}).get("recipient_fp"), "Retained backup version is missing recipient_fp metadata")
                 name, version = blob["name"], blob.get("versionId")
                 source_key = pack([name, version]).decode()
                 destination = "backups/migrated/" + digest(source_key.encode()) + ".age"
@@ -1210,7 +1403,7 @@ class Bootstrap:
                 require(entry["version_uri"].startswith(f"https://{src['key_vault_name']}.vault.azure.net/secrets/age-{fp}/"),
                         "Historical key version is outside the scoped source secret")
                 if not self.a.apply:
-                    print("DRY-RUN: exact source secret version -> memory -> enabled destination version stdin; verify derived recipient")
+                    progress("DRY-RUN: exact source secret version -> memory -> enabled destination version stdin; verify derived recipient")
                     continue
                 secret = self.retry(lambda: self.az("keyvault", "secret", "show", "--id", entry["version_uri"], "--subscription", src["subscription"]))
                 require(secret.get("attributes", {}).get("enabled") is True and self.age_recipient(secret["value"].encode()) == entry["recipient"], "Historical key fingerprint/recipient mismatch")
@@ -1230,6 +1423,13 @@ class Bootstrap:
         # a module: that could delete storage/identities and their dependencies.
         backend = self.config.get("backends", {}).get("trust")
         require(backend, "Revocation requires the existing private trust backend")
+        scope = (f"/subscriptions/{backend['subscription_id']}/resourceGroups/{backend['resource_group_name']}"
+                 f"/providers/Microsoft.Storage/storageAccounts/{backend['storage_account_name']}/blobServices/default/containers/tfstate")
+        self.storage_grant(scope, "Storage Blob Data Contributor", backend["subscription_id"])
+        if not self.a.apply:
+            progress("DRY-RUN: initialize trust backend, list authorization leaves, destroy only those leaves and verify removal")
+            return
+        self.retry(lambda: self.az("storage", "blob", "list", "--account-name", backend["storage_account_name"], "--container-name", "tfstate", "--auth-mode", "login", "--subscription", backend["subscription_id"]))
         self.backend("trust", backend)
         addresses = self.tf("trust", "state", "list").decode().splitlines()
         selected = [s for s in addresses if re.search(r"\.(?:azurerm_federated_identity_credential|azurerm_role_assignment)\.", s)]
@@ -1237,12 +1437,17 @@ class Bootstrap:
         require(all(s.startswith("module.trust.") for s in selected), "Unexpected authorization state addresses")
         variables = self.load("config/instance.tfvars.json", {})
         # Trust variables may include non-Terraform operator settings; select the
-        # same public contract as trust apply instead of persisting a tfvars file.
-        self.tf("trust", "destroy", "-input=false", "-auto-approve", "-var-file=/dev/stdin",
-                *[f"-target={s}" for s in selected], data=pack(self.trust_vars({**variables, "target_client_id": None})), change=True)
+        # same public contract and private temporary JSON file as trust apply.
+        self.tf("trust", "destroy", "-input=false", "-auto-approve",
+                *[f"-target={s}" for s in selected], variables=self.trust_vars({**variables, "target_client_id": None}), change=True)
         if self.a.apply:
             remaining = self.tf("trust", "state", "list").decode().splitlines()
             require(not set(selected).intersection(remaining), "Revocation readback failed")
+
+    @staticmethod
+    def state_matches(summary, state):
+        return (summary["lineage"] == state.get("lineage") and summary["serial"] == state.get("serial") and
+                summary["inventory_hash"] == digest(pack(state.get("resources"))))
 
 
 def parser():
@@ -1252,7 +1457,7 @@ def parser():
     action.add_argument("--apply", action="store_true")
     action.add_argument("--dry-run", action="store_true")
     p.add_argument("--instance-dir", default=os.environ.get("SF_INSTANCE_DIR", "../sf-instance-private"))
-    for name in ("org", "instance-repo", "reviewer", "source-repo", "release-sha", "vault-subscription", "subscription", "target", "role-home-target", "resource-group", "location", "escrow-cmd", "probe-run", "key-cmd", "blob", "version", "backup-account", "staging-account", "staging-blob", "ephemeral-recipient"):
+    for name in ("org", "operator-login", "instance-repo", "reviewer", "source-repo", "release-sha", "vault-subscription", "subscription", "target", "role-home-target", "resource-group", "location", "escrow-cmd", "probe-run", "key-cmd", "blob", "version", "backup-account", "staging-account", "staging-blob", "ephemeral-recipient"):
         p.add_argument("--" + name)
     p.add_argument("--vault-mode", choices=["separate-subscription", "same-subscription"])
     p.add_argument("--scope", choices=["resource-group", "subscription"], help="resource-group by default; preserve existing target ownership when omitted")
@@ -1281,9 +1486,14 @@ def main():
             except BlockingIOError as exc:
                 raise Refusal("Another bootstrap process holds the local lock") from exc
         require(not app.ledger or args.mode == "cleanup", "Unfinished assignment ledger: run cleanup --apply before resuming")
+        require(args.mode == "cleanup" or not list((app.home / "recovery").glob("*/errored.tfstate")), "Recover errored.tfstate with terraform state push against its intended backend, then securely delete it before continuing")
+        interruption = {"raised": False}
         def interrupted(signum, _frame):
+            if interruption["raised"]:
+                return
+            interruption["raised"] = True
             raise Refusal(f"Interrupted by signal {signum}; running cleanup")
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        for sig in INTERRUPTS:
             signal.signal(sig, interrupted)
         try:
             if args.revoke:
@@ -1293,8 +1503,10 @@ def main():
             elif args.mode != "cleanup":
                 getattr(app, args.mode.replace("-", "_"))()
         finally:
+            interruption["raised"] = True
+            signal.pthread_sigmask(signal.SIG_BLOCK, INTERRUPTS)
             # A second interruption must not skip ledger persistence/cleanup.
-            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            for sig in INTERRUPTS:
                 signal.signal(sig, signal.SIG_IGN)
             try:
                 try:
@@ -1302,11 +1514,14 @@ def main():
                 except (Refusal, ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
                     raise Refusal("TOKEN CLEANUP FAILED: revoke the short-lived API token in the Tailscale console") from exc
             finally:
-                app.cleanup()
+                try:
+                    app.cleanup()
+                finally:
+                    app.remove_tf_tree()
         if args.apply and not args.print_subject:
             receipt = {"mode": "revoke" if args.revoke else args.mode, "success": True, "temporary_roles_removed": True}
             app.save("config/receipts/last-bootstrap-operation.json", receipt)
-            print(json.dumps(receipt, sort_keys=True))
+            progress(json.dumps(receipt, sort_keys=True))
 
 
 if __name__ == "__main__":
@@ -1314,5 +1529,5 @@ if __name__ == "__main__":
         main()
     except (Refusal, KeyError, ValueError, OSError, zipfile.BadZipFile, subprocess.SubprocessError) as error:
         # Never interpolate SDK responses or arbitrary exception text.
-        print("REFUSED: " + (str(error) if isinstance(error, Refusal) else "Invalid configuration or tool response; no secret diagnostics emitted"), file=sys.stderr)
+        progress("REFUSED: " + (str(error) if isinstance(error, Refusal) else "Invalid configuration or tool response; no secret diagnostics emitted"), file=sys.stderr)
         sys.exit(1)

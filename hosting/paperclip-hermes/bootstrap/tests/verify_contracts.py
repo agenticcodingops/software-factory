@@ -32,6 +32,8 @@ def expand(text, values):
     return re.sub(r'\$\{var\.(\w+)\}', lambda m: str(values[m[1]]), text)
 
 
+rendered = {v['directory']: v for line in LINES if line.startswith('TF_RENDER ') for v in [json.loads(line[len('TF_RENDER '):])]}
+
 calls, applied = [], {}
 for line in LINES:
     if line.startswith('terraform '):
@@ -48,13 +50,16 @@ for line in LINES:
         assert required <= supplied.keys(), (stack, 'missing inputs', required - supplied.keys())
         applied[stack] = supplied
         assert directory.resolve().is_relative_to(HOME)
-        assert (directory.parents[1] / 'modules/host/main.tf').read_text().count('prevent_destroy = true') == 1
+        # The fixture snapshots non-secret source while Terraform is running.
+        # The actual working tree must be gone when bootstrap returns.
+        assert not directory.exists()
+        assert rendered[str(directory)]['host_prevent_destroy'] == 1
         if stack == 'trust':
-            generated = json.loads((directory / 'workload-subscriptions.tf.json').read_text())
+            generated = rendered[str(directory)]['workload-subscriptions.tf.json']
             subscriptions = {t['subscription_resource_id'].split('/')[2] for t in supplied['targets'].values()}
             assert subscriptions <= {p['subscription_id'] for p in generated['provider']['azapi']}
             assert all(p['skip_provider_registration'] is True and p['client_id'] == '${var.target_client_id}' for p in generated['provider']['azapi'])
-            assert 'merge(' in json.loads((directory / 'composition_override.tf.json').read_text())['module']['trust']['workload_resource_group_ids']
+            assert 'merge(' in rendered[str(directory)]['composition_override.tf.json']['module']['trust']['workload_resource_group_ids']
 
 if 'trust' in applied:
     supplied = applied['trust']

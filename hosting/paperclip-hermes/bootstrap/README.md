@@ -14,37 +14,59 @@ operator login caches belong to the operator's CLI sessions.
 
 Use `--instance-dir /absolute/private/directory` or `SF_INSTANCE_DIR`. This must
 resolve outside the public checkout. It holds only configuration, public claims,
-receipts, fresh rendered Terraform source/backend metadata and an assignment ledger. Never put
+receipts and an assignment ledger. Rendered Terraform trees and temporary 0600 JSON
+var-files are removed in every exit path, after role cleanup. Never put
 credentials in configuration, CLI arguments, Terraform variables or backend
 settings. No private key, SAS, bearer token, plan or pulled state is written by
-bootstrap. Subprocess failures intentionally hide diagnostics that could contain
+bootstrap. Terraform itself can write `errored.tfstate` when a backend save fails.
+Bootstrap detects that file, moves it to a private 0600 `recovery/ID/errored.tfstate`,
+reports `terraform state push` recovery instructions and blocks further work until
+the operator recovers and securely deletes it. `cleanup` remains available. This
+explicit recovery exception preserves the only copy of unsaved state. Subprocess failures intentionally hide diagnostics that could contain
 request bodies. Decrypted archives pass directly between the two age processes.
 Ciphertext is held in memory during copying; provision memory for the largest blob.
 
 ## Configuration and modes
 
 `bootstrap.json` supplies reusable CLI defaults: `org`, `instance_repo`,
-`source_repo`, `release_sha`, and, for custody operations, `subscription`,
+`operator_login` (or `--operator-login LOGIN`), `source_repo`, `release_sha`, and, for custody operations, `subscription`,
 `key_vault_id`, `key_vault_name`. These names and resource IDs belong only in the
 private instance directory. `config/instance.tfvars.json` extends the instance
 skeleton with WP4's `prefix`, `location`, `state_account_name`, `pilot_end_date`,
 `monthly_credit`, immutable `role_home_target`, and Owner-authorized `workflow_refs`. Prefixes match the trust root: 1–17 lowercase alphanumeric characters. Trust and host initialization pass only variables
 accepted by the corresponding root; backend authentication explicitly uses the
-operator CLI, Entra authentication and `use_oidc=false`. Environment credential
-and Terraform argument overrides are removed from Terraform subprocesses.
+operator CLI, Entra authentication and `use_oidc=false`. Every subprocess receives an environment allowlist: `PATH`, `HOME`, `LANG`,
+`LC_ALL`, `LC_CTYPE`, `TZ`, plus `XDG_CONFIG_HOME` and `AZURE_CONFIG_DIR` for CLIs.
+Escrow/key adapters and age receive only the first six variables; configure adapters
+through local files or non-secret arguments. Shell tokens, GitHub host overrides,
+Terraform arguments and cloud credential overrides are never inherited. GitHub is
+fixed to github.com and `gh api user` must identify the configured human operator
+before the first write. Terraform receives only bootstrap-controlled ARM settings.
 
-1. `init --org ORG --instance-repo REPO --reviewer LOGIN[,LOGIN] --source-repo SOURCE --release-sha SHA --apply`
+1. `init --operator-login LOGIN --org ORG --instance-repo REPO --reviewer LOGIN[,LOGIN] --source-repo SOURCE --release-sha SHA --apply`
    requires a verifiable Enterprise organization and an Actions policy allowing
    the pinned reusable workflows. It creates a private repository, copies missing
    files from `templates/instance/`, writes CODEOWNERS, configures immutable OIDC
    claims and environment gates, then dispatches a harmless probe on `main`.
+   Template, CODEOWNERS and probe changes are committed to a deterministic branch
+   and opened as a PR. Merge it with the required reviews, then rerun the same
+   command; bootstrap never adds a bypass actor or writes files directly to main.
+   Once rulesets are active, another listed CODEOWNER must approve the operator's PR;
+   configure enough reviewers for that approval to be possible.
+   A probe nonce stays pending across this review and the dispatched request records
+   the reviewed caller commit on main. Initial setup may require two such PRs.
    Existing instance settings are preserved. The initial invocation deliberately
    returns incomplete. Inspect the run ID and rerun with `--probe-run RUN` while
    **both** production and restore are waiting for review. This verifies approval
    enforcement without approving anything. Only then does bootstrap write its
-   successful gate receipt. Reconfiguration invalidates the old receipt first.
+   successful gate receipt. Awaiting a PR preserves the previous gate receipt;
+   live environment/template readbacks still guard every federation. A successfully
+   dispatched new reviewer probe marks setup incomplete until its gates are verified.
    One reviewer permits self-review; two distinct reviewers prevent it. `plan`
    has no branch restrictions; the other environments allow only `main` branches.
+   Admin bypass is explicitly disabled and read back for production, restore and ops.
+   CODEOWNERS assigns the operator to every generated pattern, including callers.
+   The future automatic ref-bump carve-out remains disabled until separately reviewed.
    Organization workflow enforcement is separate: caller merges stay operator-only
    until `rulesets` successfully installs and verifies the pinned required workflow.
 2. Approve the harmless run yourself. `oidc-probe --probe-run RUN --apply`
@@ -85,7 +107,11 @@ and Terraform argument overrides are removed from Terraform subprocesses.
    `--custody vault` also acquires and verifies temporary Key Vault Secrets Officer
    access on the instance vault, writes `age-FINGERPRINT` through `/dev/stdin`,
    verifies the enabled exact version and derived recipient, and removes the role.
-   Public values are read back from GitHub variables. `--rotate` retains every old
+   Public values are read back from GitHub variables. A failed publication resumes
+   the existing recipient without generating a key. Before escrow, a pending public
+   fingerprint is saved; after an uncertain escrow response, use `--key-cmd` to
+   retrieve that exact key and resume (the adapter can use the pending fingerprint).
+   `--rotate` retains every old
    map entry enabled and dispatches `ph-rotate-age`; no key retirement is offered.
    Retirement still needs the ADR's 45-day inventory/retention checks.
 5. `tailscale --token-stdin --apply` consumes a short-lived API token through stdin,
@@ -94,8 +120,10 @@ and Terraform argument overrides are removed from Terraform subprocesses.
    audience, then stores only non-secret IDs/audiences. Creation uses the upstream
    keys API with `keyType=federated`. The token is revoked on success and failure;
    HTTP 401 is required as revocation readback. A cleanup failure explicitly requests
-   console revocation. Existing federations are looked up by managed description;
-   incompatible existing settings fail closed. This mode never writes policy,
+   console revocation. Only currently Owner-authorized refs are used, even when
+   the probe receipt also contains older claims. Managed descriptions are reconciled:
+   changed claims are deleted and recreated, withdrawn refs and their repository
+   variables are deleted, and the remaining managed key inventory is read back. This mode never writes policy,
    settings or tag ownership and never joins a device. If creation needs reviewed
    tag ownership, finish the separate hardening PR and retry. `tailscale
    --print-subject` (or top-level `--print-subject`) prints claims, scopes and tags
@@ -103,7 +131,9 @@ and Terraform argument overrides are removed from Terraform subprocesses.
 6. `rulesets --source-repo SOURCE --release-sha SHA --apply` resolves the committed
    public, instance and org payloads at their distinct endpoints. It requires a
    tagged release containing the gate file, fills the numeric source ID, full SHA
-   and exact instance selector, then creates/updates by name and compares full
+   and instance selector, unions existing org repository includes with this instance
+   while retaining exclusions and excluding the source repo, then creates/updates
+   by name and compares full
    readbacks, including rule parameters and all arrays. It never treats a list
    summary as proof. API errors fail closed; unsupported org rulesets retain the
    operator-only merge path.
@@ -116,11 +146,16 @@ and Terraform argument overrides are removed from Terraform subprocesses.
    archive is persisted. Unknown fingerprints and failed age processes stop upload.
 8. `--revoke --apply` destroys only enumerated federated-credential and role-assignment
    leaf addresses in the existing private trust backend, then verifies removal.
+   It first acquires temporary Blob Data Contributor access on the unlocked vault RG
+   and waits for data-plane propagation before initializing that backend. Dry-run
+   describes the state checks without reading an uninitialized backend.
    It never targets entire identity modules, resource groups, vaults or disks.
    Normal resources and data retention remain intact.
 9. `cleanup --apply` retries unfinished assignment ledgers before any new work.
    Each temporary assignment ID is durably recorded **before** creation. Success,
    failure, lost grant responses and INT/TERM/HUP all attempt removal and verify it.
+   Output is best effort after terminal loss. The signal handler raises once;
+   INT/TERM/HUP are blocked during token, assignment and working-tree cleanup.
    Failed cleanup retains the ledger and blocks subsequent operations. SIGKILL or
    power loss cannot run handlers; the next invocation requires ledger cleanup.
 
@@ -149,11 +184,14 @@ management. Trust's normal ops writer remains unchanged.
 
 State migration uses `terraform init -migrate-state` with Entra authentication.
 Before migration a pending per-stack receipt records lineage, serial and resource
-inventory hash. Readback must match before that backend is verified. Retries inspect
-only the recorded destination, including after an interrupted migration; a mismatch
-keeps workflows paused for operator recovery. No implicit reverse migration occurs.
+inventory hash. Readback must match before that backend is verified. Retries first
+inspect the recorded destination. An empty pending destination permits retry only
+after the source still matches every recorded field. A nonempty mismatch or a
+changed source keeps workflows paused. Verified destinations are never migrated
+backwards. Dry-run describes these checks without running state pull/list.
 
-Backups include all retained versions, stream only ciphertext, preserve metadata,
+Backups request versions, metadata and immutability policies together (`--include vmi`),
+require every version to carry `recipient_fp`, stream only ciphertext, preserve metadata,
 use unique destination names and compare both hashes and destination WORM expiry.
 Source blobs are never overwritten or deleted. Repeat this phase for a final delta.
 Keys copy every mapped exact historical version in memory, write enabled destination

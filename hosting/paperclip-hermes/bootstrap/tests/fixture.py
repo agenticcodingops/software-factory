@@ -12,6 +12,11 @@ import sys
 import zipfile
 import uuid
 
+# Test harness control data is outside the production child environment.
+fixture_env = Path(sys.argv[0]).parent / 'fixture-environment.json'
+if fixture_env.exists():
+    os.environ.update(json.loads(fixture_env.read_text()))
+
 HOME = Path(os.environ['SF_INSTANCE_DIR'])
 DB = Path(os.environ['FAKE_DB'])
 LOG = Path(os.environ['CALLS'])
@@ -39,7 +44,7 @@ def initialize():
     variables = {'prefix': 'example', 'state_account_name': 'examplestate', 'location': 'example-region', 'workflow_refs': refs,
                  'custody': 'vault', 'pilot_end_date': '2030-01-01T00:00:00Z', 'monthly_credit': 100, 'role_home_target': 'primary',
                  'targets': {'primary': {'subscription_resource_id': '/subscriptions/' + TARGET_SUB, 'resource_group_name': 'rg-example', 'location': 'example-region', 'rg_managed_by': 'trust'}}}
-    write(HOME / 'bootstrap.json', {'org': 'sample', 'instance_repo': 'instance', 'subscription': VAULT_SUB, 'staging_account': 'examplestaging',
+    write(HOME / 'bootstrap.json', {'org': 'sample', 'operator_login': 'operator', 'instance_repo': 'instance', 'subscription': VAULT_SUB, 'staging_account': 'examplestaging',
           'backends': {'trust': {'storage_account_name': 'examplestate', 'resource_group_name': 'rg-example-vault', 'subscription_id': VAULT_SUB, 'tenant_id': 'tenant-placeholder', 'key': 'trust.tfstate'}},
           'key_vault_id': f'/subscriptions/{VAULT_SUB}/resourceGroups/rg-example-vault/providers/Microsoft.KeyVault/vaults/examplevault',
           'key_vault_name': 'examplevault'})
@@ -60,7 +65,7 @@ def initialize():
     write(HOME / 'migration.json', dict(sides, paused=True, lock_id='fixture-lease'))
     envs = {}
     for env in ENVS.values():
-        envs[env] = {'deployment_branch_policy': None if env == 'plan' else {'protected_branches': False, 'custom_branch_policies': True},
+        envs[env] = {'can_admins_bypass': False, 'deployment_branch_policy': None if env == 'plan' else {'protected_branches': False, 'custom_branch_policies': True},
                      'protection_rules': []}
         if env in ('production', 'restore'):
             envs[env]['protection_rules'] = [{'type': 'required_reviewers', 'prevent_self_review': False, 'reviewers': [{'reviewer': {'id': 1}}]}]
@@ -128,12 +133,13 @@ if exe == 'age':
 if exe == 'tailscale':
     sys.exit(91)  # Bootstrap must never join the operator/CI device.
 if exe == 'gh':
-    method = option('--method')
-    path = args[args.index('--method') + 2]
+    method = option('--method', 'GET')
+    path = args[args.index('--method') + 2] if '--method' in args else args[-1]
     value = body() if '--input' in args else None
     if value is not None:
         with LOG.open('a') as log:
             log.write('GH_BODY ' + json.dumps(value) + '\n')
+    if path == 'user': out({'login': os.environ.get('GH_LOGIN', 'operator'), 'type': 'User'})
     if path == 'orgs/sample': out({'plan': {'name': os.environ.get('PLAN', 'enterprise')}})
     if path == 'orgs/sample/actions/permissions': out({'enabled_repositories': 'all', 'allowed_actions': 'all' if not os.environ.get('BAD_ACTIONS') else 'selected'})
     if path.startswith('users/'): out({'id': 2 if path.endswith('second') else 1})
@@ -146,29 +152,48 @@ if exe == 'gh':
         result = dict(state['template'])
         if os.environ.get('BAD_TEMPLATE'): result['include_claim_keys'] = ['repo']
         out(result)
-    if '/git/trees/' in path: out({'tree': [{'path': k, 'sha': 'file-sha'} for k in state['files']], 'truncated': False})
+    if '/git/matching-refs/' in path:
+        branch = path.split('/heads/')[1]
+        out([{'ref': 'refs/heads/' + branch}] if branch in state.get('branches', {}) else [])
+    if path.endswith('/git/refs'):
+        state.setdefault('branches', {})[value['ref'].removeprefix('refs/heads/')] = dict(state['files']); out({})
+    if '/git/trees/' in path:
+        branch = path.split('/git/trees/')[1].split('?')[0]
+        files = state['files'] if branch == 'main' else state['branches'][branch]
+        out({'tree': [{'path': k, 'sha': 'file-sha'} for k in files], 'truncated': False})
+    if '/pulls' in path:
+        if method == 'POST':
+            state.setdefault('pulls', []).append(value)
+            out({'number': len(state['pulls']), 'html_url': 'https://example.test/pull/1'})
+        out([dict(p, number=n) for n, p in enumerate(state.get('pulls', []), 1) if p.get('head') in path])
     if '/git/ref/heads/main' in path: out({'object': {'sha': SHA}})
     if '/contents/' in path:
         name = path.split('/contents/')[1].split('?')[0]
         if 'sf-merge-gate.yml' in name: out({'content': base64.b64encode(b'implemented gate').decode()})
-        if method == 'PUT': state['files'][name] = value['content']
-        out({'sha': 'file-sha', 'content': state['files'][name]})
+        branch = value['branch'] if method == 'PUT' else path.split('?ref=')[1]
+        if method == 'PUT' and branch == 'main': sys.exit(97)
+        files = state['files'] if branch == 'main' else state['branches'][branch]
+        if method == 'PUT': files[name] = value['content']
+        out({'sha': 'file-sha', 'content': files[name]})
     if '/environments/' in path:
         env = path.split('/environments/')[1].split('/')[0]
         if path.endswith('/deployment-branch-policies'):
             out({'branch_policies': [{'name': 'main', 'type': 'branch'}]})
         if method == 'PUT':
-            if not set(value) <= {'deployment_branch_policy', 'reviewers', 'prevent_self_review', 'wait_timer'}: sys.exit(98)
-            state['envs'][env] = {'deployment_branch_policy': value['deployment_branch_policy'], 'protection_rules': []}
+            if not set(value) <= {'deployment_branch_policy', 'reviewers', 'prevent_self_review', 'wait_timer', 'can_admins_bypass'}: sys.exit(98)
+            state['envs'][env] = {'can_admins_bypass': value.get('can_admins_bypass', True), 'deployment_branch_policy': value['deployment_branch_policy'], 'protection_rules': []}
             if 'reviewers' in value:
                 state['envs'][env]['protection_rules'] = [{'type': 'required_reviewers', 'prevent_self_review': value['prevent_self_review'],
                     'reviewers': [{'reviewer': {'id': r['id']}} for r in value['reviewers']]}]
         result = dict(state['envs'][env])
+        if os.environ.get('ADMIN_BYPASS'): result['can_admins_bypass'] = True
+        if os.environ.get('ADMIN_BYPASS') == 'missing': result.pop('can_admins_bypass', None)
         if os.environ.get('BAD_GATE') and env == 'production': result['protection_rules'] = []
         out(result)
     if '/actions/variables' in path:
         name = path.rsplit('/', 1)[1]
         if method == 'GET' and '?' in path: out({'variables': list(state['variables'].values()), 'total_count': len(state['variables'])})
+        if method == 'DELETE': state['variables'].pop(name, None); out({})
         if method != 'GET': state['variables'][value['name']] = value; out({})
         out(state['variables'][name])
     if '/pending_deployments' in path:
@@ -219,12 +244,15 @@ if exe == 'az':
             state['assignments'].append(assignment)
             write(DB, state)
             if os.environ.get('SIGNAL_GRANT'):
-                os.kill(os.getppid(), signal.SIGTERM)
+                os.kill(os.getppid(), signal.SIGHUP if os.environ['SIGNAL_GRANT'] == 'HUP' else signal.SIGTERM)
                 print(json.dumps(assignment))
                 sys.exit(0)
             if os.environ.get('LOST_GRANT_RESPONSE'): sys.exit(42)
             out(assignment)
         if action == 'delete':
+            if os.environ.get('SIGNAL_GRANT'):
+                os.kill(os.getppid(), signal.SIGINT)
+                os.kill(os.getppid(), signal.SIGHUP)
             if not os.environ.get('STICKY_ROLE'):
                 state['assignments'] = [r for r in state['assignments'] if r['id'] != option('--ids')]
             out({})
@@ -266,7 +294,10 @@ if exe == 'az':
             from urllib.parse import urlsplit, unquote
             out([{'name': unquote(urlsplit(url).path.split('/backups/',1)[1])} for url in state['blob_copies'] if 'destinationbackups' in url])
         if '--include' in args:
-            out([{'name': 'backups/retained.age', 'versionId': 'historical-version', 'metadata': {'recipient_fp': FP}}])
+            blob = {'name': 'backups/retained.age', 'versionId': 'historical-version', 'properties': {}}
+            if 'm' in option('--include') and not os.environ.get('MISSING_METADATA'): blob['metadata'] = {'recipient_fp': FP}
+            if 'i' in option('--include'): blob['properties']['immutabilityPolicy'] = {'policyMode': 'Locked', 'expiryTime': '2099-01-01T00:00:00Z'}
+            out([blob])
         out([])
     if args[:4] == ['storage', 'blob', 'lease', 'renew']: out({'leaseId': option('--lease-id')})
     if args[:3] == ['storage', 'blob', 'show']:
@@ -277,17 +308,37 @@ if exe == 'az':
     if args[:1] == ['rest']: sys.stdin.read(); out({'properties': {'rows': [[10]], 'columns': [{'name': 'Cost', 'type': 'Number'}]}})
 if exe == 'terraform':
     command_args = args[1:]
+    directory = args[0].split('=', 1)[1]
+    root = Path(directory)
+    rendered = {'directory': directory, 'host_prevent_destroy': (root.parents[1] / 'modules/host/main.tf').read_text().count('prevent_destroy = true')}
+    for name in ('workload-subscriptions.tf.json', 'composition_override.tf.json'):
+        if (root / name).exists(): rendered[name] = json.loads((root / name).read_text())
+    with LOG.open('a') as log: log.write('TF_RENDER ' + json.dumps(rendered) + '\n')
     if command_args[0] == 'init':
         config = sys.stdin.read()
+        backend = dict(re.findall(r'(\w+) = "([^"]+)"', config))
+        if not any(r['roleDefinitionName'] == 'Storage Blob Data Contributor' and r['scope'].startswith('/subscriptions/' + backend['subscription_id'] + '/') for r in state['assignments']): sys.exit(92)
+        backend_key = backend['storage_account_name'] + '/' + backend['key']
+        previous = state.setdefault('initialized', {}).get(directory)
+        states = state.setdefault('backend_states', {})
+        if '-migrate-state' in command_args:
+            if not previous: sys.exit(95)
+            states[backend_key] = states.get(previous, {'lineage': 'fixture-lineage', 'serial': 9, 'resources': []})
+        elif backend_key not in states:
+            states[backend_key] = {} if backend['storage_account_name'] == 'destinationstate' else {'lineage': 'fixture-lineage', 'serial': 9, 'resources': []}
+        state['initialized'][directory] = backend_key
         with LOG.open('a') as log: log.write('TF_BACKEND ' + json.dumps(config) + '\n')
         out(b'', raw=True)
-    if command_args[0] in ('apply', 'plan'):
-        values = body()
+    if command_args[0] in ('apply', 'plan', 'destroy'):
+        varfile = Path(next(a.split('=', 1)[1] for a in command_args if a.startswith('-var-file=')))
+        if varfile.suffix != '.json' or varfile.stat().st_mode & 0o777 != 0o600: sys.exit(94)
+        values = json.loads(varfile.read_bytes())
         with LOG.open('a') as log: log.write('TF_VARS ' + json.dumps(values) + '\n')
         state['tfvars'] = values
         state.setdefault('tfvars_by_stack', {})[Path(args[0].split('=', 1)[1]).name] = values
         if '-target=module.host.module.workload_rg[0]' in command_args: state['host_rg'] = True
         if command_args[0] == 'plan' and os.environ.get('TF_DRIFT'): sys.exit(2)
+        if command_args[0] == 'destroy': state['revoked'] = True
         out(b'', raw=True)
     if command_args[0] == 'output':
         if command_args[-1] == 'deallocator_role_id': out('/subscriptions/' + TARGET_SUB + '/providers/Microsoft.Authorization/roleDefinitions/deallocator-role')
@@ -295,13 +346,15 @@ if exe == 'terraform':
         claims = json.loads((HOME / 'config/receipts/oidc.json').read_text())['claims']
         out({'federations': {i: {k: {'name': 'github-' + k, 'subject': 'wrong' if os.environ.get('BAD_FEDERATION') else c['sub'], 'issuer': 'https://token.actions.githubusercontent.com', 'audience': ['api://AzureADTokenExchange']} for k, c in entries.items()} for i, entries in claims.items()},
              'target': {}, 'vault': {}, 'twins': []})
+    if command_args[:1] == ['state'] and directory not in state.get('initialized', {}): sys.exit(93)
     if command_args[:2] == ['state', 'pull']:
         changed = os.environ.get('BAD_STATE') and state.get('pulled')
         state['pulled'] = True
-        out({'lineage': 'fixture-lineage', 'serial': 9, 'resources': [{'type': 'unexpected'}] if changed else []})
+        result = dict(state['backend_states'][state['initialized'][directory]])
+        if changed: result['resources'] = [{'type': 'unexpected'}]
+        out(result)
     if command_args[:2] == ['state', 'list']:
         out('' if state.get('revoked') else 'module.trust.module.identities["ops"].azurerm_federated_identity_credential.this["github"]\nmodule.trust.azurerm_role_assignment.operator["backups"]\nmodule.trust.azurerm_resource_group.vault\n', raw=True)
-    if command_args[0] == 'destroy': state['revoked'] = True; out(b'', raw=True)
 if exe == 'curl':
     config = sys.stdin.read()
     url = re.search(r'url = "(.*?)"', config)[1]
@@ -323,16 +376,22 @@ if exe == 'curl':
         out(b'HTTP/1.1 200 OK\r\n\r\n' + xml.encode(), raw=True)
     if 'api.tailscale.com' in url:
         if '--write-out' in args: out('200' if os.environ.get('BAD_REVOKE') else '401', raw=True)
-        if url.endswith('/settings'): out({'httpsEnabled': not bool(os.environ.get('NO_HTTPS'))})
+        if url.endswith('/settings'):
+            if os.environ.get('SIGNAL_TS'):
+                os.kill(os.getppid(), signal.SIGHUP)
+            out({'httpsEnabled': not bool(os.environ.get('NO_HTTPS'))})
         if url.endswith('/dns/preferences'): out({'magicDNS': not bool(os.environ.get('NO_DNS'))})
         if method == 'POST':
             request = json.loads(value)
             with LOG.open('a') as log: log.write('TS_BODY ' + json.dumps(request) + '\n')
-            key = 'federation' + str(len(state['federations']))
+            key = 'federation' + uuid.uuid4().hex
             state['federations'][key] = dict(request, id=key, audience='fixture-audience')
             out(state['federations'][key])
         if method == 'DELETE':
-            state['token_revoked'] = True; out({})
+            key = url.rsplit('/', 1)[1]
+            if key in state['federations']: del state['federations'][key]
+            else: state['token_revoked'] = True
+            out({})
         if url.endswith('/keys'): out({'keys': list(state['federations'].values())})
         key = url.rsplit('/', 1)[1]
         out(state['federations'][key])
