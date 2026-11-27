@@ -165,7 +165,8 @@ class GitHub:
             data=None if payload is None else json.dumps(payload).encode(), method=method,
         )
         with build_opener(NoRedirect()).open(request, timeout=30) as response:
-            if response.status not in (200, 201):
+            expected = (200,) if request.get_method() == "GET" else (200, 201)
+            if response.status not in expected:
                 raise ValueError("unexpected GitHub status")
             return json.load(response)
 

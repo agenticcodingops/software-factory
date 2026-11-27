@@ -401,6 +401,16 @@ class RegistryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     gate.GitHub("github-placeholder").registry_digest("ghcr.io/paperclipai/paperclip", "2026.1117.0")
 
+    def test_github_reads_reject_non200_and_writes_accept_creation(self):
+        for status in (201, 204, 404, 500):
+            with self.subTest(status=status), patch.object(gate, "build_opener") as builder:
+                builder.return_value.open.return_value = self.response(b'{}', status=status)
+                with self.assertRaises(ValueError):
+                    gate.GitHub("github-placeholder").request("repos/fixture/repo")
+        with patch.object(gate, "build_opener") as builder:
+            builder.return_value.open.return_value = self.response(b'{"sha":"created"}', status=201)
+            self.assertEqual(gate.GitHub("github-placeholder").request("repos/fixture/repo/contents/index.json", {}, method="PUT"), {"sha":"created"})
+
     def test_redirects_are_refused(self):
         with self.assertRaises(ValueError):
             gate.NoRedirect().redirect_request(None, None, 302, "redirect", {}, "https://other.example/")
