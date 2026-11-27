@@ -54,6 +54,10 @@ def notes_findings(old, new, releases, pattern):
     return findings
 
 
+PROTECTED_PREFIXES = (".github/workflows/", "ci/renovate/release-notes-gate", "hosting/paperclip-hermes/rulesets/")
+PROTECTED_FILES = ("CODEOWNERS",)
+
+
 TAG = r"[A-Za-z0-9_][A-Za-z0-9._-]*"
 DIGEST = r"sha256:[a-f0-9]{64}"
 
@@ -198,17 +202,16 @@ class GitHub:
                 return
         raise ValueError("upstream release pagination limit reached")
 
-    def workflow_changes(self, repo, number):
-        # GitHub returns at most 3,000 PR files. Never accept a truncated diff.
-        for page in range(1, 31):
-            files = self.request(f"repos/{repo}/pulls/{number}/files?per_page=100&page={page}")
-            for file in files:
-                if any(file.get(key, "").startswith(".github/workflows/")
-                       for key in ("filename", "previous_filename")):
-                    return True
-            if len(files) < 100:
-                return False
-        raise ValueError("PR files pagination limit reached")
+    def protected_changes(self, repo, base_sha, head_sha):
+        # Immutable SHAs prevent a PR push from changing this answer.
+        # Files appear only on page 1 and are capped at 300:
+        # https://docs.github.com/en/rest/commits/commits#compare-two-commits
+        basehead = f"{quote(base_sha, safe='')}...{quote(head_sha, safe='')}"
+        files = self.request(f"repos/{repo}/compare/{basehead}?per_page=1&page=1")["files"]
+        if len(files) >= 300:
+            raise ValueError("comparison file list may be truncated")
+        return any(name in PROTECTED_FILES or name.startswith(PROTECTED_PREFIXES)
+                   for file in files for name in (file.get("filename", ""), file.get("previous_filename", "")))
 
 
 def evaluate(api, repo, pr, base_sha):
@@ -249,8 +252,8 @@ def main():
         base_path = f"repos/{repo}/git/ref/heads/{quote(default_branch, safe='')}"
         base_sha = api.request(base_path)["object"]["sha"]
         findings = evaluate(api, repo, pr, base_sha)
-        if api.workflow_changes(repo, number):
-            findings.append("Workflow changes require the operator")
+        if api.protected_changes(repo, base_sha, sha):
+            findings.append("Gate, workflow, ruleset or CODEOWNERS changes require the operator")
         if api.request(base_path)["object"]["sha"] != base_sha:
             raise ValueError("default branch changed while checking notes; rerun the gate")
     except Exception as error:  # Any API, parse or missing-notes failure closes the gate.
@@ -264,7 +267,7 @@ def main():
     if findings:
         api.request(f"repos/{repo}/issues/{number}/labels", {"labels": ["needs-operator"]})
     status.update(state="failure" if findings else "success",
-                  description="Operator required: workflow change, release risk or unavailable notes" if findings else "Upstream release notes passed")
+                  description="Operator required: gate, workflow, ruleset, CODEOWNERS change, release risk or unavailable data" if findings else "Upstream release notes passed")
     api.request(status_path, status)
     # Avoid emitting upstream text into workflow command processing.
     print(f"release-notes-gate: {'needs-operator' if findings else 'passed'} ({len(findings)} finding(s))")

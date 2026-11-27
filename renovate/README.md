@@ -88,8 +88,13 @@ mismatched digests fail closed ([registry authentication](https://docs.docker.co
 [OCI digest header contract](https://raw.githubusercontent.com/opencontainers/distribution-spec/main/spec.md)).
 Digest-only updates with a matching digest need no release notes.
 The Compose check accepts one canonical form and is not a YAML parser. It does not cover
-a PR that points Compose at a different Dockerfile, adds `COPY --from=<image>`, or adds an override file. Changes under `.github/workflows/**`, including
-renames and deletions, also fail and require the operator. The `pull_request_target` workflow is
+a PR that points Compose at a different Dockerfile, adds `COPY --from=<image>`, or adds an override file. Protected changes are detected by comparing the captured default-branch SHA with the
+captured head SHA using the [three-dot compare API](https://docs.github.com/en/rest/commits/commits#compare-two-commits),
+including previous filenames on renames. The protected paths are `.github/workflows/`,
+`ci/renovate/release-notes-gate`, `hosting/paperclip-hermes/rulesets/` and root `CODEOWNERS`.
+The script prefix does not match `test_release_notes_gate.py`; that test remains unprotected.
+A PR with 300 or more changed files fails closed because the compare list may be truncated.
+Protected changes require the operator. The `pull_request_target` workflow is
 restricted to `main` and checks out `github.sha`, the trusted default-branch commit. PR files are
 read through the API as data. The script guards both event and live base refs and posts nothing
 for other targets. It resolves current main through the Git ref API, and fails if main moves during

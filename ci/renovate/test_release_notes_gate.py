@@ -48,13 +48,12 @@ class FakeAPI:
     def releases(self, repo):
         return [release("v0.23.5" if self.image == "hermes" else "v2026.1124.0", self.body)]
 
-    workflow_changes = gate.GitHub.workflow_changes
+    protected_changes = gate.GitHub.protected_changes
 
     def request(self, path, payload=None):
         self.calls.append((path, copy.deepcopy(payload)))
-        if "/files?" in path:
-            page = int(path.rsplit("=", 1)[1])
-            return self.files[(page - 1) * 100:page * 100]
+        if "/compare/" in path:
+            return {"files": self.files[:300], "merge_base_commit": {"sha": self.base_sha}}
         if "/git/ref/heads/" in path:
             return {"object": {"sha": self.base_sha}}
         return copy.deepcopy(self.pr) if "/pulls/" in path else {}
@@ -170,6 +169,47 @@ class NotesTests(unittest.TestCase):
         api.files = [{"filename": "docs/file.md"}] * 3000
         self.assertEqual(self.invoke(api), 1)
         self.assertEqual(api.calls[-1][1]["state"], "failure")
+
+    def test_workflow_check_is_bound_to_captured_shas_not_live_pr_files(self):
+        api = FakeAPI()
+        api.files = [{"filename": ".github/workflows/forged.yml", "status": "added"}]
+        request = api.request
+        def racing(path, payload=None):
+            if "/pulls/7/files" in path:
+                api.calls.append((path, None))
+                return []
+            return request(path, payload)
+        with patch.object(api, "request", side_effect=racing):
+            self.assertEqual(self.invoke(api), 1)
+        paths = [path for path, _ in api.calls]
+        self.assertFalse(any("/pulls/7/files" in path for path in paths))
+        self.assertIn(f"repos/fixture/repo/compare/{'a' * 40}...{'b' * 40}?per_page=1&page=1", paths)
+        self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
+        self.assertEqual(api.calls[-1][1]["state"], "failure")
+
+    def test_compare_file_cap_fails_closed_at_300(self):
+        for count, expected in ((299, 0), (300, 1)):
+            api = FakeAPI()
+            api.files = [{"filename": f"docs/{i}.md"} for i in range(count)]
+            self.assertEqual(self.invoke(api), expected)
+        api = FakeAPI()
+        with patch.object(api, "request", side_effect=lambda path, payload=None: {} if "/compare/" in path else FakeAPI.request(api, path, payload)):
+            self.assertEqual(self.invoke(api), 1)
+
+    def test_gate_trust_base_changes_require_operator(self):
+        for file in ({"filename": "ci/renovate/release-notes-gate.py"},
+                     {"filename": "docs/old.py", "previous_filename": "ci/renovate/release-notes-gate.py"},
+                     {"filename": "hosting/paperclip-hermes/rulesets/public-repo.json"},
+                     {"filename": "CODEOWNERS"}):
+            with self.subTest(file=file):
+                api = FakeAPI()
+                api.files = [file]
+                self.assertEqual(self.invoke(api), 1)
+        for name in ("renovate/default.json", "ci/renovate/check.cjs", "docs/CODEOWNERS"):
+            with self.subTest(name=name):
+                api = FakeAPI()
+                api.files = [{"filename": name}]
+                self.assertEqual(self.invoke(api), 0)
 
     def test_main_change_fails_closed(self):
         api = FakeAPI()
