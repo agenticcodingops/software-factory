@@ -389,6 +389,7 @@ class PinExtractionTests(unittest.TestCase):
         evil = "x-e:\n  a: &evil\n    image: evil.example/paperclip:9@sha256:" + "d" * 64 + "\n"
         explicit = "    ? image\n    : ghcr.io/paperclipai/${P:-paperclip}:2026.1201.0@sha256:" + "d" * 64 + "\n"
         variants += [
+            "x-e:\n  a: &runtime\n    image: evil.example/paperclip:9@sha256:" + "d" * 64 + "\n" + "services:\n  paperclip:\n    <<: *runtime\n    labels: [\n" + line + "    ]\n",
             "services:\n  paperclip:\n    labels: {\n" + line + "    }\n" + explicit,
             "services:\n  paperclip:\n    labels: '\n" + line + "    '\n" + explicit,
             "x-k: &k image\nservices:\n  paperclip:\n    labels: {\n" + line + "    }\n    *k : ghcr.io/paperclipai/${P:-paperclip}:2026.1201.0@sha256:" + "d" * 64 + "\n",
