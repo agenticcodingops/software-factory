@@ -140,6 +140,25 @@
       ],
       "matchPackageNames": [
         "!googleapis/release-please-action"
+      ],
+      "matchDepTypes": [
+        "action"
+      ]
+    },
+    {
+      "description": "Runtime, runner and workflow-image versions are not the Actions carve-out.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "uses-with",
+        "github-runner",
+        "docker",
+        "container",
+        "service"
+      ],
+      "addLabels": [
+        "needs-operator"
       ]
     },
     {

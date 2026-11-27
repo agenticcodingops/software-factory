@@ -26,12 +26,16 @@ class FakeAPI:
         self.body = body
         self.image = image
         self.files = []
+        self.workflow_content = {}
+        self.responses = {}
         self.base_sha = "a" * 40
         self.calls = []
         self.pr = {"user": {"login": "renovate[bot]"}, "base": {"sha": "d" * 40, "ref": "main"},
                    "head": {"sha": "b" * 40, "repo": {"full_name": "fixture/repo"}}}
 
     def contents(self, repo, sha, path):
+        if path.startswith(".github/workflows/"):
+            return self.workflow_content[(sha, path)]
         image = next(image for image, (_, _, file, _) in gate.IMAGES.items() if file == path)
         tag = "2026.1117.0" if sha == self.base_sha or self.image != "paperclip" else "2026.1124.0"
         digest = "c" * 64 if sha == self.base_sha else "d" * 64
@@ -52,6 +56,11 @@ class FakeAPI:
 
     def request(self, path, payload=None):
         self.calls.append((path, copy.deepcopy(payload)))
+        if path in self.responses:
+            response = self.responses[path]
+            if isinstance(response, Exception):
+                raise response
+            return copy.deepcopy(response)
         if "/compare/" in path:
             return {"files": self.files[:300], "merge_base_commit": {"sha": self.base_sha}}
         if "/git/ref/heads/" in path:
@@ -287,10 +296,6 @@ class NotesTests(unittest.TestCase):
         self.assertFalse(any(p and p.get("state") == "success" for _, p in api.calls))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PinExtractionTests(unittest.TestCase):
     hermes = "nousresearch/hermes-agent"
     paper = "ghcr.io/paperclipai/paperclip"
@@ -399,3 +404,139 @@ class RegistryTests(unittest.TestCase):
     def test_redirects_are_refused(self):
         with self.assertRaises(ValueError):
             gate.NoRedirect().redirect_request(None, None, 302, "redirect", {}, "https://other.example/")
+
+
+class WorkflowPinTests(unittest.TestCase):
+    invoke = NotesTests.invoke
+    old = "a" * 40
+    new = "f" * 40
+    file = ".github/workflows/fixture.yml"
+
+    def line(self, sha=None, tag="v7.0.2", action="actions/checkout", prefix="      - uses: "):
+        return f"{prefix}{action}@{sha or self.new} # {tag}\n"
+
+    def api(self, old=None, new=None, status="modified"):
+        api = FakeAPI(image="none")
+        api.files = [{"filename":self.file, "status":status}]
+        api.workflow_content = {
+            (api.base_sha, self.file): old or self.line(self.old, "v7.0.1"),
+            (api.pr["head"]["sha"], self.file): new or self.line(),
+        }
+        api.responses["repos/actions/checkout/git/ref/tags/v7.0.2"] = {"object":{"type":"commit", "sha":self.new}}
+        return api
+
+    def assert_result(self, api, expected):
+        self.assertEqual(self.invoke(api), expected)
+        self.assertEqual(api.calls[-1][1]["state"], "failure" if expected else "success")
+        self.assertEqual(any("/labels" in path for path, _ in api.calls), bool(expected))
+
+    def test_verified_lightweight_and_annotated_patch_bumps_pass(self):
+        for annotated in (False, True):
+            with self.subTest(annotated=annotated):
+                api = self.api()
+                if annotated:
+                    api.responses["repos/actions/checkout/git/ref/tags/v7.0.2"] = {"object":{"type":"tag", "sha":"e" * 40}}
+                    api.responses["repos/actions/checkout/git/tags/" + "e" * 40] = {"object":{"type":"commit", "sha":self.new}}
+                self.assert_result(api, 0)
+
+    def test_minor_and_action_subpath_bumps_pass(self):
+        api = self.api(old=self.line(self.old, "v7.0.1", "actions/checkout/sub"), new=self.line(tag="v7.1.0", action="actions/checkout/sub"))
+        api.responses["repos/actions/checkout/git/ref/tags/v7.1.0"] = {"object":{"type":"commit", "sha":self.new}}
+        self.assert_result(api, 0)
+
+    def test_unverified_or_missing_tag_fails(self):
+        from urllib.error import HTTPError
+        for response in ({"object":{"type":"commit", "sha":"c" * 40}}, HTTPError("https://api.github.com/fixture", 404, "missing", {}, None), {}):
+            api = self.api()
+            api.responses["repos/actions/checkout/git/ref/tags/v7.0.2"] = response
+            self.assert_result(api, 1)
+
+    def test_only_same_action_same_major_version_advances_pass(self):
+        for new in (
+            self.line(tag="v8.0.0"), self.line(tag="v6.0.0"), self.line(tag="v7.0.1"),
+            self.line(action="actions/setup-node"), self.line(prefix="    - uses: "),
+            self.line(prefix="      uses: "), self.line() + "      run: echo changed\n",
+            self.line() + "permissions: write-all\n", self.line() + "        with:\n",
+            self.line(sha="v7"), self.line(action="./local"), self.line(action="docker://example/action"),
+        ):
+            with self.subTest(new=new):
+                self.assert_result(self.api(new=new), 1)
+        for extra in ("      run: echo old\n", "permissions: read-all\n"):
+            self.assert_result(self.api(old=self.line(self.old, "v7.0.1") + extra, new=self.line() + extra.replace("old", "new").replace("read-all", "write-all")), 1)
+        self.assert_result(self.api(old=self.line(self.old, "v7.0.1", "fixture/repo"), new=self.line(action="fixture/repo")), 1)
+        self.assertIsNone(gate.ACTION_PIN.fullmatch(self.line(action="./local")))
+        self.assertIsNone(gate.ACTION_PIN.fullmatch(self.line(action="docker://example/action")))
+
+    def test_workflow_status_and_strict_paths_are_protected(self):
+        for status in ("added", "removed", "renamed", "copied", "changed", "unknown"):
+            self.assert_result(self.api(status=status), 1)
+        for path in ("ci/renovate/release-notes-gate.py", "hosting/paperclip-hermes/rulesets/public-repo.json", "CODEOWNERS"):
+            api = self.api()
+            api.files = [{"filename":path, "status":"modified", "patch": self.line()}]
+            self.assert_result(api, 1)
+            self.assertFalse(any("/git/ref/tags/" in path for path, _ in api.calls))
+
+    def test_work_limits_stop_before_upstream_tag_calls(self):
+        api = self.api()
+        api.files *= 21
+        with patch.object(api, "contents", wraps=api.contents) as contents:
+            self.assert_result(api, 1)
+        self.assertFalse(any(call.args[2].startswith(".github/workflows/") for call in contents.call_args_list))
+        api = self.api(old=self.line(self.old, "v7.0.1") * 51, new=self.line() * 51)
+        self.assert_result(api, 1)
+        self.assertFalse(any("/git/ref/tags/" in path for path, _ in api.calls))
+
+    def test_immutable_merge_base_contents_errors_and_tag_chain_limit(self):
+        api = self.api()
+        before = api.contents
+        def fail(repo, sha, path):
+            if path == self.file:
+                raise OSError("contents unavailable")
+            return before(repo, sha, path)
+        with patch.object(api, "contents", side_effect=fail):
+            self.assert_result(api, 1)
+        api = self.api()
+        compare = f"repos/fixture/repo/compare/{api.base_sha}...{api.pr['head']['sha']}?per_page=1&page=1"
+        api.responses[compare] = {"files":api.files}
+        self.assert_result(api, 1)
+        api = self.api()
+        api.responses["repos/actions/checkout/git/ref/tags/v7.0.2"] = {"object":{"type":"tag", "sha":"e" * 40}}
+        api.responses["repos/actions/checkout/git/tags/" + "e" * 40] = {"object":{"type":"tag", "sha":"e" * 40}}
+        self.assert_result(api, 1)
+        self.assertEqual(sum("/git/tags/" in path for path, _ in api.calls), 5)
+        api = self.api()
+        merge_base = "9" * 40
+        api.responses[compare] = {"files":api.files, "merge_base_commit":{"sha":merge_base}}
+        api.workflow_content[(merge_base, self.file)] = api.workflow_content.pop((api.base_sha, self.file))
+        with patch.object(api, "contents", wraps=api.contents) as contents:
+            self.assert_result(api, 0)
+        self.assertIn(("fixture/repo", merge_base, self.file), [c.args for c in contents.call_args_list])
+
+    def test_mixed_image_changes_still_get_evaluated(self):
+        api = self.api()
+        self.assert_result(api, 0)  # FakeAPI(image='none') still changes both digests.
+        api = self.api()
+        api.image, api.body = "hermes", "migration"
+        with patch.object(api, "releases", wraps=api.releases) as releases:
+            self.assert_result(api, 1)
+        releases.assert_called_once_with("NousResearch/hermes-agent")
+
+    def test_contents_decode_and_github_token_host(self):
+        from io import BytesIO
+        import base64
+        api = gate.GitHub("github-placeholder")
+        with patch.object(api, "request", return_value={"content":base64.b64encode(b"\xff").decode()}), self.assertRaises(UnicodeDecodeError):
+            api.contents("fixture/repo", "a" * 40, self.file)
+        with patch.object(gate, "build_opener") as builder:
+            response = BytesIO(b'{}')
+            response.status = 200
+            builder.return_value.open.return_value = response
+            api.request("repos/fixture/repo")
+            request = builder.return_value.open.call_args.args[0]
+            self.assertEqual(request.full_url, "https://api.github.com/repos/fixture/repo")
+            self.assertEqual(request.get_header("Authorization"), "Bearer github-placeholder")
+            self.assertIsInstance(builder.call_args.args[0], gate.NoRedirect)
+
+
+if __name__ == "__main__":
+    unittest.main()

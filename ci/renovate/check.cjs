@@ -99,6 +99,21 @@ function assertPublic(events, scenario, pins, want, saveDigest = true) {
     assert.ok(!(caddyMajor.addLabels || []).includes('agent-merge'));
     assertMergeLabels(plans);
     console.log('PASS majors from every manager: needs-operator, never agent-merge');
+    const actionPatch = plans.find(b => b.depName === 'actions/checkout' && b.updateType === 'patch');
+    assert.ok(actionPatch.addLabels.includes('agent-merge'));
+    assert.ok(!actionPatch.addLabels.includes('needs-operator'));
+    assert.match(actionPatch.commitMessage, /^chore\(deps\): /);
+    const actionMajor = plans.find(b => b.depName === 'actions/checkout' && b.updateType === 'major');
+    assert.ok(actionMajor.addLabels.includes('needs-operator'));
+    assert.ok(!actionMajor.addLabels.includes('agent-merge'));
+    const runtimeInput = deps.find(d => d.depName === 'node');
+    assert.equal(runtimeInput.manager, 'github-actions');
+    assert.equal(runtimeInput.depType, 'uses-with');
+    const nodePlan = plans.find(b => b.upgrades.some(u => u.depName === 'node'));
+    assert.ok(nodePlan.addLabels.includes('needs-operator'));
+    assert.ok(!nodePlan.addLabels.includes('agent-merge'));
+    assert.match(nodePlan.commitMessage, /^chore\(deps\): /);
+    console.log('PASS public Actions patch labels; runtime inputs require operator');
     const provider = plans.find(b => b.depName === 'azurerm' && b.updateType === 'patch');
     assert.ok(provider.addLabels.includes('needs-operator'));
     assert.ok(!provider.addLabels.includes('agent-merge'));
@@ -222,6 +237,8 @@ try {
         'docs/example/package.json': 'package.json',
         '.github/workflows/release.yml': '.github/workflows/release.yml',
       })) write(dir, file, fs.readFileSync(path.join(root, source), 'utf8'));
+      write(dir,'.github/workflows/fixture-actions.yml', `name: Fixture\non: push\npermissions: {}\njobs:\n  check:\n    permissions: {}\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@${'a'.repeat(40)} # v7.0.1\n`);
+      write(dir,'.github/workflows/ci.yml', `name: CI\non: push\npermissions: {}\njobs:\n  check:\n    permissions: {}\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/setup-node@${'a'.repeat(40)} # v7.0.1\n        with:\n          node-version: '24.22.3'\n`);
     }
     if (scenario === 'bumped') {
       const pins = readPins(dir), want = next(pins);

@@ -61,6 +61,9 @@ def notes_findings(old, new, releases, pattern):
 PROTECTED_PREFIXES = (".github/workflows/", "ci/renovate/release-notes-gate", "hosting/paperclip-hermes/rulesets/")
 PROTECTED_FILES = ("CODEOWNERS",)
 
+ACTION_PIN = re.compile(r"^(\s*(?:-\s+)?uses:\s+)([A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+(?:/[^@\s]+)?)@([0-9a-f]{40})(\s+#\s+)(v\d+\.\d+\.\d+)\s*$")
+WORKFLOW_FINDING = "Workflow changes other than verified action pin bumps require the operator"
+
 
 TAG = r"[A-Za-z0-9_][A-Za-z0-9._-]*"
 DIGEST = r"sha256:[a-f0-9]{64}"
@@ -154,15 +157,15 @@ class GitHub:
     def __init__(self, token):
         self.token = token
 
-    def request(self, path, payload=None):
+    def request(self, path, payload=None, method=None):
         request = Request(
             "https://api.github.com/" + path,
             headers={"Authorization": "Bearer " + self.token,
                      "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
-            data=None if payload is None else json.dumps(payload).encode(),
+            data=None if payload is None else json.dumps(payload).encode(), method=method,
         )
         with build_opener(NoRedirect()).open(request, timeout=30) as response:
-            if response.status != 200:
+            if response.status not in (200, 201):
                 raise ValueError("unexpected GitHub status")
             return json.load(response)
 
@@ -211,11 +214,59 @@ class GitHub:
         # Files appear only on page 1 and are capped at 300:
         # https://docs.github.com/en/rest/commits/commits#compare-two-commits
         basehead = f"{quote(base_sha, safe='')}...{quote(head_sha, safe='')}"
-        files = self.request(f"repos/{repo}/compare/{basehead}?per_page=1&page=1")["files"]
+        comparison = self.request(f"repos/{repo}/compare/{basehead}?per_page=1&page=1")
+        files = comparison["files"]
         if len(files) >= 300:
             raise ValueError("comparison file list may be truncated")
-        return any(name in PROTECTED_FILES or name.startswith(PROTECTED_PREFIXES)
-                   for file in files for name in (file.get("filename", ""), file.get("previous_filename", "")))
+        workflows = []
+        for file in files:
+            names = (file.get("filename", ""), file.get("previous_filename", ""))
+            if any(name in PROTECTED_FILES or name.startswith(PROTECTED_PREFIXES[1:]) for name in names):
+                return ["Gate, workflow, ruleset or CODEOWNERS changes require the operator"]
+            if any(name.startswith(".github/workflows/") for name in names):
+                workflows.append(file)
+        if len(workflows) > 20 or any(file["status"] != "modified" for file in workflows):
+            return [WORKFLOW_FINDING]
+        if not workflows:
+            return []
+        merge_base = comparison["merge_base_commit"]["sha"]
+        changed = []
+        for file in workflows:
+            old = self.contents(repo, merge_base, file["filename"]).splitlines(keepends=True)
+            new = self.contents(repo, head_sha, file["filename"]).splitlines(keepends=True)
+            if len(old) != len(new):
+                return [WORKFLOW_FINDING]
+            differences = [(a, b) for a, b in zip(old, new) if a != b]
+            if not differences:
+                return [WORKFLOW_FINDING]
+            changed.extend(differences)
+            if len(changed) > 50:
+                return [WORKFLOW_FINDING]
+        # This proves same-action, same-major pin bumps against tags at gate time,
+        # not the safety of upstream action code. minimumReleaseAge and two reviews
+        # remain other controls. Ref/tag API contracts:
+        # https://docs.github.com/en/rest/git/refs
+        # https://docs.github.com/en/rest/git/tags
+        for old, new in changed:
+            before, after = ACTION_PIN.fullmatch(old), ACTION_PIN.fullmatch(new)
+            if not before or not after or (before[1], before[2]) != (after[1], after[2]):
+                return [WORKFLOW_FINDING]
+            upstream = "/".join(after[2].split("/")[:2])
+            lower = tuple(map(int, before[5][1:].split(".")))
+            upper = tuple(map(int, after[5][1:].split(".")))
+            if upstream.lower() == repo.lower() or upper[0] != lower[0] or upper <= lower:
+                return [WORKFLOW_FINDING]
+            obj = self.request(f"repos/{upstream}/git/ref/tags/{after[5]}")["object"]
+            for _ in range(5):
+                if obj["type"] != "tag":
+                    break
+                tag_sha = obj["sha"]
+                if not re.fullmatch(r"[0-9a-f]{40}", tag_sha):
+                    raise ValueError("invalid upstream tag object")
+                obj = self.request(f"repos/{upstream}/git/tags/{tag_sha}")["object"]
+            if obj["type"] != "commit" or obj["sha"] != after[3]:
+                return [WORKFLOW_FINDING]
+        return []
 
 
 def evaluate(api, repo, pr, base_sha):
@@ -257,8 +308,7 @@ def main():
         base_path = f"repos/{repo}/git/ref/heads/{quote(default_branch, safe='')}"
         base_sha = api.request(base_path)["object"]["sha"]
         findings = evaluate(api, repo, pr, base_sha)
-        if api.protected_changes(repo, base_sha, sha):
-            findings.append("Gate, workflow, ruleset or CODEOWNERS changes require the operator")
+        findings.extend(api.protected_changes(repo, base_sha, sha))
         if api.request(base_path)["object"]["sha"] != base_sha:
             raise ValueError("default branch changed while checking notes; rerun the gate")
     except Exception as error:  # Any API, parse or missing-notes failure closes the gate.

@@ -17,7 +17,7 @@ agent merges. These are operator settings changes; committing a payload does not
 
 Agents may merge `agent-merge` PRs only after required checks and two reviews of the current head.
 Renovate automerge is disabled throughout. Image digest/patch updates (Paperclip: digest only) and Terraform runtime patches
-get that label. Actions and instance production refs get it only for digest, pinDigest, patch and minor updates. Every major from any manager gets
+get that label. Action references (depType `action`) and instance production refs get it only for digest, pinDigest, patch and minor updates. Every major from any manager gets
 `needs-operator`. Validator/release tooling updates always require the operator. Provider updates
 (including patches) and AVM 0.x minor updates get
 `needs-operator`; AVM minor changes carry Renovate's `isBreaking` flag and a major-risk PR note.
@@ -100,7 +100,23 @@ including previous filenames on renames. The protected paths are `.github/workfl
 `ci/renovate/release-notes-gate`, `hosting/paperclip-hermes/rulesets/` and root `CODEOWNERS`.
 The script prefix does not match `test_release_notes_gate.py`; that test remains unprotected.
 A PR with 300 or more changed files fails closed because the compare list may be truncated.
-Protected changes require the operator. The `pull_request_target` workflow is
+Gate script, ruleset and CODEOWNERS changes always require the operator. Workflow files
+have a verified pin-only exception: status must be `modified`, immutable merge-base and head
+contents must decode as UTF-8 with equal line counts, and every changed line must be a
+same-action `uses: owner/repo[/path]@<40 lowercase hex> # vX.Y.Z` bump preserving the key
+and indentation. Local, Docker and same-repository references are excluded. The numeric
+version must advance within the same major; unchanged versions with a different SHA,
+downgrades and majors fail. The new SHA must equal the upstream tag's commit, following
+at most five annotated-tag hops ([refs API](https://docs.github.com/en/rest/git/refs),
+[tags API](https://docs.github.com/en/rest/git/tags)). Missing data, API/decode errors,
+more than 20 workflow files or 50 changed lines fail closed. Compare patch text is never trusted.
+This proves what the upstream tag pointed to when the gate ran; it does not review upstream
+action code. Renovate's configured `minimumReleaseAge` and two current-head reviews remain
+other controls. Actions majors, runtime inputs (`uses-with`), runners and workflow images,
+and every other workflow edit need the operator. The allowed depTypes are checked against
+[Renovate 45.1.0](https://github.com/renovatebot/renovate/blob/45.1.0/lib/modules/manager/github-actions/dep-types.ts).
+The operator's 2026-11-27 decision keeps public Actions patch/minor merges with agents;
+this explicit verified exception records the ADR interpretation without editing the ADR. The `pull_request_target` workflow is
 restricted to `main` and checks out `github.sha`, the trusted default-branch commit. PR files are
 read through the API as data. The script guards both event and live base refs and posts nothing
 for other targets. It resolves current main through the Git ref API, and fails if main moves during
