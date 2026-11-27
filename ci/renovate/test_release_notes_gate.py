@@ -500,12 +500,42 @@ class WorkflowPinTests(unittest.TestCase):
             self.line(sha="v7"), self.line(action="./local"), self.line(action="docker://example/action"),
         ):
             with self.subTest(new=new):
-                self.assert_result(self.api(new=new), 1)
+                api = self.api(new=new)
+                for tag in ("v8.0.0", "v6.0.0", "v7.0.1"):
+                    api.responses[f"repos/actions/checkout/git/ref/tags/{tag}"] = {"object":{"type":"commit", "sha":self.new}}
+                api.responses["repos/actions/setup-node/git/ref/tags/v7.0.2"] = {"object":{"type":"commit", "sha":self.new}}
+                self.assert_result(api, 1)
+                self.assertFalse(any("/git/ref/tags/" in path for path, _ in api.calls))
         for extra in ("      run: echo old\n", "permissions: read-all\n"):
             self.assert_result(self.api(old=self.line(self.old, "v7.0.1") + extra, new=self.line() + extra.replace("old", "new").replace("read-all", "write-all")), 1)
-        self.assert_result(self.api(old=self.line(self.old, "v7.0.1", "fixture/repo"), new=self.line(action="fixture/repo")), 1)
+        api = self.api(old=self.line(self.old, "v7.0.1", "fixture/repo"), new=self.line(action="fixture/repo"))
+        api.responses["repos/fixture/repo/git/ref/tags/v7.0.2"] = {"object":{"type":"commit", "sha":self.new}}
+        self.assert_result(api, 1)
+        self.assertFalse(any("/git/ref/tags/" in path for path, _ in api.calls))
         self.assertIsNone(gate.ACTION_PIN.fullmatch(self.line(action="./local")))
         self.assertIsNone(gate.ACTION_PIN.fullmatch(self.line(action="docker://example/action")))
+
+    def test_tag_must_resolve_to_commit_object(self):
+        for kind in ("tree", "blob"):
+            for annotated in (False, True):
+                with self.subTest(kind=kind, annotated=annotated):
+                    api = self.api()
+                    obj = {"object":{"type":kind, "sha":self.new}}
+                    ref = "repos/actions/checkout/git/ref/tags/v7.0.2"
+                    if annotated:
+                        api.responses[ref] = {"object":{"type":"tag", "sha":"e" * 40}}
+                        api.responses["repos/actions/checkout/git/tags/" + "e" * 40] = obj
+                    else:
+                        api.responses[ref] = obj
+                    self.assert_result(api, 1)
+
+    def test_empty_diff_requires_operator(self):
+        for same in (self.line(), ""):
+            with self.subTest(same=same):
+                api = self.api()
+                for key in api.workflow_content:
+                    api.workflow_content[key] = same
+                self.assert_result(api, 1)
 
     def test_workflow_pin_bumps_preserve_all_other_bytes(self):
         old = self.line(self.old, "v7.0.1") + "        if: true\n"
