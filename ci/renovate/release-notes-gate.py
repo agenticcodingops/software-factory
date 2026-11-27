@@ -160,7 +160,9 @@ def flow_scan(line):
             start = True
         elif ch == "-" and nxt in ("", " ") and start and not stack:
             pass
-        elif ch in "&!" and start:
+        elif ch == "!" and start:
+            raise ValueError("compose YAML tags are unsupported")
+        elif ch == "&" and start:
             end = content.find(" ", index)
             rest = "" if end == -1 else content[end:].lstrip(" ")
             if rest and not rest.startswith("#"):

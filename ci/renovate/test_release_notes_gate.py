@@ -370,6 +370,19 @@ class PinExtractionTests(unittest.TestCase):
                              self.paper, "paperclip")
         self.assertEqual(gate.compose_pin(text, self.paper, "paperclip")[0], "2026.1117.0")
 
+    def test_yaml_tags_are_rejected(self):
+        root = Path(__file__).resolve().parents[2]
+        text = (root / gate.IMAGES[self.paper][2]).read_text()
+        variants = [text.replace("  paperclip:\n", "  paperclip:\n" + fragment, 1)
+                    for fragment in ("    !reset\n", "    !override\n", "    !!map\n",
+                                     "    &a\n    !reset\n", "    - !reset\n")]
+        variants += [text.replace("  paperclip:\n", "  paperclip: !reset\n", 1),
+                     text.replace("services:\n", "services: !!map\n", 1)]
+        for variant in variants:
+            with self.subTest(text=variant), self.assertRaises(ValueError):
+                gate.compose_pin(variant, self.paper, "paperclip")
+        self.assertEqual(gate.compose_pin(text, self.paper, "paperclip")[0], "2026.1117.0")
+
     def test_comment_cannot_satisfy_the_dockerfile_pin(self):
         comment = f"# {self.hermes}:v0.23.4@{self.digest}\n"
         variants = [
