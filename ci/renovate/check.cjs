@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
+require('./test_pins.cjs');
+const {readPins, bump, next} = require('./pins.cjs');
 const root = path.resolve(__dirname, '../..');
 const temporary = path.join(os.tmpdir(), `wp7-renovate-${require('node:crypto').randomBytes(6).toString('hex')}`);
 fs.mkdirSync(temporary);
@@ -47,22 +49,22 @@ function branches(events) {
   assert.ok(result, 'missing CLI branch plans');
   return result.branches;
 }
-function assertPublic(events, scenario) {
+function assertPublic(events, scenario, pins, want, saveDigest = true) {
   const deps = extracted(events);
   const plans = branches(events);
   assert.ok(plans.length > 0);
   assert.ok(plans.every(b => b.automerge === false), 'agents, not Renovate, perform merges');
   assert.ok(deps.every(d => !(d.warnings || []).length), 'dependency lookup warning');
   const paper = deps.find(d => d.depName === 'ghcr.io/paperclipai/paperclip' && d.packageFile.startsWith('hosting/'));
-  const prefix = scenario === 'prefixed' ? 'v' : '';
-  const update = paper.updates.find(u => u.newValue === `${prefix}2026.1124.0`);
+  const prefix = pins.paperclip.prefix;
+  const update = paper.updates.find(u => u.newValue === `${prefix}${want.paperclip}`);
   assert.ok(update, 'Paperclip CalVer update must be proposed');
   assert.equal(update.newDigest, `sha256:${'b'.repeat(64)}`);
   assert.equal(Boolean(update.pendingChecks), ['young','missing'].includes(scenario));
   assert.ok(paper.updates.every(u => !/nightly|cloud|beta/.test(u.newValue)));
   if (scenario === 'mature') {
     const hermes = deps.find(d => d.depName === 'nousresearch/hermes-agent' && d.packageFile.startsWith('hosting/'));
-    assert.ok(hermes.updates.some(u => u.newValue === 'v0.23.5'));
+    assert.ok(hermes.updates.some(u => u.newValue === want.hermes));
     assert.ok(hermes.updates.every(u => !/2026|canary|rc|desktop/.test(u.newValue)));
     const postgres = deps.find(d => d.depName === 'postgres' && d.packageFile.startsWith('hosting/'));
     assert.ok(postgres.updates.length);
@@ -77,7 +79,7 @@ function assertPublic(events, scenario) {
     const provider = plans.find(b => b.depName === 'azurerm' && b.updateType === 'patch');
     assert.ok(provider.addLabels.includes('needs-operator'));
     assert.ok(!provider.addLabels.includes('agent-merge'));
-    assert.ok(provider.upgrades.every(u => u.lockedVersion === '4.81.0'));
+    assert.ok(provider.upgrades.every(u => u.lockedVersion === pins.providers['hashicorp/azurerm']));
     assert.ok(provider.upgrades.some(u => u.packageFile.endsWith('stacks/host/versions.tf')));
     const avm = plans.filter(b => b.datasource === 'terraform-module');
     assert.ok(avm.length >= 5);
@@ -91,7 +93,7 @@ function assertPublic(events, scenario) {
     assert.ok(runtime.addLabels.includes('agent-merge'));
     assert.equal(runtime.upgrades.length,4, 'customManager plus three exact stack requirements');
     assert.ok(runtime.upgrades.some(u => u.manager === 'regex' && u.packageFile === '.terraform-version'));
-    assert.ok(runtime.upgrades.every(u => u.newVersion === '1.17.3'));
+    assert.ok(runtime.upgrades.every(u => u.newVersion === want.terraform));
     const outside = deps.filter(d => d.packageFile.startsWith('docs/example/'));
     assert.ok(outside.some(d => d.manager === 'docker-compose'));
     assert.ok(outside.some(d => d.manager === 'dockerfile'));
@@ -119,11 +121,11 @@ function assertPublic(events, scenario) {
     }
     console.log('PASS file scope, weekly schedule, compatible Tailscale minor and grouped validator/release tooling updates');
     const digest = imagePlans.find(b => b.depName === 'postgres' && b.updateType === 'digest');
-    fs.writeFileSync(path.join(temporary,'digest-branch.json'), JSON.stringify(digest));
-    console.log('PASS Paperclip CalVer + digest after 3 days; Hermes v2026.9.24/canary/rc/desktop rejected');
+    if (saveDigest) fs.writeFileSync(path.join(temporary,'digest-branch.json'), JSON.stringify(digest));
+    console.log(`PASS Paperclip ${prefix}${want.paperclip} + digest after 3 days; Hermes ${want.hermes}, unstable tags rejected`);
     console.log('PASS AVM 0.x minor + provider patch: needs-operator, no automerge');
     console.log('PASS Compose/Dockerfile digest pins + fix(deps); PostgreSQL stays on 17');
-    console.log('PASS .terraform-version customManager + stack pins; provider lock files extracted');
+    console.log(`PASS Terraform ${want.terraform} + stack pins; provider ${pins.providers['hashicorp/azurerm']} lock files extracted`);
   } else {
     console.log(`PASS Paperclip ${scenario}: ${update.pendingChecks ? 'held' : 'passed'}`);
   }
@@ -171,17 +173,22 @@ try {
   for (const [time, expected] of [['2026-11-23T05:59:00Z', true], ['2026-11-23T06:00:00Z', false], ['2026-11-24T02:00:00Z', false]]) {
     assert.equal(defaults.schedule.some(cron => cronMatches(cron, DateTime.fromISO(time), defaults.timezone)), expected, `weekly schedule at ${time}`);
   }
-  for (const scenario of ['mature', 'young', 'missing', 'prefixed']) {
+  for (const scenario of ['mature', 'young', 'missing', 'prefixed', 'bumped']) {
     const dir = path.join(temporary,scenario); fs.mkdirSync(dir);
+    const livePins = readPins(root);
     for (const file of ['hosting/paperclip-hermes/kit/compose.yaml','hosting/paperclip-hermes/kit/Dockerfile.hermes','.terraform-version']) {
       let content = fs.readFileSync(path.join(root,file),'utf8');
-      if (scenario === 'prefixed') content = content.replace(':2026.1117.0@', ':v2026.1117.0@');
+      if (scenario === 'prefixed' && file.endsWith('compose.yaml')) {
+        const before = content;
+        content = content.replace(`:${livePins.paperclip.prefix}${livePins.paperclip.version}@`, `:v${livePins.paperclip.version}@`);
+        assert.notEqual(content, before, 'prefixed scenario must change the compose pin');
+      }
       write(dir,file,content);
     }
     fs.cpSync(path.join(root,'hosting/paperclip-hermes/terraform'),path.join(dir,'hosting/paperclip-hermes/terraform'), {
       recursive:true, filter: p => !p.split(path.sep).includes('.terraform'),
     });
-    if (scenario === 'mature') {
+    if (['mature', 'bumped'].includes(scenario)) {
       for (const [file, source] of Object.entries({
         'docs/example/compose.yaml': 'hosting/paperclip-hermes/kit/compose.yaml',
         'docs/example/Dockerfile.hermes': 'hosting/paperclip-hermes/kit/Dockerfile.hermes',
@@ -192,8 +199,31 @@ try {
         '.github/workflows/release.yml': '.github/workflows/release.yml',
       })) write(dir, file, fs.readFileSync(path.join(root, source), 'utf8'));
     }
+    if (scenario === 'bumped') {
+      const pins = readPins(dir), want = next(pins);
+      const rewrite = (file, before, after) => {
+        const content = fs.readFileSync(path.join(dir,file),'utf8');
+        const changed = content.replaceAll(before, after);
+        assert.notEqual(content, changed, `bumped rewrite did not change ${file}`);
+        write(dir,file,changed);
+      };
+      rewrite('.terraform-version', pins.terraform, want.terraform);
+      for (const stack of ['host','trust','tailnet']) {
+        rewrite(`hosting/paperclip-hermes/terraform/stacks/${stack}/versions.tf`, `required_version = "= ${pins.terraform}"`, `required_version = "= ${want.terraform}"`);
+      }
+      for (const stack of ['host','trust']) {
+        for (const file of ['versions.tf', '.terraform.lock.hcl']) {
+          rewrite(`hosting/paperclip-hermes/terraform/stacks/${stack}/${file}`, pins.providers['hashicorp/azurerm'], want.providers['hashicorp/azurerm']);
+        }
+      }
+      rewrite('hosting/paperclip-hermes/kit/compose.yaml', `:${pins.paperclip.prefix}${pins.paperclip.version}@`, `:${pins.paperclip.prefix}${want.paperclip}@`);
+      rewrite('hosting/paperclip-hermes/kit/Dockerfile.hermes', `:${pins.hermes}@`, `:${want.hermes}@`);
+      rewrite('.github/workflows/release.yml', `# ${pins.actions['googleapis/release-please-action']}`, `# ${want.actions['googleapis/release-please-action']}`);
+    }
+    const pins = readPins(dir), want = next(pins);
     const events = cliRun(dir,scenario,'default');
-    assertPublic(events, scenario);
+    assertPublic(events, scenario === 'bumped' ? 'mature' : scenario, pins, want, scenario !== 'bumped');
+    if (scenario === 'bumped') console.log('PASS fixtures stay valid after pins advance (runtime, provider, Paperclip, Hermes, release action)');
   }
   const dir = path.join(temporary,'instance'); fs.mkdirSync(dir);
   for (const name of ['deploy','restore','vault-move','teardown','plan','tailnet-import','ops','power','cost-guard','backup-verify','ops-target-b','power-target-b','cost-guard-target-b','backup-verify-target-b']) {

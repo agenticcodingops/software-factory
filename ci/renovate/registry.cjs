@@ -4,6 +4,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const root = path.resolve(__dirname, '../..');
 const scenario = process.env.WP7_SCENARIO;
+const {readPins, bump, next} = require('./pins.cjs');
+const pins = scenario === 'instance' ? null : readPins(process.cwd());
+const want = pins && next(pins);
 const now = Date.now();
 const age = (days) => new Date(now - days * 86400000).toISOString();
 const digest = (letter) => `sha256:${letter.repeat(64)}`;
@@ -21,38 +24,37 @@ for (const [name, preset] of Object.entries({default: defaults, instance})) {
     .reply(200, {content: Buffer.from(JSON.stringify(preset)).toString('base64')});
 }
 
-const paperTag = scenario === 'prefixed' ? 'v2026.1124.0' : '2026.1124.0';
+if (pins) {
+const paperTag = (pins.paperclip.prefix ? 'v' : '') + want.paperclip;
 const packages = [
-  { name: digest('a'), created_at: age(20), metadata: { container: { tags: ['2026.1117.0', 'v2026.1117.0'] } } },
+  { name: digest('a'), created_at: age(20), metadata: { container: { tags: [pins.paperclip.version, 'v' + pins.paperclip.version] } } },
   { name: digest('b'), created_at: scenario === 'missing' ? null : age(scenario === 'young' ? 2 : 3.1),
-    metadata: { container: { tags: [paperTag, 'nightly', '2026.1124.0-cloud', '2026.1124.0-beta'] } } },
+    metadata: { container: { tags: [paperTag, 'nightly', want.paperclip + '-cloud', want.paperclip + '-beta'] } } },
 ];
 nock('https://api.github.com').persist()
   .matchHeader('authorization', /^(?:Bearer|token) fixture-placeholder$/i)
   .get('/orgs/paperclipai/packages/container/paperclip/versions').query({per_page: 100}).reply(200, packages);
 nock('https://releases.hashicorp.com').persist().get('/terraform/index.json').reply(200, {
-  versions: { '1.17.2': {}, '1.17.3': {} },
+  versions: {[pins.terraform]: {}, [want.terraform]: {}},
 });
+}
 
 nock('https://registry.terraform.io').persist()
   .get('/.well-known/terraform.json').reply(200, {'modules.v1': '/v1/modules/', 'providers.v1': '/v1/providers/'});
-const providers = {'hashicorp/azurerm': '4.81.0', 'Azure/azapi': '2.14.0', 'hashicorp/random': '3.9.1',
-  'hashicorp/time': '0.14.2', 'hashicorp/tls': '4.4.2', 'tailscale/tailscale': '0.30.0'};
-for (const [name, version] of Object.entries(providers)) {
-  const parts = version.split('.').map(Number);
-  if (name === 'tailscale/tailscale') { parts[1]++; parts[2] = 0; } else { parts[2]++; }
+for (const [name, version] of Object.entries(pins?.providers || {})) {
   nock('https://registry.terraform.io').persist().get(`/v2/providers/${name.toLowerCase()}`).query({include: 'provider-versions'}).reply(200, {
     data: {attributes: {}},
-    included: [version, parts.join('.')].map(version => ({type: 'provider-versions', attributes: {version, 'published-at': age(10)}})),
+    included: [version, want.providers[name]].map(version => ({type: 'provider-versions', attributes: {version, 'published-at': age(10)}})),
   });
 }
 // Registry fixture responds to every AVM pinned in the real Terraform tree.
 function walk(dir) {
+  if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir, {withFileTypes: true}).flatMap(e =>
     e.isDirectory() && e.name !== '.terraform' ? walk(path.join(dir, e.name)) : e.isFile() && e.name.endsWith('.tf') ? [path.join(dir, e.name)] : []);
 }
 const modules = new Map();
-for (const file of walk(`${root}/hosting/paperclip-hermes/terraform`)) {
+for (const file of walk(`${process.cwd()}/hosting/paperclip-hermes/terraform`)) {
   for (const m of fs.readFileSync(file, 'utf8').matchAll(/source\s*=\s*"(Azure\/avm-[^"]+)"\s+version\s*=\s*"([\d.]+)"/g)) {
     modules.set(m[1], m[2]);
   }
@@ -65,7 +67,8 @@ for (const [name, version] of modules) {
   });
 }
 
-const images = {'nousresearch/hermes-agent': ['v0.23.4','v0.23.5','v2026.9.24','v0.99.0-canary','v0.24.0-rc.1','v0.24.0-desktop'],
+// A PostgreSQL major move is a policy change and should require a test edit.
+const images = {...(pins ? {'nousresearch/hermes-agent': [pins.hermes, want.hermes, 'v2026.9.24', 'v0.99.0-canary', bump(pins.hermes, 'minor') + '-rc.1', bump(pins.hermes, 'minor') + '-desktop']} : {}),
   'library/postgres': ['17','17.1','18'], 'library/caddy': ['2-alpine','2.1-alpine']};
 for (const [name, tags] of Object.entries(images)) {
   nock('https://hub.docker.com').persist().get(`/v2/repositories/${name}/tags`).query(true).reply(200, {
@@ -81,13 +84,16 @@ nock('https://api.github.com').persist().post('/graphql').reply((uri, body) => {
   const query = body.query;
   const repo = query.match(/repository\(owner: "([^"]+)", name: "([^"]+)"/);
   const name = repo ? repo[2] : body.variables?.name;
-  const versions = name === 'software-factory' ? ['v0.1.0', 'v0.2.0', 'v1.0.0'] : name === 'release-please-action' ? ['v4.4.0','v4.4.1'] : ['v7.0.1','v7.0.2','v8.0.0'];
+  const owner = repo ? repo[1] : body.variables?.owner;
+  const action = `${owner}/${name}`;
+  const versions = pins?.actions[action] ? [pins.actions[action], want.actions[action]] : name === 'software-factory' ? ['v0.1.0', 'v0.2.0', 'v1.0.0'] : ['v7.0.1','v7.0.2','v8.0.0'];
   const tags = versions.map((version, i) => ({version, target: {type: 'Commit', oid: i ? head : old, releaseTimestamp: age(10)}}));
   const releases = versions.map((version, id) => ({version, releaseTimestamp: age(10), isDraft: false, isPrerelease: false,
     url: `https://github.com/fixture/repo/releases/tag/${version}`, id: id + 1, name: version, description: 'Routine fixes.'}));
   return [200, {data: {repository: {isRepoPrivate: false, payload: {pageInfo: {hasNextPage: false, endCursor: null}, nodes: query.includes('refs(') ? tags : releases}}}}];
 });
-const devDependencies = JSON.parse(fs.readFileSync(`${root}/package.json`)).devDependencies;
+const packageFile = path.join(process.cwd(), 'package.json');
+const devDependencies = fs.existsSync(packageFile) ? JSON.parse(fs.readFileSync(packageFile)).devDependencies : {};
 for (const [name, version] of Object.entries(devDependencies)) {
   const parts = version.split('.').map(Number); parts[2]++;
   const versions = [version, parts.join('.')];
