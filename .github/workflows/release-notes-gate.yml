@@ -28,7 +28,10 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Install verified Compose from the trusted checkout
+        run: bash ci/install-tools.sh "$RUNNER_TEMP/wp7-bin"
       - name: Publish the gate on the current PR head
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 ci/renovate/release-notes-gate.py
+        run: |
+          PATH="$RUNNER_TEMP/wp7-bin:$PATH" python3 ci/renovate/release-notes-gate.py

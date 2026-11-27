@@ -19,4 +19,9 @@ curl --fail --silent --show-error --location --retry 3 \
   https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o gitleaks.tar.gz
 echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz' | sha256sum -c -
 tar -xzf gitleaks.tar.gz gitleaks
-install -m 0755 actionlint tflint gitleaks "$destination/"
+# Latest stable v2 release: https://github.com/docker/compose/releases/tag/v2.40.3
+# Standalone invocation: https://docs.docker.com/compose/install/standalone/
+curl --fail --silent --show-error --location --retry 3 \
+  https://github.com/docker/compose/releases/download/v2.40.3/docker-compose-linux-x86_64 -o docker-compose
+echo 'dba9d98e1ba5bfe11d88c99b9bd32fc4a0624a30fafe68eea34d61a3e42fd372  docker-compose' | sha256sum -c -
+install -m 0755 actionlint tflint gitleaks docker-compose "$destination/"

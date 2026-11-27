@@ -5,7 +5,10 @@ import base64
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -235,6 +238,67 @@ def compose_pin(text, image, service):
     return unique_pin(pins)
 
 
+COMPOSE_TIMEOUT = 60
+COMPOSE_VALUES = {
+    "TAILSCALE_HOSTNAME": "pilot.tailnet.example",
+    "FIXTURE_REPOSITORY": "owner/fixture-repository",
+    "KIT_IMAGE_TAG": "local",
+    "DASHBOARD_SUBNET": "172.30.99.0/24",
+    "DASHBOARD_GATEWAY": "172.30.99.1",
+    "HERMES_MODEL": "fixture-model",
+    "KIT_MESSAGING_OFF": "",
+}
+
+
+def confirm_compose_pin(text, image, service, pin):
+    # ci/install-tools.sh installs the checksum-verified standalone docker-compose
+    # on PATH in both workflows. Never fall back to the runner's Docker CLI plugin.
+    # config resolves the paperclip image the registry/notes checks describe:
+    # https://docs.docker.com/reference/cli/docker/compose/config/
+    # This does not check other services, Dockerfiles, override files or env files.
+    binary = shutil.which("docker-compose")
+    if binary is None:
+        raise ValueError("verified Compose is unavailable")
+
+    def no_constant(value):
+        raise ValueError("non-JSON Compose constant")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate Compose JSON key")
+            result[key] = value
+        return result
+
+    with tempfile.TemporaryDirectory(prefix="compose-gate-") as directory:
+        root = Path(directory)
+        (root / "compose.yaml").write_bytes(text.encode("utf-8"))
+        config = root / "docker-config"
+        config.mkdir()
+        # Construct from scratch: only PATH and fixed fixture values survive.
+        # The private cwd has no .env/override; HOME and Docker credentials are empty.
+        env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": directory,
+               "DOCKER_CONFIG": str(config), **COMPOSE_VALUES}
+        run = subprocess.run(
+            [binary, "-f", "compose.yaml", "--profile", "*", "config", "--format", "json"],
+            cwd=directory, env=env, capture_output=True, text=True,
+            timeout=COMPOSE_TIMEOUT, check=True,
+        )
+        model = json.loads(run.stdout, parse_constant=no_constant, object_pairs_hook=unique_object)
+        services = model.get("services") if isinstance(model, dict) else None
+        resolved = services.get(service) if isinstance(services, dict) else None
+        actual = resolved.get("image") if isinstance(resolved, dict) else None
+        if not isinstance(actual, str) or actual != f"{image}:{pin[0]}@{pin[1]}":
+            raise ValueError("Compose service image differs from the checked pin")
+
+
+def checked_compose_pin(text, image, service):
+    pin = compose_pin(text, image, service)
+    confirm_compose_pin(text, image, service, pin)
+    return pin
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise ValueError("redirects are forbidden")
@@ -368,7 +432,7 @@ def evaluate(api, repo, pr, base_sha):
         before = api.contents(repo, base_sha, path)
         after = api.contents(pr["head"]["repo"]["full_name"], pr["head"]["sha"], path)
         kind, service = extractor
-        extract = (lambda text: compose_pin(text, image, service)) if kind == "compose" else (lambda text: dockerfile_pin(text, image))
+        extract = (lambda text: checked_compose_pin(text, image, service)) if kind == "compose" else (lambda text: dockerfile_pin(text, image))
         old_tag, old_digest = extract(before)
         new_tag, new_digest = extract(after)
         if (old_tag, old_digest) == (new_tag, new_digest):

@@ -6,6 +6,8 @@ from io import StringIO
 import importlib.util
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -42,7 +44,7 @@ class FakeAPI:
         if "Dockerfile" in path:
             tag = "v0.23.4" if sha == self.base_sha or self.image != "hermes" else "v0.23.5"
             return f"# base\nFROM {image}:{tag}@sha256:{digest} AS runtime\nRUN true \\\n    && true\nFROM runtime AS sandbox\n"
-        return ("services:\n  postgres:\n    image: postgres:17@sha256:" + "e" * 64 + "\n"
+        return ("x-runtime: &runtime\n  restart: unless-stopped\nservices:\n  postgres:\n    image: postgres:17@sha256:" + "e" * 64 + "\n"
                 f"  paperclip:\n    <<: *runtime\n    image: {image}:{tag}@sha256:{digest}\n"
                 "  hermes:\n    image: software-factory-hermes:${KIT_IMAGE_TAG:-local}\n")
 
@@ -498,6 +500,111 @@ class PinExtractionTests(unittest.TestCase):
         for text in (self.compose() + "\r", self.compose() + "\ufeff", "---\n" + self.compose()):
             with self.assertRaises(ValueError):
                 gate.compose_pin(text, self.paper, "paperclip")
+
+
+class ComposeOracleTests(unittest.TestCase):
+    invoke = NotesTests.invoke
+    paper = PinExtractionTests.paper
+
+    def kit(self):
+        return (Path(__file__).resolve().parents[2] / gate.IMAGES[self.paper][2]).read_text()
+
+    def fake_binary(self, directory, program):
+        binary = Path(directory) / "docker-compose"
+        binary.write_text(f"#!{sys.executable}\n" + program + "\n")
+        binary.chmod(0o755)
+        return patch.dict(os.environ, {"PATH": directory + os.pathsep + os.environ["PATH"]})
+
+    def test_real_compose_confirms_kit_pin(self):
+        text = self.kit()
+        self.assertEqual(gate.checked_compose_pin(text, self.paper, "paperclip"),
+                         gate.compose_pin(text, self.paper, "paperclip"))
+
+    def test_oracle_is_independent_of_scanner_on_divergent_inputs(self):
+        text = self.kit()
+        pin = gate.compose_pin(text, self.paper, "paperclip")
+        tracked = next(line for line in text.splitlines(True) if line.startswith("    image: " + self.paper))
+        variants = [text.replace(tracked, tracked + continuation) for continuation in
+                    ("      other.example/paperclip\n", "     other\n", "\n      other\n")]
+        variants.append(text.replace("  paperclip:\n", "  paperclip:\n    !reset\n", 1))
+        # Mutate away the entire scanner: only the real Compose oracle can reject.
+        for variant in variants:
+            with self.subTest(text=variant), patch.object(gate, "compose_pin", return_value=pin):
+                with self.assertRaises(ValueError):
+                    gate.checked_compose_pin(variant, self.paper, "paperclip")
+
+    def test_scanner_rejects_before_oracle_runs(self):
+        with patch.object(gate.subprocess, "run") as run, self.assertRaises(ValueError):
+            gate.checked_compose_pin("services: {}", self.paper, "paperclip")
+        run.assert_not_called()
+
+    def test_oracle_failures_label_and_fail_status_on_base_and_head(self):
+        expected = self.paper + ":2026.1117.0@sha256:" + "c" * 64
+        programs = {
+            "exit": "raise SystemExit(4)",
+            "timeout": "import time; time.sleep(30)",
+            "invalid-json": "print('not JSON')",
+            "missing-service": "print('{\"services\": {}}')",
+            "different-image": "print('{\"services\": {\"paperclip\": {\"image\": \"other:1\"}}}')",
+        }
+        for value in ([], None, {"services": []}, {"services": {"paperclip": []}},
+                      {"services": {"paperclip": {}}}, {"services": {"paperclip": {"image": 1}}}):
+            programs[repr(value)] = "print(" + repr(json.dumps(value)) + ")"
+        programs["duplicate-key"] = "print(" + repr('{"services":{},"services":{"paperclip":{"image":' + json.dumps(expected) + '}}}') + ")"
+        programs["non-json-constant"] = "print(" + repr('{"x":NaN,"services":{"paperclip":{"image":' + json.dumps(expected) + '}}}') + ")"
+        # Let base or head alone fail. The equal scanner pins must not skip the oracle.
+        for side in ("base", "head"):
+            for name, failure in programs.items():
+                with self.subTest(side=side, failure=name), tempfile.TemporaryDirectory() as directory:
+                    program = ("from pathlib import Path\n"
+                               "p = Path(" + repr(str(Path(directory) / "calls")) + ")\n"
+                               "n = int(p.read_text()) if p.exists() else 0\np.write_text(str(n+1))\n"
+                               "if n == " + str(int(side == "head")) + ":\n" +
+                               "\n".join("    " + line for line in failure.splitlines()) +
+                               "\nelse:\n    print(" + repr(json.dumps({"services": {"paperclip": {"image": expected}}})) + ")")
+                    api = FakeAPI()
+                    original = api.contents
+                    def unchanged(repo, sha, path):
+                        return original(repo, api.base_sha, path)
+                    with self.fake_binary(directory, program), patch.object(api, "contents", side_effect=unchanged), patch.object(gate, "COMPOSE_TIMEOUT", 5 if name == "timeout" else 60):
+                        self.assertEqual(self.invoke(api), 1)
+                    self.assertEqual(int((Path(directory) / "calls").read_text()), 1 + int(side == "head"))
+                    self.assertEqual(api.calls[-1][1]["state"], "failure")
+                    self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
+
+    def test_missing_verified_binary_fails(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"PATH": directory}):
+            with self.assertRaisesRegex(ValueError, "verified Compose is unavailable"):
+                gate.checked_compose_pin(self.kit(), self.paper, "paperclip")
+
+    def test_subprocess_has_only_explicit_environment_and_private_files(self):
+        text = self.kit()
+        pin = gate.compose_pin(text, self.paper, "paperclip")
+        expected = {"services": {"paperclip": {"image": f"{self.paper}:{pin[0]}@{pin[1]}"}}}
+        program = "print(" + repr(json.dumps(expected)) + ")"
+        runner_env = {"GH_TOKEN": "runner-fixture", "GITHUB_TOKEN": "runner-fixture",
+                      "COMPOSE_FILE": "runner.yaml", "COMPOSE_PROFILES": "runner",
+                      "DOCKER_HOST": "runner", "ARBITRARY_RUNNER_VALUE": "runner"}
+        original = subprocess.run
+        def inspect(*args, **kwargs):
+            root = Path(kwargs["cwd"])
+            self.assertEqual(set(p.name for p in root.iterdir()), {"compose.yaml", "docker-config"})
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((root / "compose.yaml").read_bytes(), text.encode())
+            self.assertEqual(list((root / "docker-config").iterdir()), [])
+            env = kwargs["env"]
+            self.assertEqual(set(env), {"PATH", "HOME", "DOCKER_CONFIG"} | set(gate.COMPOSE_VALUES))
+            self.assertTrue(set(runner_env).isdisjoint(env))
+            self.assertEqual(env, {"PATH": os.environ["PATH"], "HOME": str(root),
+                                   "DOCKER_CONFIG": str(root / "docker-config"), **gate.COMPOSE_VALUES})
+            self.assertEqual(args[0][1:], ["-f", "compose.yaml", "--profile", "*", "config", "--format", "json"])
+            self.assertEqual(kwargs["timeout"], 60)
+            return original(*args, **kwargs)
+        with tempfile.TemporaryDirectory() as directory, self.fake_binary(directory, program), patch.dict(os.environ, runner_env):
+            with patch.object(gate.subprocess, "run", side_effect=inspect) as run:
+                self.assertEqual(gate.checked_compose_pin(text, self.paper, "paperclip"), pin)
+            self.assertEqual(run.call_count, 1)
+            self.assertFalse(Path(run.call_args.kwargs["cwd"]).exists())
 
 
 class RegistryTests(unittest.TestCase):
