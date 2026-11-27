@@ -37,7 +37,14 @@ if phase in ("POST", "PUT"):
     (state / "body").write_text(body)
     print("123")
 elif phase == "readback":
-    print((state / "body").read_text())
+    body = json.loads((state / "body").read_text())
+    if os.environ.get("NULL_ADMIN"):
+        for actor in body["bypass_actors"]:
+            if actor["actor_type"] == "OrganizationAdmin": actor["actor_id"] = None
+    if os.environ.get("NULL_TEAM"):
+        for actor in body["bypass_actors"]:
+            if actor["actor_type"] == "Team": actor["actor_id"] = None
+    print(json.dumps(body))
 elif phase == "user": print("operator-fixture")
 elif phase == "sha": print("a" * 40)
 elif phase == "blob": print(json.loads((pathlib.Path(os.environ["APPLY_ROOT"]) / "hosting/paperclip-hermes/rulesets/org-release-notes-gate.pin.json").read_text())["blob_sha"])
@@ -111,6 +118,18 @@ class ManualApplyTests(unittest.TestCase):
             self.assertTrue(block.startswith("(\nset -euo pipefail\n"))
             self.assertTrue(block.endswith("\n)"))
             self.assertIn("gh api user --jq .login", block)
+
+    def test_only_organization_admin_null_actor_id_is_normalized(self):
+        for number, block in enumerate(self.blocks()):
+            with self.subTest(block=number):
+                result, _, leftovers = self.run_block(block, NULL_ADMIN="1")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(leftovers, [])
+            if "public-release-tags.json" in block:
+                result, _, leftovers = self.run_block(block, NULL_ADMIN="1", NULL_TEAM="1")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("actor_id", result.stdout)
+                self.assertEqual(leftovers, [])
 
     def test_successful_create_and_update_have_empty_readback_diff(self):
         for number, block in enumerate(self.blocks()):

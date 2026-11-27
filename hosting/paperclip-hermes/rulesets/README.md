@@ -73,8 +73,8 @@ else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" 
 readback=$(mktemp)
 trap 'rm -f "$readback"' EXIT
 gh api "repos/agenticcodingops/software-factory/rulesets/$id" > "$readback"
-diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$f") \
-     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$readback")
+diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$f") \
+     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$readback")
 )
 ```
 
@@ -103,8 +103,8 @@ if [ -z "$id" ]; then id=$(gh api --method POST orgs/agenticcodingops/rulesets -
 else gh api --method PUT "orgs/agenticcodingops/rulesets/$id" --input "$body" >/dev/null || exit 1; fi
 [[ $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset ID is unresolved' >&2; exit 1; }
 gh api "orgs/agenticcodingops/rulesets/$id" > "$readback" || exit 1
-diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$body") \
-     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$readback")
+diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$body") \
+     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$readback")
 )
 ```
 
@@ -131,13 +131,18 @@ if [ -z "$id" ]; then id=$(gh api --method POST repos/agenticcodingops/software-
 else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" --input "$body" >/dev/null || exit 1; fi
 [[ $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset ID is unresolved' >&2; exit 1; }
 gh api "repos/agenticcodingops/software-factory/rulesets/$id" > "$readback" || exit 1
-diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$body") \
-     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$readback")
+diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$body") \
+     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$readback")
 )
 ```
 
-Any diff line must be explained by a documented API default; otherwise the apply
-failed. Check listings for duplicate names and pagination before applying: the
+The expected result is an empty diff and exit status 0. The filter drops only
+`"actor_id": null` returned for an OrganizationAdmin bypass actor; the
+[API ignores actor_id for that type](https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
+A Team actor's null or changed ID still appears in the diff. Any remaining diff line means
+the apply failed unless it is a documented API default, which the operator records in
+this README in a reviewed PR. Do not normalize other fields without a real readback.
+Check listings for duplicate names and pagination before applying: the
 [repository rules API](https://docs.github.com/en/rest/repos/rules) supports `includes_parents`
 and caps `per_page` at 100. Use the [teams API](https://docs.github.com/en/rest/teams/teams)
 to verify membership. A later workflow change needs the blob pin updated in a reviewed
