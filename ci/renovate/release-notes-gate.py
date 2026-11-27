@@ -82,14 +82,16 @@ def unique_pin(pins):
 
 def dockerfile_pin(text, image):
     # Strict physical FROM lines; no continuation/parser directives are interpreted.
+    # DetectSyntax also falls back to // comments and skips a first-line shebang:
+    # https://raw.githubusercontent.com/moby/buildkit/master/frontend/dockerfile/parser/directives.go
     # https://docs.docker.com/reference/dockerfile/
     ascii_only(text)
     stages, pins = set(), []
     for raw in text.split("\n"):
         line = raw.lstrip(" ")
+        if re.match(r"(?i)(#|//)\s*(syntax|escape|check)\s*=", line):
+            raise ValueError("Dockerfile parser directives require the operator")
         if line.startswith("#"):
-            if re.match(r"(?i)#\s*(syntax|escape)\s*=", line):
-                raise ValueError("Dockerfile parser directives require the operator")
             continue
         if re.fullmatch(r"(?i)(f|fr|fro)\\[ ]*", line):
             raise ValueError("split FROM keyword")
