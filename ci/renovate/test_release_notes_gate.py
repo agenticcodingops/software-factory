@@ -565,6 +565,11 @@ class WorkflowPinTests(unittest.TestCase):
                 self.assert_result(api, 1)
                 self.assertFalse(any("/git/ref/tags/" in path for path, _ in api.calls))
 
+        # A pin bump must preserve the final LF as well as every unchanged line.
+        api = self.api(old=self.line(self.old, "v7.0.1"), new=self.line().removesuffix("\n"))
+        self.assert_result(api, 1)
+        self.assertFalse(any("/git/ref/tags/" in path for path, _ in api.calls))
+
     def test_workflow_status_and_strict_paths_are_protected(self):
         for status in ("added", "removed", "renamed", "copied", "changed", "unknown"):
             self.assert_result(self.api(status=status), 1)
