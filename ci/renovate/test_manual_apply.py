@@ -63,6 +63,16 @@ elif phase == "readback":
                 if change == "removed_parameter": del rule["parameters"]["require_code_owner_review"]
             if rule["type"] == "required_status_checks" and change == "integration":
                 rule["parameters"]["required_status_checks"][0]["integration_id"] = 42
+    change = os.environ.get("READBACK_CHANGE")
+    if change == "enforcement": body["enforcement"] = "disabled"
+    if change == "conditions": body["conditions"]["ref_name"]["include"].append("refs/heads/other")
+    if change == "repo_condition": body["conditions"]["repository_name"]["include"].append("other-repo")
+    if change == "bypass":
+        body["bypass_actors"].append({"actor_id":5, "actor_type":"RepositoryRole", "bypass_mode":"always"})
+    if change == "bypass_mode":
+        for actor in body["bypass_actors"]:
+            if actor["actor_type"] == "OrganizationAdmin" and actor["bypass_mode"] == "pull_request":
+                actor["bypass_mode"] = "always"
     if os.environ.get("NULL_ADMIN"):
         for actor in body["bypass_actors"]:
             if actor["actor_type"] == "OrganizationAdmin": actor["actor_id"] = None
@@ -217,7 +227,7 @@ class ManualApplyTests(unittest.TestCase):
                 self.assertFalse(any("--method" in c for c in calls))
                 self.assertEqual(leftovers, [])
 
-    def test_branch_readback_compares_every_committed_field_and_extra_rule(self):
+    def test_branch_readback_compares_rules_and_extra_rule(self):
         block = next(b for b in self.blocks() if "public-repo.json" in b)
         for change in ("last_push", "merge", "integration", "removed_parameter", "extra_rule", "removed_rule"):
             with self.subTest(change=change):
@@ -225,6 +235,20 @@ class ManualApplyTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotEqual(result.stdout, "operator-fixture\n")
                 self.assertEqual(leftovers, [])
+
+    def test_readback_compares_enforcement_conditions_and_bypass_actors(self):
+        for number, block in enumerate(self.blocks()):
+            changes = ["enforcement", "conditions", "bypass"]
+            if "public-release-tags.json" not in block:
+                changes.append("bypass_mode")
+            if "org-release-notes-gate.json" in block:
+                changes.append("repo_condition")
+            for change in changes:
+                with self.subTest(block=number, change=change):
+                    result, _, leftovers, _ = self.run_block(block, READBACK_CHANGE=change)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotEqual(result.stdout, "operator-fixture\n")
+                    self.assertEqual(leftovers, [])
 
     def test_each_apply_is_a_standalone_subshell(self):
         for block in self.blocks():
