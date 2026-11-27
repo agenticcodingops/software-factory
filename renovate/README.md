@@ -132,8 +132,11 @@ The Compose check accepts one canonical form and is not a YAML parser. It reject
 flow collections, multi-line quoted scalars, explicit (`?`) and alias keys, any merge other
 than `<<: *runtime` indented exactly four spaces, and any 1-space or 3-space indentation.
 It also rejects a quote outside the start of a value or key, brackets inside a plain
-scalar other than `${...}`, `''` escapes, and an anchor or tag followed by a value on
-the same line. It does not cover
+scalar other than `${...}`, `''` escapes, a closing quote followed directly by anything
+other than end of line, a space, a final `:`, `: `, or (inside a flow collection) `,`
+`]` `}`, so compact JSON-style mappings such as `{"a":"b"}` must be written
+`{"a": "b"}`, and an anchor or tag followed by a value on
+the same line. The plain-key form `{a:"b"}` also fails the quote-start rule. It does not cover
 a PR that points Compose at a different Dockerfile, adds `COPY --from=<image>`, or adds an override file. Protected changes are detected by comparing the captured default-branch SHA with the
 captured head SHA using the [three-dot compare API](https://docs.github.com/en/rest/commits/commits#compare-two-commits),
 including previous filenames on renames. The protected paths are `.github/workflows/`,
