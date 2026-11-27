@@ -180,9 +180,21 @@ def compose_pin(text, image, service):
     ascii_only(text)
     top, current = None, None
     services, image_lines, pins = set(), set(), []
+    pending_indent = None
     for line in text.split("\n"):
-        if not line.strip() or line.lstrip(" ").startswith("#"):
+        if not line.strip():
             continue
+        indent = len(line) - len(line.lstrip(" "))
+        # YAML folds deeper lines into a preceding plain scalar, even across blanks.
+        # Only empty block keys/dashes (and a key's bare anchor) may introduce children.
+        if pending_indent is not None and indent > pending_indent:
+            raise ValueError("compose multi-line plain scalars are unsupported")
+        if line.lstrip(" ").startswith("#"):
+            continue
+        container = re.fullmatch(r" *(?:(?:- +)?[A-Za-z0-9_.-]+: *(?:&[A-Za-z0-9_-]+ *)?|- *)(?:#.*)?", line)
+        # A sequence mapping's key starts after "- "; its next key is a sibling.
+        key_indent = indent + 2 if re.match(r" *- [A-Za-z0-9_.-]+: ", line) else indent
+        pending_indent = None if container else key_indent
         if "\\" in line:
             raise ValueError("compose backslashes are unsupported")
         indent = len(line) - len(line.lstrip(" "))

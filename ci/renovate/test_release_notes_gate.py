@@ -357,6 +357,19 @@ class PinExtractionTests(unittest.TestCase):
             pin = gate.compose_pin(text, image, service) if kind == "compose" else gate.dockerfile_pin(text, image)
             self.assertRegex(pin[0], "^" + pattern + "$")
 
+    def test_plain_scalar_continuations_are_rejected(self):
+        root = Path(__file__).resolve().parents[2]
+        text = (root / gate.IMAGES[self.paper][2]).read_text()
+        tracked = next(line for line in text.splitlines(True) if line.startswith("    image: " + self.paper))
+        for continuation in ("      other.example/paperclip\n", "     other\n",
+                             "\n      other\n", "      # comment\n"):
+            with self.subTest(continuation=continuation), self.assertRaisesRegex(ValueError, "multi-line plain scalars"):
+                gate.compose_pin(text.replace(tracked, tracked + continuation), self.paper, "paperclip")
+        with self.assertRaisesRegex(ValueError, "multi-line plain scalars"):
+            gate.compose_pin(text.replace("  restart: unless-stopped\n", "  restart: unless-stopped\n    other\n"),
+                             self.paper, "paperclip")
+        self.assertEqual(gate.compose_pin(text, self.paper, "paperclip")[0], "2026.1117.0")
+
     def test_comment_cannot_satisfy_the_dockerfile_pin(self):
         comment = f"# {self.hermes}:v0.23.4@{self.digest}\n"
         variants = [
