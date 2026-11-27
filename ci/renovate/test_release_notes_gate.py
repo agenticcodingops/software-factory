@@ -331,7 +331,7 @@ class PinExtractionTests(unittest.TestCase):
             "# escape=`\n" + self.docker(),
             "# syntax=docker/dockerfile:1\n" + self.docker(),
             self.docker() + "FROM evil:1\n",
-            "\t" + self.docker(),
+            self.docker().replace("FROM", "\tFROM", 1),
             self.docker() + self.docker(),
         ]
         for text in variants:
