@@ -94,7 +94,7 @@ Most recent Hermes patches currently go to the operator while upstream defers pa
 Paperclip version bumps are operator-reviewed in practice because upstream bodies routinely
 contain these words, including "No migrations" ([Paperclip releases](https://github.com/paperclipai/paperclip/releases)). Missing/empty notes and API failures also fail
 closed. The gate reads `(tag, digest)` from strict physical image lines: canonical
-`    image: repository:tag@sha256:...` under the named Compose service and
+`image: repository:tag@sha256:...` indented four spaces under the named Compose service and
 `FROM repository:tag@sha256:... [AS stage]` in the Dockerfile. Earlier Dockerfile
 stage aliases and unqualified local-build Compose images on other services are allowed.
 Comments cannot supply a pin; directives, interpolation on the tracked image, escapes,
@@ -132,8 +132,9 @@ and every other workflow edit need the operator. The allowed depTypes are checke
 The operator's 2026-11-27 decision keeps public Actions patch/minor merges with agents;
 this explicit verified exception records the ADR interpretation without editing the ADR. The `pull_request_target` workflow is
 restricted to `main` and checks out `github.sha`, the trusted default-branch commit. PR files are
-read through the API as data. The script guards both event and live base refs and posts nothing
-for other targets. It resolves current main through the Git ref API, and fails if main moves during
+read through the API as data. Events targeting another branch post nothing; a live base
+change fails the run and replaces an existing pending status with error. Retargeting back
+to main requires a reopen or a new commit. It resolves current main through the Git ref API, and fails if main moves during
 evaluation; a changing PR head receives no passing result.
 
 The per-SHA status is informational. `org-release-notes-gate.json` requires the workflow itself at
@@ -179,7 +180,7 @@ using this repository's manifest configuration and the npm-pinned release-please
 release PR with changelog, version file and manifest updates, both for initial `0.1.0` and a
 subsequent `0.1.1` patch. The SCM adapter records writes locally; no GitHub PR is published.
 Separate notes-gate tests cover risk words, skipped release pages, missing notes/API failures,
-author-independent image checks against current main, workflow changes across diff pages,
+author-independent image checks against current main, protected paths in immutable comparisons, verified action pins,
 non-default targets, label/status publication, digest-only updates, and moving main/PR heads.
 The CLI fixture also covers Actions/caller majors, disabled out-of-scope files, grouped validator
 updates, weekly scheduling and a Tailscale minor compatible with its module range. Ruleset tests
