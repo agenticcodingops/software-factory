@@ -160,6 +160,24 @@ class NotesTests(unittest.TestCase):
         self.assertEqual(api.calls[-1][1]["state"], "failure")
         self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
 
+    def test_compose_block_scalar_hidden_upgrade_fails_before_network(self):
+        api = FakeAPI()
+        original = api.contents
+        def hidden(repo, sha, file):
+            text = original(repo, sha, file)
+            if sha != api.base_sha and file.endswith("compose.yaml"):
+                pin = "    image: ghcr.io/paperclipai/paperclip:2026.1117.0@sha256:" + "c" * 64
+                return "services:\n  paperclip:\n   <<: *evil\n   command: |\n" + pin + "\n"
+            if "Dockerfile" in file:
+                return original(repo, api.base_sha, file)
+            return text
+        with patch.object(api, "contents", side_effect=hidden), patch.object(api, "registry_digest") as registry, patch.object(api, "releases") as releases:
+            self.assertEqual(self.invoke(api), 1)
+        registry.assert_not_called()
+        releases.assert_not_called()
+        self.assertEqual(api.calls[-1][1]["state"], "failure")
+        self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
+
     def test_any_author_and_both_images_are_checked_against_current_main(self):
         for author in ("renovate[bot]", "agent", "operator"):
             for image in ("paperclip", "hermes"):
@@ -354,6 +372,18 @@ class PinExtractionTests(unittest.TestCase):
             self.compose().replace(line, line + line),
             self.compose().replace(line, "    image: software-factory-hermes:${KIT_IMAGE_TAG:-local}\n"),
             self.compose().replace(self.paper, "mirror.example/" + self.paper),
+        ]
+        evil = "x-e:\n  a: &evil\n    image: evil.example/paperclip:9@sha256:" + "d" * 64 + "\n"
+        explicit = "    ? image\n    : ghcr.io/paperclipai/${P:-paperclip}:2026.1201.0@sha256:" + "d" * 64 + "\n"
+        variants += [
+            "services:\n  paperclip:\n    labels: {\n" + line + "    }\n" + explicit,
+            "services:\n  paperclip:\n    labels: '\n" + line + "    '\n" + explicit,
+            "x-k: &k image\nservices:\n  paperclip:\n    labels: {\n" + line + "    }\n    *k : ghcr.io/paperclipai/${P:-paperclip}:2026.1201.0@sha256:" + "d" * 64 + "\n",
+            'services:\n  previous:\n    labels: "\n  paperclip:\n' + line + '    "\n  "paperclip":\n    image: evil.example/paperclip:9@sha256:' + 'd' * 64 + '\n',
+            evil + "services:\n  paperclip:\n    labels: {\n" + line + "    }\n    <<: [*runtime, *evil]\n",
+            evil + "services:\n <<:\n  paperclip:\n" + line + " paperclip:\n  <<: *evil\n",
+            evil + "services:\n  paperclip:\n   <<: *evil\n   command: |\n" + line,
+            evil + "services:\n  paperclip:\n   <<: *evil\n   labels:\n   - |\n" + line,
         ]
         for text in variants:
             with self.subTest(text=text), self.assertRaises(ValueError):

@@ -120,6 +120,16 @@ def compose_pin(text, image, service):
             continue
         if "\\" in line:
             raise ValueError("compose backslashes are unsupported")
+        indent = len(line) - len(line.lstrip(" "))
+        if indent in (1, 3):
+            raise ValueError("compose indentation requires the operator")
+        if line.lstrip(" ").startswith(("?", "*")) or re.search(r"\*[A-Za-z0-9_-]+\s*:", line):
+            raise ValueError("compose explicit and alias keys are unsupported")
+        unquoted = re.sub(r"\"[^\"]*\"|'[^']*'", "", line)
+        if any(char in unquoted for char in "\"'") or unquoted.count("{") != unquoted.count("}") or unquoted.count("[") != unquoted.count("]"):
+            raise ValueError("compose multiline quotes and flow collections are unsupported")
+        if "<<" in line and line != "    <<: *runtime":
+            raise ValueError("compose merge must be the canonical runtime alias")
         if not line.startswith(" "):
             if line.startswith(("---", "...")):
                 raise ValueError("multiple compose documents are unsupported")

@@ -107,7 +107,9 @@ HEAD check must prove that the new tag resolves to the pinned digest; unavailabl
 mismatched digests fail closed ([registry authentication](https://docs.docker.com/reference/api/registry/auth/),
 [OCI digest header contract](https://raw.githubusercontent.com/opencontainers/distribution-spec/main/spec.md)).
 Digest-only updates with a matching digest need no release notes.
-The Compose check accepts one canonical form and is not a YAML parser. It does not cover
+The Compose check accepts one canonical form and is not a YAML parser. It rejects multi-line
+flow collections, multi-line quoted scalars, explicit (`?`) and alias keys, any merge other
+than `<<: *runtime` indented exactly four spaces, and any 1-space or 3-space indentation. It does not cover
 a PR that points Compose at a different Dockerfile, adds `COPY --from=<image>`, or adds an override file. Protected changes are detected by comparing the captured default-branch SHA with the
 captured head SHA using the [three-dot compare API](https://docs.github.com/en/rest/commits/commits#compare-two-commits),
 including previous filenames on renames. The protected paths are `.github/workflows/`,
