@@ -73,7 +73,22 @@ release bodies for every stable tag between the current default-branch version a
 including skipped releases, regardless of PR author.
 Case-insensitive `breaking`, `migration` or `rollback floor` text applies `needs-operator` and fails
 the `release-notes-gate` status on the exact PR head. Missing/empty notes and API failures also fail
-closed. Digest-only updates need no release notes. Changes under `.github/workflows/**`, including
+closed. The gate reads `(tag, digest)` from strict physical image lines: canonical
+`    image: repository:tag@sha256:...` under the named Compose service and
+`FROM repository:tag@sha256:... [AS stage]` in the Dockerfile. Earlier Dockerfile
+stage aliases and unqualified local-build Compose images on other services are allowed.
+Comments cannot supply a pin; directives, interpolation on the tracked image, escapes,
+unsupported image syntax, duplicate pins and non-ASCII/control characters fail closed.
+These forms deliberately restrict [Dockerfile syntax](https://docs.docker.com/reference/dockerfile/),
+[YAML escaped line breaks](https://yaml.org/spec/1.2.2/#double-quoted-style) and
+[Compose interpolation](https://docs.docker.com/reference/compose-file/interpolation/).
+Whenever either tag or digest changes, an anonymous registry token and mandatory manifest
+HEAD check must prove that the new tag resolves to the pinned digest; unavailable or
+mismatched digests fail closed ([registry authentication](https://docs.docker.com/reference/api/registry/auth/),
+[OCI digest header contract](https://raw.githubusercontent.com/opencontainers/distribution-spec/main/spec.md)).
+Digest-only updates with a matching digest need no release notes.
+The Compose check accepts one canonical form and is not a YAML parser. It does not cover
+a PR that points Compose at a different Dockerfile, adds `COPY --from=<image>`, or adds an override file. Changes under `.github/workflows/**`, including
 renames and deletions, also fail and require the operator. The `pull_request_target` workflow is
 restricted to `main` and checks out `github.sha`, the trusted default-branch commit. PR files are
 read through the API as data. The script guards both event and live base refs and posts nothing
