@@ -176,6 +176,9 @@ author-independent image checks against current main, workflow changes across di
 non-default targets, label/status publication, digest-only updates, and moving main/PR heads.
 The CLI fixture also covers Actions/caller majors, disabled out-of-scope files, grouped validator
 updates, weekly scheduling and a Tailscale minor compatible with its module range. Ruleset tests
-verify the immutable workflow binding and release-tag bypass contract. Native RE2 is skipped in the
-CLI fixture because CI installs npm packages with `--ignore-scripts`; the regexes use RE2-compatible
-syntax and the strict validator checks the committed presets.
+verify the immutable workflow binding and release-tag bypass contract. Native RE2 is not installed in CI because npm installs use `--ignore-scripts`.
+The validator falls back to RegExp ([validator source](https://github.com/renovatebot/renovate/blob/45.1.0/lib/config-validator.ts));
+the CLI fixture keeps `RENOVATE_X_IGNORE_RE2`. A separate Python syntax test walks every
+regex-valued preset string and rejects lookarounds, backreferences, atomic groups and
+possessive quantifiers while allowing named capture groups, enforcing the
+[RE2 syntax contract](https://docs.renovatebot.com/string-pattern-matching/).
