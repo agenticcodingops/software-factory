@@ -140,7 +140,9 @@ before the first write. Terraform receives only bootstrap-controlled ARM setting
    by name and compares full
    readbacks, including rule parameters and all arrays. It never treats a list
    summary as proof. API errors fail closed; unsupported org rulesets retain the
-   operator-only merge path.
+   operator-only merge path. It does not apply `org-release-notes-gate.json` or
+   `public-release-tags.json`, prints them as NOT APPLIED, and the operator applies
+   them per [the rulesets README](../rulesets/README.md).
 7. `sf restore-assist --backup-account ACCOUNT --staging-account STAGING --blob backups/NAME --version VERSION --staging-blob restore/UNIQUE --ephemeral-recipient RECIPIENT --key-cmd EXECUTABLE --apply`
    reads the recorded fingerprint before retrieving a key. The adapter returns
    the password-manager key on stdout into an anonymous pipe. Bootstrap verifies
@@ -263,6 +265,7 @@ runtime and assertions scan output, argv and all temporary files for leakage.
 
 | Requirement | Bats test name (in `tests/bootstrap.bats`) |
 | --- | --- |
+| Payloads outside the rulesets command are announced, never silently skipped | `rulesets name every committed payload they do not apply` |
 | Dry-run and idempotence | `dry-run is default…`, `trust applies WP4 variables…`, `rulesets resolve pinned gate…` |
 | Actual immutable subjects and exact workflow refs | `environment-scoped probe collects real sub…`, `probe refuses wrong sub…`, `trust refuses changed subject template…`, `tailscale federates exact probe claims…` |
 | Role scopes and WP4 names | `trust applies WP4 variables…`, `subscription scope sets host RG ownership`, all three `vault …` phase tests |

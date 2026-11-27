@@ -353,6 +353,25 @@ PYTS
   [ "$status" -eq 1 ]
 }
 
+@test 'rulesets name every committed payload they do not apply' {
+  sha=$(printf 'a%.0s' {1..40})
+  run boot rulesets --source-repo sample/source --release-sha "$sha"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'NOT APPLIED'*'org-release-notes-gate.json'*'public-release-tags.json'* ]]
+  [[ "$output" != *'.pin.json'* ]]
+  run boot rulesets --source-repo sample/source --release-sha "$sha" --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'NOT APPLIED'*'org-release-notes-gate.json'*'public-release-tags.json'* ]]
+  [[ "$output" != *'.pin.json'* ]]
+  python3 - <<'PYTEST'
+import json, os
+from pathlib import Path
+cloud = json.loads(Path(os.environ['FAKE_DB']).read_text())
+names = {r['name'] for store in cloud['rulesets'].values() for r in store.values()}
+assert names == {'software-factory-main', 'software-factory-instance-merge-gate', 'software-factory-instance-main'}, names
+PYTEST
+}
+
 @test 'restore-assist streams plaintext only between age processes and verifies staged hash' {
   run bash "$helper" restore-assist --backup-account sourcebackups --blob backups/retained.age --version historical-version --staging-blob restore/unique.age --ephemeral-recipient age1ephemeral --key-cmd key-reader --apply
   [ "$status" -eq 0 ]

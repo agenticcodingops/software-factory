@@ -1,6 +1,7 @@
 """Ruleset contracts: require workflow identity and limit release-tag bypass."""
 
 import json
+import re
 from pathlib import Path
 import hashlib
 import unittest
@@ -38,6 +39,20 @@ class RulesetTests(unittest.TestCase):
         source = Path(__file__).read_text()
         self.assertNotIn("import " + "sub" + "process", source)
         self.assertNotIn("git" + " show", source)
+
+    def test_every_payload_has_a_documented_apply_path(self):
+        payloads = {p.name for p in RULESETS.glob("*.json") if not p.name.endswith(".pin.json")}
+        readme = (RULESETS / "README.md").read_text()
+        rows = dict(re.findall(r"^\| `([a-z-]+\.json)` \|[^|]*\| ([^|]+?) \|$", readme, re.M))
+        self.assertEqual(set(rows), payloads, "every payload needs one endpoint-table row")
+        source = (ROOT / "hosting/paperclip-hermes/bootstrap/bootstrap.py").read_text()
+        managed = {m + ".json" for m in re.findall(r'\("([a-z-]+)", f"(?:repos|orgs)/[^"]*/rulesets"\)', source)}
+        self.assertEqual({p for p, by in rows.items() if "bootstrap" in by}, managed)
+        for payload in payloads - managed:
+            self.assertIn("by hand", rows[payload])
+            self.assertIn(json.loads((RULESETS / payload).read_text())["name"], readme)
+        self.assertIn("commits?sha=main&path=", readme, "manual apply must resolve the main commit")
+        self.assertIn("org-release-notes-gate.pin.json", readme)
 
     def test_release_tags_only_allow_release_actor_team_and_operator(self):
         tags = json.loads((RULESETS / "public-release-tags.json").read_text())
