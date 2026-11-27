@@ -38,6 +38,26 @@ if phase in ("POST", "PUT"):
     print("123")
 elif phase == "readback":
     body = json.loads((state / "body").read_text())
+    if body["name"] == "software-factory-main":
+        body.update(id=123, source_type="Repository")
+        for actor in body["bypass_actors"]:
+            if actor["actor_type"] == "OrganizationAdmin": actor["actor_id"] = None
+        for rule in body["rules"]:
+            if rule["type"] == "pull_request":
+                rule["parameters"].update(dismissal_restriction={"enabled":False, "allowed_actors":[]},
+                                          require_extra_approval_for_unattributed_changes=True, required_reviewers=[])
+            if rule["type"] == "required_status_checks":
+                rule["parameters"]["do_not_enforce_on_create"] = False
+        change = os.environ.get("READBACK_CHANGE")
+        if change == "extra_rule": body["rules"].append({"type":"required_signatures"})
+        if change == "removed_rule": body["rules"].pop(0)
+        for rule in body["rules"]:
+            if rule["type"] == "pull_request":
+                if change == "last_push": rule["parameters"]["require_last_push_approval"] = False
+                if change == "merge": rule["parameters"]["allowed_merge_methods"].append("merge")
+                if change == "removed_parameter": del rule["parameters"]["require_code_owner_review"]
+            if rule["type"] == "required_status_checks" and change == "integration":
+                rule["parameters"]["required_status_checks"][0]["integration_id"] = 42
     if os.environ.get("NULL_ADMIN"):
         for actor in body["bypass_actors"]:
             if actor["actor_type"] == "OrganizationAdmin": actor["actor_id"] = None
@@ -51,6 +71,32 @@ elif phase == "blob": print(json.loads((pathlib.Path(os.environ["APPLY_ROOT"]) /
 elif phase in ("team", "repo"): print("456")
 elif phase == "list": print("123" if os.environ.get("EXISTING") else "")
 '''
+
+
+
+class PublicReferencesTests(unittest.TestCase):
+    def test_committed_scoped_files_name_only_the_public_repository(self):
+        paths = subprocess.check_output(
+            ["git", "ls-files", "-z", "--", "hosting/", "renovate/", "ci/renovate/"], cwd=ROOT,
+        ).decode().split("\0")
+        private_names = [b"-".join(parts) for parts in (
+            (b"dev", b"environments"), (b"agentic", b"research", b"stack"),
+            (b"workout", b"trackroutinely"),
+        )]
+        for name in filter(None, paths):
+            with self.subTest(path=name):
+                data = (ROOT / name).read_bytes()
+                for match in re.finditer(rb"agenticcodingops/([A-Za-z0-9_.-]+)", data):
+                    # Organization API routes and CODEOWNERS teams are not repositories.
+                    prefix = data[max(0, match.start() - 5):match.start()]
+                    if prefix.endswith(b"orgs/") and match[1] in (b"rulesets", b"teams"):
+                        continue
+                    if prefix.endswith(b"@") and match[1] == b"maintainers":
+                        continue
+                    self.assertEqual(match[1].removesuffix(b".git"), b"software-factory",
+                                     "non-public repository reference")
+                for private in private_names:
+                    self.assertNotIn(private, data, "private repository name")
 
 
 class ManualApplyTests(unittest.TestCase):
@@ -113,6 +159,15 @@ class ManualApplyTests(unittest.TestCase):
                         self.assertEqual(sum("--method" in c for c in calls), int(phase == "POST"))
                         self.assertEqual(leftovers, [])
 
+    def test_branch_readback_compares_every_committed_field_and_extra_rule(self):
+        block = next(b for b in self.blocks() if "public-repo.json" in b)
+        for change in ("last_push", "merge", "integration", "removed_parameter", "extra_rule", "removed_rule"):
+            with self.subTest(change=change):
+                result, _, leftovers = self.run_block(block, READBACK_CHANGE=change)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(result.stdout, "operator-fixture\n")
+                self.assertEqual(leftovers, [])
+
     def test_each_apply_is_a_standalone_subshell(self):
         for block in self.blocks():
             self.assertTrue(block.startswith("(\nset -euo pipefail\n"))
@@ -137,6 +192,7 @@ class ManualApplyTests(unittest.TestCase):
                 with self.subTest(block=number, existing=existing):
                     result, calls, leftovers = self.run_block(block, EXISTING=existing)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout, "operator-fixture\n", "readback diff must be empty")
                     self.assertEqual(len([c for c in calls if "--method" in c]), 1)
                     self.assertEqual(leftovers, [])
 

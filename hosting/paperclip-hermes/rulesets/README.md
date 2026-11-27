@@ -74,7 +74,7 @@ readback=$(mktemp)
 trap 'rm -f "$readback"' EXIT
 gh api "repos/agenticcodingops/software-factory/rulesets/$id" > "$readback"
 diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$f") \
-     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$readback")
+     <(jq -S --slurpfile want "$f" '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id) | .rules |= map(. as $r | (first($want[0].rules[] | select(.type == $r.type)) // null) as $w | if $w != null and .parameters then .parameters |= with_entries(select(.key as $k | ($w.parameters // {}) | has($k))) else . end)' "$readback")
 )
 ```
 
@@ -136,10 +136,19 @@ diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.by
 )
 ```
 
-The expected result is an empty diff and exit status 0. The filter drops only
+The expected result is an empty diff and exit status 0. Each filter drops
 `"actor_id": null` returned for an OrganizationAdmin bypass actor; the
 [API ignores actor_id for that type](https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
-A Team actor's null or changed ID still appears in the diff. Any remaining diff line means
+A Team actor's null or changed ID still appears in the diff.
+For `software-factory-main`, the readback side also keeps only the rule parameters
+set by the committed payload because GitHub returns extra parameters:
+`dismissal_restriction`, `require_extra_approval_for_unattributed_changes`,
+`required_reviewers` and `do_not_enforce_on_create`. These extra parameters were observed on
+2026-11-27 in GitHub ruleset readbacks of existing repository rulesets in the same
+organisation; the [repository ruleset response documentation](https://docs.github.com/en/rest/repos/rules#get-a-repository-ruleset)
+lists all four.
+Every committed field, and any rule type absent from the payload, is still compared.
+Any remaining diff line means
 the apply failed unless it is a documented API default, which the operator records in
 this README in a reviewed PR. Do not normalize other fields without a real readback.
 Check listings for duplicate names and pagination before applying: the
