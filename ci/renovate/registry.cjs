@@ -25,7 +25,8 @@ for (const [name, preset] of Object.entries({default: defaults, instance})) {
 }
 
 if (pins) {
-const paperTag = (pins.paperclip.prefix ? 'v' : '') + want.paperclip;
+const paperVersion = scenario === 'paperclip-patch' ? bump(pins.paperclip.version, 'patch') : want.paperclip;
+const paperTag = (pins.paperclip.prefix ? 'v' : '') + paperVersion;
 const packages = [
   { name: digest('a'), created_at: age(20), metadata: { container: { tags: [pins.paperclip.version, 'v' + pins.paperclip.version] } } },
   { name: digest('b'), created_at: scenario === 'missing' ? null : age(scenario === 'young' ? 2 : 3.1),

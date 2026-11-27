@@ -16,7 +16,7 @@ according to the [rulesets README](../hosting/paperclip-hermes/rulesets/README.m
 agent merges. These are operator settings changes; committing a payload does not apply it.
 
 Agents may merge `agent-merge` PRs only after required checks and two reviews of the current head.
-Renovate automerge is disabled throughout. Image digest/patch updates and Terraform runtime patches
+Renovate automerge is disabled throughout. Image digest/patch updates (Paperclip: digest only) and Terraform runtime patches
 get that label. Actions and instance production refs get it only for digest, pinDigest, patch and minor updates. Every major from any manager gets
 `needs-operator`. Validator/release tooling updates always require the operator. Provider updates
 (including patches) and AVM 0.x minor updates get

@@ -66,11 +66,18 @@ function assertPublic(events, scenario, pins, want, saveDigest = true) {
   assert.ok(deps.every(d => !(d.warnings || []).length), 'dependency lookup warning');
   const paper = deps.find(d => d.depName === 'ghcr.io/paperclipai/paperclip' && d.packageFile.startsWith('hosting/'));
   const prefix = pins.paperclip.prefix;
-  const update = paper.updates.find(u => u.newValue === `${prefix}${want.paperclip}`);
+  const paperVersion = scenario === 'paperclip-patch' ? bump(pins.paperclip.version, 'patch') : want.paperclip;
+  const update = paper.updates.find(u => u.newValue === `${prefix}${paperVersion}`);
   assert.ok(update, 'Paperclip CalVer update must be proposed');
   assert.equal(update.newDigest, `sha256:${'b'.repeat(64)}`);
   assert.equal(Boolean(update.pendingChecks), ['young','missing'].includes(scenario));
   assert.ok(paper.updates.every(u => !/nightly|cloud|beta/.test(u.newValue)));
+  for (const plan of plans.filter(b => b.depName === 'ghcr.io/paperclipai/paperclip' && b.updateType !== 'digest')) {
+    assert.ok(!(plan.addLabels || []).includes('agent-merge'), 'Paperclip version bump must not carry agent-merge');
+  }
+  if (scenario === 'paperclip-patch') {
+    assert.ok(plans.some(b => b.depName === 'ghcr.io/paperclipai/paperclip' && b.updateType === 'patch'), 'Paperclip patch must be proposed');
+  }
   if (scenario === 'mature') {
     const hermes = deps.find(d => d.depName === 'nousresearch/hermes-agent' && d.packageFile.startsWith('hosting/'));
     assert.ok(hermes.updates.some(u => u.newValue === want.hermes));
@@ -82,7 +89,7 @@ function assertPublic(events, scenario, pins, want, saveDigest = true) {
     assert.ok(imagePlans.length >= 4);
     for (const b of imagePlans) {
       assert.match(b.commitMessage, /^fix\(deps\): /);
-      if (['digest','patch'].includes(b.updateType)) assert.ok(b.addLabels.includes('agent-merge'));
+      if (['digest','patch'].includes(b.updateType) && (b.depName !== 'ghcr.io/paperclipai/paperclip' || b.updateType === 'digest')) assert.ok(b.addLabels.includes('agent-merge'));
       for (const u of b.upgrades) assert.match(u.newDigest, /^sha256:[a-f0-9]{64}$/);
     }
     const caddyMajor = imagePlans.find(b => b.depName === 'caddy' && b.updateType === 'major');
@@ -190,7 +197,7 @@ try {
   for (const [time, expected] of [['2026-11-23T05:59:00Z', true], ['2026-11-23T06:00:00Z', false], ['2026-11-24T02:00:00Z', false]]) {
     assert.equal(defaults.schedule.some(cron => cronMatches(cron, DateTime.fromISO(time), defaults.timezone)), expected, `weekly schedule at ${time}`);
   }
-  for (const scenario of ['mature', 'young', 'missing', 'prefixed', 'bumped']) {
+  for (const scenario of ['mature', 'young', 'missing', 'prefixed', 'bumped', 'paperclip-patch']) {
     const dir = path.join(temporary,scenario); fs.mkdirSync(dir);
     const livePins = readPins(root);
     for (const file of ['hosting/paperclip-hermes/kit/compose.yaml','hosting/paperclip-hermes/kit/Dockerfile.hermes','.terraform-version']) {

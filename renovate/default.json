@@ -104,6 +104,25 @@
       ],
       "addLabels": [
         "agent-merge"
+      ],
+      "matchPackageNames": [
+        "!ghcr.io/paperclipai/paperclip"
+      ]
+    },
+    {
+      "description": "Paperclip version bumps are operator-reviewed; only digest updates allow agent merge.",
+      "matchPackageNames": [
+        "ghcr.io/paperclipai/paperclip"
+      ],
+      "matchManagers": [
+        "docker-compose",
+        "dockerfile"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
+      "addLabels": [
+        "agent-merge"
       ]
     },
     {
