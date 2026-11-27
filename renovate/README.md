@@ -63,8 +63,10 @@ version, digest and timestamp together in the [custom datasource format](https:/
 The GitHub token goes only to `api.github.com`, never a registry or the raw index host.
 
 The timestamp records first observation of each `(version, digest)`, retaining it only
-while the digest stays the same. A re-pushed tag restarts the clock, so the soak cannot be
-shorter than the image's real age. A new entry soaks for three days from first observation;
+while the digest stays the same, bounded below by the release's UTC `published_at` from
+GitHub's releases API. A missing or invalid publication date fails closed. A re-pushed
+tag restarts the clock when the builder observes its new digest. A new entry soaks for
+three days from first observation;
 the first run delays all candidates by three days. An unresolved tag form (404) is omitted;
 any other registry/API/parse failure or an empty result aborts before publishing and leaves
 the previous file in place. Contents/ref API publishing uses no git push
@@ -75,6 +77,23 @@ introduce new releases; previously observed entries remain available with their 
 soak clocks. Until the operator first runs the workflow after merge, the URL returns 404
 and no Paperclip update is proposed. No dependency dashboard is configured, so a failed
 scheduled run is how a stalled index is noticed.
+
+The soak clock is only as trustworthy as write access to `renovate-data`: any account
+or workflow token with contents write can alter the file. A bypass for the shared Actions
+integration would not close this boundary, because a workflow pushed on any branch runs
+under that same identity ([workflow permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#permissions)).
+The publication-date floor repairs backdating only on the next daily run; a forged file
+is served until then, and a re-pushed tag can still be backdated as far as `published_at`.
+The remaining mitigations are operator review of Paperclip version bumps and the gate's
+independent registry digest check.
+
+Operator follow-up: real closure needs a dedicated writer identity (a GitHub App, or the
+machine user through a team) and a ruleset restricting creation, update and deletion of
+`refs/heads/renovate-data`, bypassed only by that actor and OrganizationAdmin. Model a
+disabled template on `public-release-tags.json` with `actor_id: 0`. Activating it must
+wait until the index workflow uses that actor's stored credential instead of `github.token`,
+or the index will stall. Choosing and storing that credential is an operator decision;
+this PR adds neither the credential nor an active ruleset.
 
 The instance regex customManager supplies `depType: workflow` for canonical
 `uses: ...@<sha> # vX.Y.Z` caller lines. The native manager is

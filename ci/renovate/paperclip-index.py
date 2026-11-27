@@ -21,6 +21,13 @@ BRANCH = "renovate-data"
 FILE = "paperclip-releases.json"
 
 
+def utc_timestamp(value):
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+        raise ValueError("index timestamps must be UTC")
+    return parsed
+
+
 def build(releases, previous, resolve, now):
     """All registry reads complete before callers may publish anything."""
     observed = {(entry["version"], entry["digest"]): entry["releaseTimestamp"]
@@ -30,6 +37,8 @@ def build(releases, previous, resolve, now):
         tag = release["tag_name"]
         if release.get("draft") or release.get("prerelease") or not re.fullmatch(PATTERN, tag):
             continue
+        published = release["published_at"]
+        published_date = utc_timestamp(published)
         bare = tag.removeprefix("v")
         for form in (bare, "v" + bare):
             if form in entries:
@@ -43,9 +52,9 @@ def build(releases, previous, resolve, now):
             if not re.fullmatch(gate.DIGEST, digest):
                 raise ValueError("invalid registry digest")
             timestamp = observed.get((form, digest), now)
-            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-            if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
-                raise ValueError("index timestamps must be UTC")
+            parsed = utc_timestamp(timestamp)
+            if (form, digest) in observed and parsed < published_date:
+                timestamp = published
             entries[form] = {"version": form, "digest": digest, "releaseTimestamp": timestamp}
     if not entries:
         raise ValueError("no stable Paperclip images resolved")

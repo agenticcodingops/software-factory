@@ -17,7 +17,7 @@ SPEC.loader.exec_module(index)
 NOW = "2026-11-27T07:23:00Z"
 EARLIER = "2026-11-20T07:23:00Z"
 DIGEST = "sha256:" + "a" * 64
-RELEASE = {"tag_name":"v2026.1117.0"}
+RELEASE = {"tag_name":"v2026.1117.0", "published_at":"2026-11-17T07:23:00Z"}
 
 
 def missing():
@@ -88,12 +88,12 @@ class IndexTests(unittest.TestCase):
             if "1118" in tag:
                 raise missing()
             return DIGEST
-        result = index.build([RELEASE, {"tag_name":"2026.1118.0"}], {}, one_release, NOW)
+        result = index.build([RELEASE, dict(RELEASE, tag_name="2026.1118.0")], {}, one_release, NOW)
         self.assertEqual(len(result["releases"]), 2)
 
     def test_nonstable_releases_never_resolve(self):
         skipped = [{"tag_name":tag} for tag in ("nightly", "canary", "2026.1117.0-beta", "sha-abcdef", "v0.23.4")]
-        skipped += [{"tag_name":"v2026.1118.0", "draft":True}, {"tag_name":"v2026.1119.0", "prerelease":True}]
+        skipped += [dict(RELEASE, tag_name="v2026.1118.0", draft=True), dict(RELEASE, tag_name="v2026.1119.0", prerelease=True)]
         calls = []
         def resolve(image, tag):
             calls.append(tag)
@@ -108,6 +108,33 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(unchanged, previous)
         changed = index.build([RELEASE], previous, lambda *_: "sha256:" + "b" * 64, NOW)
         self.assertTrue(all(e["releaseTimestamp"] == NOW for e in changed["releases"]))
+
+    def test_backdated_index_is_raised_to_publication_and_rewritten(self):
+        previous = index.build([RELEASE], {}, lambda *_: DIGEST, EARLIER)
+        for entry in previous["releases"]:
+            entry["releaseTimestamp"] = "2026-11-01T00:00:00Z"
+        result = index.build([RELEASE], previous, lambda *_: DIGEST, NOW)
+        self.assertTrue(all(e["releaseTimestamp"] == RELEASE["published_at"] for e in result["releases"]))
+        api = FakeAPI(previous)
+        self.assertTrue(index.publish(api, "fixture/repo", NOW))
+        self.assertEqual(api.calls[-1][2], "PUT")
+        self.assertEqual(json.loads(base64.b64decode(api.calls[-1][1]["content"])), result)
+
+    def test_later_observation_is_kept_and_invalid_publication_fails_closed(self):
+        previous = index.build([RELEASE], {}, lambda *_: DIGEST, EARLIER)
+        self.assertGreater(EARLIER, RELEASE["published_at"])
+        self.assertEqual(index.build([RELEASE], previous, lambda *_: DIGEST, NOW), previous)
+        for published in (None, "invalid", "2026-11-17T01:00:00", "2026-11-17T01:00:00+01:00"):
+            for retained in ({}, previous):
+                with self.subTest(published=published, retained=bool(retained)):
+                    bad = dict(RELEASE, published_at=published)
+                    if published is None:
+                        del bad["published_at"]
+                    api = FakeAPI(retained or None)
+                    api.release_data = [bad]
+                    with self.assertRaises((KeyError, TypeError, ValueError)):
+                        index.publish(api, "fixture/repo", NOW)
+                    self.assertTrue(all(payload is None for _, payload, _ in api.calls))
 
     def test_builder_never_lists_packages_even_beyond_100_versions(self):
         api = FakeAPI()
