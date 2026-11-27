@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -31,6 +32,9 @@ if os.environ.get("FAIL_PHASE") == phase:
     print('{"message":"API error","status":"403"}')
     sys.exit(1)
 if os.environ.get("BAD_PHASE") == phase:
+    if phase in ("POST", "PUT"):
+        body = pathlib.Path(args[args.index("--input") + 1]).read_text()
+        (state / "body").write_text(body)
     print(os.environ.get("BAD_VALUE", '{"message":"bad value"}'))
     sys.exit(0)
 if phase in ("POST", "PUT"):
@@ -108,7 +112,7 @@ class ManualApplyTests(unittest.TestCase):
         self.assertEqual(len(apply_blocks), 3, "all three documented applies must execute")
         return apply_blocks
 
-    def run_block(self, block, **scenario):
+    def run_block(self, block, cwd=ROOT, **scenario):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             (state / "gh").write_text(STUB)
@@ -116,9 +120,9 @@ class ManualApplyTests(unittest.TestCase):
             temp = state / "tmp"
             temp.mkdir()
             env = {**os.environ, "PATH":directory + os.pathsep + os.environ["PATH"],
-                   "APPLY_STATE":directory, "APPLY_ROOT":str(ROOT), "RELEASE_TEAM_SLUG":"release-fixture",
+                   "APPLY_STATE":directory, "APPLY_ROOT":str(cwd), "RELEASE_TEAM_SLUG":"release-fixture",
                    "TMPDIR":str(temp), **scenario}
-            result = subprocess.run(["bash", "-c", block], cwd=ROOT, env=env, capture_output=True, text=True)
+            result = subprocess.run(["bash", "-c", block], cwd=cwd, env=env, capture_output=True, text=True)
             calls = [json.loads(line) for line in (state / "calls").read_text().splitlines()]
             leftovers = list(temp.iterdir())
             body = json.loads((state / "body").read_text()) if (state / "body").exists() else None
@@ -150,7 +154,7 @@ class ManualApplyTests(unittest.TestCase):
                     self.assertEqual(leftovers, [])
             shapes = {"list":["123\n456", "{}", "0"], "POST":["{}", "0", ""]}
             if "org-release-notes-gate.json" in block:
-                shapes.update(sha=["{}", "", "A" * 40], repo=["{}", "0", ""])
+                shapes.update(sha=["{}", "", "A" * 40], repo=["{}", "0", ""], blob=["b" * 40, "{}", ""])
             if "public-release-tags.json" in block:
                 shapes["team"] = ["{}", "0", ""]
             for phase, values in shapes.items():
@@ -159,7 +163,29 @@ class ManualApplyTests(unittest.TestCase):
                         result, calls, leftovers, _ = self.run_block(block, BAD_PHASE=phase, BAD_VALUE=value)
                         self.assertNotEqual(result.returncode, 0)
                         self.assertEqual(sum("--method" in c for c in calls), int(phase == "POST"))
+                        if phase == "blob":
+                            self.assertIn("workflow at main differs from the reviewed pin", result.stderr)
+                        if phase == "POST":
+                            self.assertIn("ruleset ID is unresolved", result.stderr)
+                            self.assertFalse(any("/rulesets/" in c[1] for c in calls if "--method" not in c))
                         self.assertEqual(leftovers, [])
+
+    def test_gate_pin_file_shape_is_checked_before_any_write(self):
+        block = next(b for b in self.blocks() if "org-release-notes-gate.json" in b)
+        for field, value in (("blob_sha", "x"), ("path", "")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                cwd = Path(directory)
+                destination = cwd / "hosting/paperclip-hermes/rulesets"
+                shutil.copytree(RULESETS, destination)
+                pin_file = destination / "org-release-notes-gate.pin.json"
+                pin = json.loads(pin_file.read_text())
+                pin[field] = value
+                pin_file.write_text(json.dumps(pin))
+                result, calls, leftovers, _ = self.run_block(block, cwd=cwd)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("workflow pin is unresolved", result.stderr)
+                self.assertFalse(any("--method" in c for c in calls))
+                self.assertEqual(leftovers, [])
 
     def test_branch_readback_compares_every_committed_field_and_extra_rule(self):
         block = next(b for b in self.blocks() if "public-repo.json" in b)
