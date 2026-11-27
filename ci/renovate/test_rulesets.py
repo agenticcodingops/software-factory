@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-import subprocess
+import hashlib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,20 +16,28 @@ class RulesetTests(unittest.TestCase):
                     for c in r["parameters"]["required_status_checks"]]
         self.assertNotIn("release-notes-gate", contexts)
         gate = json.loads((RULESETS / "org-release-notes-gate.json").read_text())
-        self.assertEqual(gate["enforcement"], "active")
         self.assertEqual(gate["conditions"]["repository_name"]["include"], ["software-factory"])
         self.assertEqual(gate["conditions"]["ref_name"]["include"], ["refs/heads/main"])
         self.assertEqual(gate["bypass_actors"], branch["bypass_actors"])
         required = next(r["parameters"] for r in gate["rules"] if r["type"] == "workflows")
         self.assertFalse(required["do_not_enforce_on_create"])
         workflow, = required["workflows"]
-        self.assertGreater(workflow["repository_id"], 0)
-        self.assertRegex(workflow["sha"], r"^[a-f0-9]{40}$")
-        self.assertNotEqual(workflow["sha"], "0" * 40)
+        pin = json.loads((RULESETS / "org-release-notes-gate.pin.json").read_text())
+        self.assertEqual(gate["enforcement"], "disabled", "unresolved template must never be active")
+        self.assertEqual(workflow["repository_id"], 0)
+        self.assertEqual(workflow["sha"], "0" * 40, "no literal commit pin: squash merge keeps no branch SHA")
         self.assertNotIn("ref", workflow)
         self.assertEqual(workflow["path"], ".github/workflows/release-notes-gate.yml")
-        pinned = subprocess.check_output(["git", "show", f'{workflow["sha"]}:{workflow["path"]}'], cwd=ROOT)
-        self.assertEqual(pinned, (ROOT / workflow["path"]).read_bytes(), "repin after changing the gate workflow")
+        self.assertEqual(pin["path"], workflow["path"])
+        data = (ROOT / workflow["path"]).read_bytes()
+        self.assertNotIn(b"\r", data)
+        self.assertEqual(hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest(), pin["blob_sha"],
+                         "gate workflow changed: review it and update org-release-notes-gate.pin.json")
+
+    def test_ruleset_tests_need_no_git_history(self):
+        source = Path(__file__).read_text()
+        self.assertNotIn("import " + "sub" + "process", source)
+        self.assertNotIn("git" + " show", source)
 
     def test_release_tags_only_allow_release_actor_team_and_operator(self):
         tags = json.loads((RULESETS / "public-release-tags.json").read_text())

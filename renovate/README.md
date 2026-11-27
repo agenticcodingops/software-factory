@@ -81,7 +81,8 @@ for other targets. It resolves current main through the Git ref API, and fails i
 evaluation; a changing PR head receives no passing result.
 
 The per-SHA status is informational. `org-release-notes-gate.json` requires the workflow itself at
-an immutable SHA, with only the operator's org-admin pull-request bypass. A forged status or another
+a merged main commit resolved by the operator from the disabled template and checked against
+`org-release-notes-gate.pin.json`, with only the operator's org-admin pull-request bypass. A forged status or another
 workflow using the same job name cannot satisfy that rule. GitHub's required-workflow rules ignore
 trigger filters, so the script's default-branch guard is necessary too. See the
 [GitHub required-workflow documentation](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#supported-event-triggers).

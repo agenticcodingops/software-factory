@@ -1,7 +1,7 @@
 {
   "name": "software-factory-release-notes-gate",
   "target": "branch",
-  "enforcement": "active",
+  "enforcement": "disabled",
   "bypass_actors": [
     {
       "actor_type": "OrganizationAdmin",
@@ -31,8 +31,8 @@
         "workflows": [
           {
             "path": ".github/workflows/release-notes-gate.yml",
-            "repository_id": 1472948871,
-            "sha": "1a9d118dda06131c4bf67d5e3fe0cf5c5de6550a"
+            "repository_id": 0,
+            "sha": "0000000000000000000000000000000000000000"
           }
         ]
       }
