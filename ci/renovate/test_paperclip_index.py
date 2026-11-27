@@ -93,13 +93,14 @@ class IndexTests(unittest.TestCase):
 
     def test_nonstable_releases_never_resolve(self):
         skipped = [{"tag_name":tag} for tag in ("nightly", "canary", "2026.1117.0-beta", "sha-abcdef", "v0.23.4")]
-        skipped += [dict(RELEASE, draft=True), dict(RELEASE, prerelease=True)]
+        skipped += [{"tag_name":"v2026.1118.0", "draft":True}, {"tag_name":"v2026.1119.0", "prerelease":True}]
         calls = []
         def resolve(image, tag):
             calls.append(tag)
             return DIGEST
-        index.build(skipped + [RELEASE], {}, resolve, NOW)
+        result = index.build(skipped + [RELEASE], {}, resolve, NOW)
         self.assertEqual(calls, ["2026.1117.0", "v2026.1117.0"])
+        self.assertEqual([entry["version"] for entry in result["releases"]], ["2026.1117.0", "v2026.1117.0"])
 
     def test_timestamp_kept_for_same_digest_and_restarted_for_repush(self):
         previous = index.build([RELEASE], {}, lambda *_: DIGEST, EARLIER)
