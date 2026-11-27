@@ -259,8 +259,8 @@ class GitHub:
         # Workflow files are printable ASCII with LF endings. Changed lines must be
         # byte-identical except for the 40-hex SHA and version. This proves
         # same-action, same-major pin bumps against tags at gate time,
-        # not the safety of upstream action code. minimumReleaseAge and two reviews
-        # remain other controls. Ref/tag API contracts:
+        # not the safety of upstream action code. Only two reviews remain the other
+        # control; no release-age soak applies to Actions tags. Ref/tag API contracts:
         # https://docs.github.com/en/rest/git/refs
         # https://docs.github.com/en/rest/git/tags
         for old, new in changed:

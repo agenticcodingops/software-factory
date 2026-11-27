@@ -605,6 +605,18 @@ class WorkflowPinTests(unittest.TestCase):
             self.assert_result(api, 1)
         releases.assert_called_once_with("NousResearch/hermes-agent")
 
+    def test_action_soak_documentation_matches_image_only_policy(self):
+        root = Path(__file__).resolve().parents[2]
+        readme = (root / "renovate/README.md").read_text()
+        self.assertIn("Actions pin bumps have no soak period", readme)
+        self.assertIn("two current-head reviews are the only other control", readme)
+        source = (root / "ci/renovate/release-notes-gate.py").read_text()
+        self.assertIn("no release-age soak applies to Actions tags", source)
+        preset = json.loads((root / "renovate/default.json").read_text())
+        age_rules = [r for r in preset["packageRules"] if "minimumReleaseAge" in r]
+        self.assertTrue(age_rules)
+        self.assertTrue(all(r.get("matchDatasources") == ["docker"] or r.get("matchPackageNames") == ["ghcr.io/paperclipai/paperclip"] for r in age_rules))
+
     def test_contents_decode_and_github_token_host(self):
         from io import BytesIO
         import base64

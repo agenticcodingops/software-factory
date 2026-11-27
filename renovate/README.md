@@ -128,8 +128,9 @@ at most five annotated-tag hops ([refs API](https://docs.github.com/en/rest/git/
 [tags API](https://docs.github.com/en/rest/git/tags)). Missing data, API/decode errors,
 more than 20 workflow files or 50 changed lines fail closed. Compare patch text is never trusted.
 This proves what the upstream tag pointed to when the gate ran; it does not review upstream
-action code. Renovate's configured `minimumReleaseAge` and two current-head reviews remain
-other controls. Actions majors, runtime inputs (`uses-with`), runners and workflow images,
+action code. The two current-head reviews are the only other control on an action pin bump.
+`minimumReleaseAge` is configured only for the docker datasource and the Paperclip rule,
+so Actions pin bumps have no soak period ([Renovate 45.1.0 default](https://github.com/renovatebot/renovate/blob/45.1.0/lib/config/options/index.ts)). Actions majors, runtime inputs (`uses-with`), runners and workflow images,
 and every other workflow edit need the operator. The allowed depTypes are checked against
 [Renovate 45.1.0](https://github.com/renovatebot/renovate/blob/45.1.0/lib/modules/manager/github-actions/dep-types.ts).
 The operator's 2026-11-27 decision keeps public Actions patch/minor merges with agents;
