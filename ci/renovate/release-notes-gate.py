@@ -110,6 +110,69 @@ def dockerfile_pin(text, image):
     return unique_pin(pins)
 
 
+def flow_scan(line):
+    """Reject physical lines that can hide later YAML nodes in scalar/flow content."""
+    content = line.lstrip(" ")
+    start, stack, dollar = True, [], 0
+    index = 0
+
+    def reject():
+        raise ValueError("compose multiline quotes and flow collections are unsupported")
+
+    while index < len(content):
+        ch = content[index]
+        nxt = content[index + 1:index + 2]
+        if ch == " ":
+            pass
+        elif ch == "#" and (index == 0 or content[index - 1] == " "):
+            break
+        elif ch in "\"'":
+            if not start:
+                reject()
+            closing = content.find(ch, index + 1)
+            if closing == -1:
+                reject()
+            tail = content[closing + 1:]
+            if not (not tail or tail.startswith(" ") or tail == ":" or
+                    tail.startswith(": ") or (stack and tail[0] in ",]}")):
+                reject()
+            index, start = closing, False
+        elif ch in "[{":
+            if start:
+                stack.append(ch)
+            elif ch == "{" and not stack and content[index - 1] == "$":
+                dollar += 1
+            else:
+                reject()
+        elif ch in "]}":
+            if stack:
+                opening = stack.pop()
+                if (opening, ch) not in (("[", "]"), ("{", "}")):
+                    reject()
+                start = False
+            elif ch == "}" and dollar:
+                dollar -= 1
+            else:
+                reject()
+        elif ch == "," and stack:
+            start = True
+        elif ch == ":" and nxt in ("", " "):
+            start = True
+        elif ch == "-" and nxt in ("", " ") and start and not stack:
+            pass
+        elif ch in "&!" and start:
+            end = content.find(" ", index)
+            rest = "" if end == -1 else content[end:].lstrip(" ")
+            if rest and not rest.startswith("#"):
+                reject()
+            break
+        else:
+            start = False
+        index += 1
+    if stack or dollar:
+        reject()
+
+
 def compose_pin(text, image, service):
     # One canonical physical image line, not a YAML parser. Reject escapes and indirection.
     # https://yaml.org/spec/1.2.2/#double-quoted-style
@@ -127,9 +190,7 @@ def compose_pin(text, image, service):
             raise ValueError("compose indentation requires the operator")
         if line.lstrip(" ").startswith(("?", "*")) or re.search(r"\*[A-Za-z0-9_-]+\s*:", line):
             raise ValueError("compose explicit and alias keys are unsupported")
-        unquoted = re.sub(r"\"[^\"]*\"|'[^']*'", "", line)
-        if any(char in unquoted for char in "\"'") or unquoted.count("{") != unquoted.count("}") or unquoted.count("[") != unquoted.count("]"):
-            raise ValueError("compose multiline quotes and flow collections are unsupported")
+        flow_scan(line)
         if "<<" in line and line != "    <<: *runtime":
             raise ValueError("compose merge must be the canonical runtime alias")
         if not line.startswith(" "):

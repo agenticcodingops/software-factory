@@ -130,6 +130,25 @@ class NotesTests(unittest.TestCase):
             self.assertEqual(self.invoke(api), 1)
         self.assertEqual(api.calls[-1][1]["state"], "failure")
 
+    def test_plain_scalar_quote_hidden_upgrade_fails_before_network(self):
+        api = FakeAPI()
+        original = api.contents
+
+        def hidden(repo, sha, file):
+            if sha != api.base_sha and file.endswith("compose.yaml"):
+                return ("x-e:\n  a: &runtime\n    image: evil.example/paperclip:9@sha256:" +
+                        "d" * 64 + "\nservices:\n  paperclip:\n    <<: *runtime\n    x-a ': '\n" +
+                        "    image: ghcr.io/paperclipai/paperclip:2026.1117.0@sha256:" +
+                        "c" * 64 + "\n    ' # '\n")
+            return original(repo, api.base_sha, file)
+
+        with patch.object(api, "contents", side_effect=hidden), patch.object(api, "registry_digest") as registry, patch.object(api, "releases") as releases:
+            self.assertEqual(self.invoke(api), 1)
+        registry.assert_not_called()
+        releases.assert_not_called()
+        self.assertEqual(api.calls[-1][1]["state"], "failure")
+        self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
+
     def test_digest_only_needs_no_release_notes(self):
         api = FakeAPI(image="none")
         with patch.object(api, "releases", side_effect=AssertionError("digest must not need notes")), patch.object(api, "registry_digest", wraps=api.registry_digest) as registry:
@@ -399,6 +418,35 @@ class PinExtractionTests(unittest.TestCase):
             evil + "services:\n  paperclip:\n   <<: *evil\n   command: |\n" + line,
             evil + "services:\n  paperclip:\n   <<: *evil\n   labels:\n   - |\n" + line,
         ]
+        runtime = evil.replace("&evil", "&runtime")
+        for opening, closing in (
+            ("    x-a'b: 'c", "    ' # '"),
+            ('    a"b: "c', '    " # "'),
+            ("    x-k: [ # ]", "    ] # ["),
+            ("    x-k: { # }", "    } # {"),
+            ("    x-a ': '", "    ' # '"),
+            ("    x-a, ': '", "    ' # '"),
+            ("    x-a :': '", "    ' # '"),
+            ('    x-a ": "', '    " # "'),
+            ("    x-k: [ a ', # ' ]", "    , x ' ] # ' [ ]"),
+            ("    x-k: { a ', # ' }", "    , x ' } # ' { }"),
+            ("    x-k ]: [", "    ]"),
+            ("    labels: [", "    ]"),
+        ):
+            variants.append(runtime + "services:\n  paperclip:\n    <<: *runtime\n" +
+                            opening + "\n" + line + closing + "\n")
+        # The decoy service itself can be hidden inside a scalar. Quotes in comments
+        # must never close the scanner's quotes or collections.
+        for opening, closing in (
+            ('      a"b: \'x" y', '      z "y\' # "'),
+            ("      a'b: \"x' y", "      z 'y\" # '"),
+            ('    x-j: [a - "b, c: \'x" y]', '      z - "q\'] # "'),
+            ("    x-j: [a - 'b, c: \"x' y]", "      z - 'q\"] # '"),
+            ("    x-a'b: 'c", "    ' # '"),
+        ):
+            variants.append("services:\n  previous:\n" + opening + "\n  paperclip:\n" +
+                            line + closing + '\n  "paperclip":\n    image: evil.example/paperclip:9@sha256:' +
+                            "d" * 64 + "\n")
         for text in variants:
             with self.subTest(text=text), self.assertRaises(ValueError):
                 gate.compose_pin(text, self.paper, "paperclip")
