@@ -24,9 +24,9 @@ def regexes(value, key="", path=""):
     elif isinstance(value, str):
         if re.fullmatch(r"!?/.*?/[a-zA-Z]*", value, re.S):
             yield path, value
-        elif key == "versioning" and value.startswith("regex:"):
-            yield path, value.removeprefix("regex:")
-        elif key in {"matchStrings", "managerFilePatterns", "extractVersion"}:
+        elif key in {"versioning", "versioningTemplate"} and "regex:" in value:
+            yield path, value.split("regex:", 1)[1]
+        elif key in {"matchStrings", "managerFilePatterns", "extractVersion", "extractVersionTemplate", "versionCompatibility"}:
             yield path, value
 
 
@@ -48,5 +48,20 @@ class RegexSyntaxTests(unittest.TestCase):
 
     def test_walk_covers_all_regex_locations_including_nested_negated_patterns(self):
         value = {"nested": ["!/foo/i", "/bar/", {"versioning":"regex:^(?<major>1)$", "matchStrings":["one"],
-                  "managerFilePatterns":["two"], "extractVersion":"three", "ordinary":"ignored"}]}
-        self.assertEqual([v for _, v in regexes(value)], ["!/foo/i", "/bar/", "^(?<major>1)$", "one", "two", "three"])
+                  "managerFilePatterns":["two"], "extractVersion":"three", "ordinary":"ignored",
+                  "versioningTemplate":"regex:four", "versionCompatibility":"five", "extractVersionTemplate":"six",
+                  "nestedTemplate":{"versioningTemplate":"{{#if versioning}}{{{versioning}}}{{else}}regex:seven{{/if}}"}}]}
+        self.assertEqual([v for _, v in regexes(value)], ["!/foo/i", "/bar/", "^(?<major>1)$", "one", "two", "three", "four", "five", "six", "seven{{/if}}"])
+
+    def test_regex_templates_and_compatibility_reject_lookarounds(self):
+        for document in (
+            {"versioningTemplate":r"regex:^(?<major>\d+)(?!-rc)$"},
+            {"versionCompatibility":r"^(?<version>.*)(?<compatibility>-alpine)(?!x)$"},
+            {"extractVersionTemplate":r"^(?<version>.*)(?!x)$"},
+            {"versioningTemplate":r"{{#if versioning}}{{{versioning}}}{{else}}regex:^(?<major>\d+)(?!x)${{/if}}"},
+        ):
+            with self.subTest(document=document):
+                found = list(regexes(document))
+                self.assertEqual(len(found), 1)
+                with self.assertRaises(ValueError):
+                    check_regex(found[0][1])
