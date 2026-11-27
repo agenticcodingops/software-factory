@@ -359,6 +359,16 @@ class PinExtractionTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 gate.dockerfile_pin(text, self.hermes)
 
+    def test_dockerfile_rejects_non_ascii_and_control_whitespace(self):
+        for text in (
+            self.docker() + "\tFROM evil.example/x:1 AS final\n",
+            self.docker().replace("RUN true", "RUN true\r", 1),
+            self.docker() + "# caf\u00e9\n",
+            "\ufeff" + self.docker(),
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "printable ASCII"):
+                gate.dockerfile_pin(text, self.hermes)
+
     def test_comment_cannot_satisfy_the_compose_pin(self):
         comment = f"# {self.paper}:2026.1117.0@{self.digest}\n"
         line = f"    image: {self.paper}:2026.1117.0@{self.digest}\n"
