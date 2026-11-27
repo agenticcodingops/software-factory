@@ -50,8 +50,9 @@ The [commits API](https://docs.github.com/en/rest/commits/commits#list-commits) 
 the [contents API](https://docs.github.com/en/rest/repos/contents#get-repository-content) returns a Git blob `sha`.
 The [org rules API](https://docs.github.com/en/rest/orgs/rules) accepts workflow `repository_id`, `sha` and `path`.
 
-Run each Bash subshell below as a standalone command (the readback uses process
-substitution). Do not chain it with `&&`, `||` or `if`, which can disable errexit
+The commands require standalone `jq`, `gh` and `diff` on PATH. Each JSON projection
+is rendered to a temporary file with a checked exit status before comparison.
+Run each Bash subshell below as a standalone command. Do not chain it with `&&`, `||` or `if`, which can disable errexit
 ([Bash conditional command rules](https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html)).
 The first command shows the active account; use `gh auth switch` to the
 organization-admin account if it shows a different login.
@@ -64,17 +65,22 @@ head. The later bootstrap `rulesets` run finds this ruleset by name and updates 
 (
 set -euo pipefail
 gh api user --jq .login
+command -v jq >/dev/null
+command -v gh >/dev/null
 f=hosting/paperclip-hermes/rulesets/public-repo.json
+jq -e . "$f" >/dev/null
 id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --jq '.[] | select(.name=="software-factory-main") | .id') || exit 1
 [[ -z $id || $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset lookup is ambiguous or failed' >&2; exit 1; }
 if [ -z "$id" ]; then id=$(gh api --method POST repos/agenticcodingops/software-factory/rulesets --input "$f" --jq .id) || exit 1
 else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" --input "$f" >/dev/null || exit 1; fi
 [[ $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset ID is unresolved' >&2; exit 1; }
-readback=$(mktemp)
-trap 'rm -f "$readback"' EXIT
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+readback=$scratch/readback
 gh api "repos/agenticcodingops/software-factory/rulesets/$id" > "$readback"
-diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$f") \
-     <(jq -S --slurpfile want "$f" '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id) | .rules |= map(. as $r | (first($want[0].rules[] | select(.type == $r.type)) // null) as $w | if $w != null and .parameters then .parameters |= with_entries(select(.key as $k | ($w.parameters // {}) | has($k))) else . end)' "$readback")
+jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$f" > "$scratch/expected"
+jq -S --slurpfile want "$f" '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id) | .rules |= map(. as $r | (first($want[0].rules[] | select(.type == $r.type)) // null) as $w | if $w != null and .parameters then .parameters |= with_entries(select(.key as $k | ($w.parameters // {}) | has($k))) else . end)' "$readback" > "$scratch/actual"
+diff "$scratch/expected" "$scratch/actual"
 )
 ```
 
@@ -82,7 +88,10 @@ diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.by
 (
 set -euo pipefail
 gh api user --jq .login
+command -v jq >/dev/null
+command -v gh >/dev/null
 d=hosting/paperclip-hermes/rulesets; f=$d/org-release-notes-gate.json; p=$d/org-release-notes-gate.pin.json
+jq -e . "$f" >/dev/null
 path=$(jq -er .path "$p")
 blob=$(jq -er .blob_sha "$p")
 [[ -n $path && $blob =~ ^[0-9a-f]{40}$ ]] || { echo 'workflow pin is unresolved' >&2; exit 1; }
@@ -92,10 +101,10 @@ actual_blob=$(gh api "repos/agenticcodingops/software-factory/contents/$path?ref
 [ "$actual_blob" = "$blob" ] || { echo 'workflow at main differs from the reviewed pin' >&2; exit 1; }
 repo_id=$(gh api repos/agenticcodingops/software-factory --jq .id) || exit 1
 [[ $repo_id =~ ^[1-9][0-9]*$ ]] || { echo 'repository ID is unresolved' >&2; exit 1; }
-body=$(mktemp)
-readback=""
-trap 'rm -f "$body" "$readback"' EXIT
-readback=$(mktemp)
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+body=$scratch/body
+readback=$scratch/readback
 jq --arg sha "$sha" --argjson id "$repo_id" '.enforcement = "active" | .rules[0].parameters.workflows[0] |= (.sha = $sha | .repository_id = $id)' "$f" > "$body"
 id=$(gh api 'orgs/agenticcodingops/rulesets?per_page=100' --jq '.[] | select(.name=="software-factory-release-notes-gate") | .id') || exit 1
 [[ -z $id || $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset lookup is ambiguous or failed' >&2; exit 1; }
@@ -103,8 +112,9 @@ if [ -z "$id" ]; then id=$(gh api --method POST orgs/agenticcodingops/rulesets -
 else gh api --method PUT "orgs/agenticcodingops/rulesets/$id" --input "$body" >/dev/null || exit 1; fi
 [[ $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset ID is unresolved' >&2; exit 1; }
 gh api "orgs/agenticcodingops/rulesets/$id" > "$readback" || exit 1
-diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$body") \
-     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$readback")
+jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$body" > "$scratch/expected"
+jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$readback" > "$scratch/actual"
+diff "$scratch/expected" "$scratch/actual"
 )
 ```
 
@@ -117,13 +127,16 @@ team ID into a temporary body and never commit it:
 (
 set -euo pipefail
 gh api user --jq .login
+command -v jq >/dev/null
+command -v gh >/dev/null
 f=hosting/paperclip-hermes/rulesets/public-release-tags.json
+jq -e . "$f" >/dev/null
 team=$(gh api "orgs/agenticcodingops/teams/$RELEASE_TEAM_SLUG" --jq .id) || { echo 'release team lookup failed' >&2; exit 1; }
 [[ $team =~ ^[1-9][0-9]*$ ]] || { echo 'release team is unresolved' >&2; exit 1; }
-body=$(mktemp)
-readback=""
-trap 'rm -f "$body" "$readback"' EXIT
-readback=$(mktemp)
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+body=$scratch/body
+readback=$scratch/readback
 jq --argjson team "$team" '(.bypass_actors[] | select(.actor_type=="Team") | .actor_id) = $team | .enforcement = "active"' "$f" > "$body"
 id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --jq '.[] | select(.name=="software-factory-release-tags") | .id') || exit 1
 [[ -z $id || $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset lookup is ambiguous or failed' >&2; exit 1; }
@@ -131,8 +144,9 @@ if [ -z "$id" ]; then id=$(gh api --method POST repos/agenticcodingops/software-
 else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" --input "$body" >/dev/null || exit 1; fi
 [[ $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset ID is unresolved' >&2; exit 1; }
 gh api "repos/agenticcodingops/software-factory/rulesets/$id" > "$readback" || exit 1
-diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$body") \
-     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$readback")
+jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$body" > "$scratch/expected"
+jq -S '{name,target,enforcement,bypass_actors,conditions,rules} | del(.bypass_actors[] | select(.actor_type == "OrganizationAdmin" and .actor_id == null) | .actor_id)' "$readback" > "$scratch/actual"
+diff "$scratch/expected" "$scratch/actual"
 )
 ```
 

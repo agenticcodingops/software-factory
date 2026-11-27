@@ -112,14 +112,22 @@ class ManualApplyTests(unittest.TestCase):
         self.assertEqual(len(apply_blocks), 3, "all three documented applies must execute")
         return apply_blocks
 
-    def run_block(self, block, cwd=ROOT, **scenario):
+    def run_block(self, block, cwd=ROOT, missing_jq=False, failing_projection=False, **scenario):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             (state / "gh").write_text(STUB)
             (state / "gh").chmod(0o755)
+            if missing_jq:
+                # Do not inherit /usr/bin, where CI installs jq beside Bash and diff.
+                for tool in ("bash", "python3", "diff", "mktemp", "rm", "cat"):
+                    (state / tool).symlink_to(shutil.which(tool))
+            if failing_projection:
+                (state / "jq").write_text('#!/bin/sh\nif [ "$1" = -S ]; then exit 9; fi\nexec ' +
+                                          shutil.which("jq") + ' "$@"\n')
+                (state / "jq").chmod(0o755)
             temp = state / "tmp"
             temp.mkdir()
-            env = {**os.environ, "PATH":directory + os.pathsep + os.environ["PATH"],
+            env = {**os.environ, "PATH":directory if missing_jq else directory + os.pathsep + os.environ["PATH"],
                    "APPLY_STATE":directory, "APPLY_ROOT":str(cwd), "RELEASE_TEAM_SLUG":"release-fixture",
                    "TMPDIR":str(temp), **scenario}
             result = subprocess.run(["bash", "-c", block], cwd=cwd, env=env, capture_output=True, text=True)
@@ -127,6 +135,28 @@ class ManualApplyTests(unittest.TestCase):
             leftovers = list(temp.iterdir())
             body = json.loads((state / "body").read_text()) if (state / "body").exists() else None
             return result, calls, leftovers, body
+
+    def test_missing_jq_stops_before_any_write(self):
+        for number, block in enumerate(self.blocks()):
+            with self.subTest(block=number):
+                result, calls, leftovers, _ = self.run_block(block, missing_jq=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any("--method" in call for call in calls))
+                self.assertEqual(leftovers, [])
+
+    def test_failed_json_projections_cannot_compare_as_empty_streams(self):
+        for number, block in enumerate(self.blocks()):
+            with self.subTest(block=number):
+                result, _, leftovers, _ = self.run_block(block, failing_projection=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(leftovers, [])
+
+    def test_invalid_readback_json_fails_comparison(self):
+        for number, block in enumerate(self.blocks()):
+            with self.subTest(block=number):
+                result, _, leftovers, _ = self.run_block(block, BAD_PHASE="readback", BAD_VALUE="{")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(leftovers, [])
 
     def test_failed_subshell_keeps_parent_shell_alive(self):
         for block in self.blocks():
