@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
 require('./test_pins.cjs');
+require('./test_validator.cjs');
 const {readPins, bump, next} = require('./pins.cjs');
 const root = path.resolve(__dirname, '../..');
 const temporary = path.join(os.tmpdir(), `wp7-renovate-${require('node:crypto').randomBytes(6).toString('hex')}`);
