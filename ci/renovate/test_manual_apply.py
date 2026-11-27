@@ -1,5 +1,6 @@
 """Run the documented apply commands with a local gh stub; never contact GitHub."""
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -120,12 +121,13 @@ class ManualApplyTests(unittest.TestCase):
             result = subprocess.run(["bash", "-c", block], cwd=ROOT, env=env, capture_output=True, text=True)
             calls = [json.loads(line) for line in (state / "calls").read_text().splitlines()]
             leftovers = list(temp.iterdir())
-            return result, calls, leftovers
+            body = json.loads((state / "body").read_text()) if (state / "body").exists() else None
+            return result, calls, leftovers, body
 
     def test_failed_subshell_keeps_parent_shell_alive(self):
         for block in self.blocks():
             phase = "blob" if "org-release-notes-gate.json" in block else "team" if "public-release-tags.json" in block else "user"
-            result, _, leftovers = self.run_block(block + "\nresult=$?\nprintf 'parent survived:%s\\n' \"$result\"\n", FAIL_PHASE=phase)
+            result, _, leftovers, _ = self.run_block(block + "\nresult=$?\nprintf 'parent survived:%s\\n' \"$result\"\n", FAIL_PHASE=phase)
             self.assertEqual(result.returncode, 0)
             self.assertIn("parent survived:1", result.stdout)
             self.assertEqual(leftovers, [])
@@ -139,7 +141,7 @@ class ManualApplyTests(unittest.TestCase):
                 phases += ["team"]
             for phase in phases:
                 with self.subTest(block=number, phase=phase):
-                    result, calls, leftovers = self.run_block(block, FAIL_PHASE=phase, EXISTING="1" if phase == "PUT" else "")
+                    result, calls, leftovers, _ = self.run_block(block, FAIL_PHASE=phase, EXISTING="1" if phase == "PUT" else "")
                     self.assertNotEqual(result.returncode, 0)
                     writes = [c for c in calls if "--method" in c]
                     self.assertEqual(len(writes), int(phase in ("POST", "PUT", "readback")))
@@ -154,7 +156,7 @@ class ManualApplyTests(unittest.TestCase):
             for phase, values in shapes.items():
                 for value in values:
                     with self.subTest(block=number, phase=phase, value=value):
-                        result, calls, leftovers = self.run_block(block, BAD_PHASE=phase, BAD_VALUE=value)
+                        result, calls, leftovers, _ = self.run_block(block, BAD_PHASE=phase, BAD_VALUE=value)
                         self.assertNotEqual(result.returncode, 0)
                         self.assertEqual(sum("--method" in c for c in calls), int(phase == "POST"))
                         self.assertEqual(leftovers, [])
@@ -163,7 +165,7 @@ class ManualApplyTests(unittest.TestCase):
         block = next(b for b in self.blocks() if "public-repo.json" in b)
         for change in ("last_push", "merge", "integration", "removed_parameter", "extra_rule", "removed_rule"):
             with self.subTest(change=change):
-                result, _, leftovers = self.run_block(block, READBACK_CHANGE=change)
+                result, _, leftovers, _ = self.run_block(block, READBACK_CHANGE=change)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotEqual(result.stdout, "operator-fixture\n")
                 self.assertEqual(leftovers, [])
@@ -177,11 +179,11 @@ class ManualApplyTests(unittest.TestCase):
     def test_only_organization_admin_null_actor_id_is_normalized(self):
         for number, block in enumerate(self.blocks()):
             with self.subTest(block=number):
-                result, _, leftovers = self.run_block(block, NULL_ADMIN="1")
+                result, _, leftovers, _ = self.run_block(block, NULL_ADMIN="1")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(leftovers, [])
             if "public-release-tags.json" in block:
-                result, _, leftovers = self.run_block(block, NULL_ADMIN="1", NULL_TEAM="1")
+                result, _, leftovers, _ = self.run_block(block, NULL_ADMIN="1", NULL_TEAM="1")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("actor_id", result.stdout)
                 self.assertEqual(leftovers, [])
@@ -190,11 +192,40 @@ class ManualApplyTests(unittest.TestCase):
         for number, block in enumerate(self.blocks()):
             for existing in ("", "1"):
                 with self.subTest(block=number, existing=existing):
-                    result, calls, leftovers = self.run_block(block, EXISTING=existing)
+                    result, calls, leftovers, body = self.run_block(block, EXISTING=existing)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(result.stdout, "operator-fixture\n", "readback diff must be empty")
                     self.assertEqual(len([c for c in calls if "--method" in c]), 1)
                     self.assertEqual(leftovers, [])
+                    self.assertEqual(body["enforcement"], "active")
+                    filename = next(name for name in ("org-release-notes-gate.json", "public-release-tags.json", "public-repo.json") if name in block)
+                    template = json.loads((RULESETS / filename).read_text())
+                    normalized = copy.deepcopy(body)
+                    endpoint = "repos/agenticcodingops/software-factory/rulesets"
+                    if filename == "org-release-notes-gate.json":
+                        endpoint = "orgs/agenticcodingops/rulesets"
+                        workflow = next(r for r in normalized["rules"] if r["type"] == "workflows")["parameters"]["workflows"][0]
+                        self.assertEqual(workflow["sha"], "a" * 40)
+                        self.assertEqual(workflow["repository_id"], 456)
+                        original = next(r for r in template["rules"] if r["type"] == "workflows")["parameters"]["workflows"][0]
+                        workflow["sha"], workflow["repository_id"] = original["sha"], original["repository_id"]
+                    elif filename == "public-release-tags.json":
+                        teams = [a for a in normalized["bypass_actors"] if a["actor_type"] == "Team"]
+                        self.assertEqual(len(teams), 1)
+                        self.assertEqual(teams[0]["actor_id"], 456)
+                        teams[0]["actor_id"] = next(a for a in template["bypass_actors"] if a["actor_type"] == "Team")["actor_id"]
+                    normalized["enforcement"] = template["enforcement"]
+                    self.assertEqual(normalized, template)
+                    write = next(c for c in calls if "--method" in c)
+                    method = "PUT" if existing else "POST"
+                    self.assertEqual(write[:4], ["api", "--method", method, endpoint + ("/123" if existing else "")])
+                    readbacks = [c for c in calls if "--method" not in c and "/rulesets/" in c[1]]
+                    self.assertEqual([c[1] for c in readbacks], [endpoint + "/123"])
+                    listing = next(c for c in calls if "rulesets?" in c[1])
+                    self.assertTrue(listing[1].startswith(endpoint + "?"))
+                    self.assertIn('select(.name=="' + template["name"] + '")', listing[listing.index("--jq") + 1])
+                    if filename != "org-release-notes-gate.json":
+                        self.assertIn("includes_parents=false", listing[1])
 
 
 if __name__ == "__main__":
