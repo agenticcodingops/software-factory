@@ -87,7 +87,7 @@ nock('https://api.github.com').persist().post('/graphql').reply((uri, body) => {
   const name = repo ? repo[2] : body.variables?.name;
   const owner = repo ? repo[1] : body.variables?.owner;
   const action = `${owner}/${name}`;
-  const versions = name === 'node-versions' ? ['24.22.3', '24.22.4'] : pins?.actions[action] ? [pins.actions[action], want.actions[action], ...(action === 'actions/checkout' ? [`v${Number(pins.actions[action].slice(1).split('.')[0]) + 1}.0.0`] : [])] : name === 'software-factory' ? ['v0.1.0', 'v0.2.0', 'v1.0.0'] : ['v7.0.1','v7.0.2','v8.0.0'];
+  const versions = name === 'node-versions' ? ['24.22.3', '24.22.4'] : pins?.actions[action] ? [pins.actions[action], want.actions[action], ...(action === 'actions/checkout' ? [...(scenario === 'checkout-minor' ? [`v${pins.actions[action].slice(1).split('.')[0]}.${Number(pins.actions[action].slice(1).split('.')[1]) + 1}.0`] : []), `v${Number(pins.actions[action].slice(1).split('.')[0]) + 1}.0.0`] : [])] : name === 'software-factory' ? ['v0.1.0', 'v0.2.0', 'v1.0.0'] : ['v7.0.1','v7.0.2','v8.0.0'];
   const tags = versions.map((version, i) => ({version, target: {type: 'Commit', oid: i ? head : old, releaseTimestamp: age(10)}}));
   const releases = versions.map((version, id) => ({version, releaseTimestamp: age(10), isDraft: false, isPrerelease: false,
     url: `https://github.com/fixture/repo/releases/tag/${version}`, id: id + 1, name: version, description: 'Routine fixes.'}));

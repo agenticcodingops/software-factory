@@ -17,7 +17,9 @@ agent merges. These are operator settings changes; committing a payload does not
 
 Agents may merge `agent-merge` PRs only after required checks and two reviews of the current head.
 Renovate automerge is disabled throughout. Image digest/patch updates (Paperclip: digest only) and Terraform runtime patches
-get that label. Action references (depType `action`) and instance production refs get it only for digest, pinDigest, patch and minor updates. Every major from any manager gets
+get that label. Action references (depType `action`) and instance production refs get it only for digest, pinDigest, patch and minor updates. Updates to `.github/workflows/release-notes-gate.yml` are a separate `needs-operator`
+stream: its content is blob-pinned and the pin lives under the protected rulesets path.
+Every major from any manager gets
 `needs-operator`. Validator/release tooling updates always require the operator. Provider updates
 (including patches) and AVM 0.x minor updates get
 `needs-operator`; AVM minor changes carry Renovate's `isBreaking` flag and a major-risk PR note.
@@ -116,7 +118,7 @@ including previous filenames on renames. The protected paths are `.github/workfl
 `ci/renovate/release-notes-gate`, `hosting/paperclip-hermes/rulesets/` and root `CODEOWNERS`.
 The script prefix does not match `test_release_notes_gate.py`; that test remains unprotected.
 A PR with 300 or more changed files fails closed because the compare list may be truncated.
-Gate script, ruleset and CODEOWNERS changes always require the operator. Workflow files
+Gate script, gate workflow, ruleset and CODEOWNERS changes always require the operator. Other workflow files
 have a verified pin-only exception: status must be `modified`, immutable merge-base and head
 contents must be printable ASCII with LF line endings and equal line counts. Each changed
 line must be byte-identical except for the 40-hex SHA and version, and must be a
@@ -133,7 +135,9 @@ action code. The two current-head reviews are the only other control on an actio
 so Actions pin bumps have no soak period ([Renovate 45.1.0 default](https://github.com/renovatebot/renovate/blob/45.1.0/lib/config/options/index.ts)). Actions majors, runtime inputs (`uses-with`), runners and workflow images,
 and every other workflow edit need the operator. The allowed depTypes are checked against
 [Renovate 45.1.0](https://github.com/renovatebot/renovate/blob/45.1.0/lib/modules/manager/github-actions/dep-types.ts).
-The operator's 2026-11-27 decision keeps public Actions patch/minor merges with agents;
+The operator's 2026-11-27 decision keeps public Actions patch/minor merges with agents,
+except the gate workflow's separate `needs-operator` stream. Its pin must be updated
+in the same PR and its ruleset re-applied after merge;
 this explicit verified exception records the ADR interpretation without editing the ADR. The `pull_request_target` workflow is
 restricted to `main` and checks out `github.sha`, the trusted default-branch commit. PR files are
 read through the API as data. Events targeting another branch post nothing; a live base

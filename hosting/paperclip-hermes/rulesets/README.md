@@ -7,7 +7,7 @@ These are [repository ruleset request payloads](https://docs.github.com/en/rest/
 `org-release-notes-gate.json` adds the public repository's required release-notes workflow. Its selector includes only `software-factory` on `main`; it is a disabled template with unresolved repository ID and commit SHA. `org-release-notes-gate.pin.json` records the reviewed workflow's Git blob SHA, independently of branch history. At apply time the operator resolves the newest merged main commit that touched the workflow, verifies its contents blob against the pin, and renders the active API body (commands below). A later workflow change requires a reviewed pin update and re-application. Do not substitute a mutable ref or a bare `release-notes-gate` status context: unrelated workflows use the same Actions integration and could forge that status. The status remains informational. The ruleset pins only the YAML; that YAML runs the script from the default-branch head
 ([pull_request_target semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target)).
 The logic is trusted because main is protected by CODEOWNER review of the latest push and
-the gate fails PRs touching its own script prefix, rulesets or root CODEOWNERS, and workflow changes other than verified same-action, same-major pin bumps.
+the gate fails PRs touching its own script prefix, gate workflow, rulesets or root CODEOWNERS, and workflow changes other than verified same-action, same-major pin bumps.
 The captured main/head SHAs bind that [comparison](https://docs.github.com/en/rest/commits/commits#compare-two-commits),
 including renames, and the 300-file cap fails closed. Only organization admins have a PR-only bypass of this workflow requirement.
 
@@ -114,4 +114,8 @@ failed. Check listings for duplicate names and pagination before applying: the
 [repository rules API](https://docs.github.com/en/rest/repos/rules) supports `includes_parents`
 and caps `per_page` at 100. Use the [teams API](https://docs.github.com/en/rest/teams/teams)
 to verify membership. A later workflow change needs the blob pin updated in a reviewed
-PR and the gate ruleset re-applied.
+PR and the gate ruleset re-applied after merge. Renovate action bumps to the gate workflow
+arrive as a separate `needs-operator` PR because its content is blob-pinned; update
+`blob_sha` in `org-release-notes-gate.pin.json` in that same PR using
+`git hash-object .github/workflows/release-notes-gate.yml`. Other workflow files
+retain the verified pin-only exception.

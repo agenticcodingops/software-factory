@@ -59,6 +59,29 @@ function assertMergeLabels(plans) {
     assert.ok(!(labels.includes('agent-merge') && labels.includes('needs-operator')), `${b.branchName}: conflicting merge labels`);
   }
 }
+function assertActionStreams(events, types) {
+  const deps = extracted(events), plans = branches(events);
+  const gateFile = '.github/workflows/release-notes-gate.yml';
+  const checkoutPlans = plans.filter(b => b.upgrades.some(u => u.depName === 'actions/checkout'));
+  const gatePlans = checkoutPlans.filter(b => b.upgrades.some(u => u.packageFile === gateFile));
+  assert.ok(gatePlans.length > 0, 'missing gate workflow stream');
+  for (const plan of gatePlans) {
+    assert.ok(plan.upgrades.every(u => u.packageFile === gateFile), 'gate branch must contain only the gate workflow');
+    assert.ok(plan.addLabels.includes('needs-operator'));
+    assert.ok(!plan.addLabels.includes('agent-merge'));
+  }
+  for (const type of types) {
+    const ordinary = checkoutPlans.filter(b => b.updateType === type && b.upgrades.every(u => u.packageFile !== gateFile));
+    assert.equal(ordinary.length, 1, `one non-gate checkout ${type} branch`);
+    assert.ok(ordinary[0].addLabels.includes(type === 'major' ? 'needs-operator' : 'agent-merge'));
+    assert.ok(!ordinary[0].addLabels.includes(type === 'major' ? 'agent-merge' : 'needs-operator'));
+    const candidate = deps.find(d => d.depName === 'actions/checkout' && d.packageFile !== gateFile).updates.find(u => u.updateType === type);
+    assert.ok(candidate, `missing checkout ${type} candidate`);
+    assert.equal(gatePlans.filter(b => b.upgrades.some(u => u.depName === 'actions/checkout' && u.newValue === candidate.newValue)).length, 1, `one gate checkout ${type} branch`);
+  }
+  assertMergeLabels(plans);
+  console.log(`PASS checkout ${types.join('/')}: separate protected gate workflow stream`);
+}
 function assertPublic(events, scenario, pins, want, saveDigest = true) {
   const deps = extracted(events);
   const plans = branches(events);
@@ -103,6 +126,7 @@ function assertPublic(events, scenario, pins, want, saveDigest = true) {
     assert.ok(!(caddyMajor.addLabels || []).includes('agent-merge'));
     assertMergeLabels(plans);
     console.log('PASS majors from every manager: needs-operator, never agent-merge');
+    assertActionStreams(events, ['patch', 'major']);
     const actionPatch = plans.find(b => b.depName === 'actions/checkout' && b.updateType === 'patch');
     assert.ok(actionPatch.addLabels.includes('agent-merge'));
     assert.ok(!actionPatch.addLabels.includes('needs-operator'));
@@ -243,6 +267,7 @@ try {
         '.github/workflows/release.yml': '.github/workflows/release.yml',
       })) write(dir, file, fs.readFileSync(path.join(root, source), 'utf8'));
       write(dir,'.github/workflows/fixture-actions.yml', `name: Fixture\non: push\npermissions: {}\njobs:\n  check:\n    permissions: {}\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@${'a'.repeat(40)} # v7.0.1\n`);
+      write(dir,'.github/workflows/release-notes-gate.yml', fs.readFileSync(path.join(dir, '.github/workflows/fixture-actions.yml'), 'utf8'));
       write(dir,'.github/workflows/ci.yml', `name: CI\non: push\npermissions: {}\njobs:\n  check:\n    permissions: {}\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/setup-node@${'a'.repeat(40)} # v7.0.1\n        with:\n          node-version: '24.22.3'\n`);
     }
     if (scenario === 'bumped') {
@@ -269,6 +294,7 @@ try {
     const pins = readPins(dir), want = next(pins);
     const events = cliRun(dir,scenario,'default');
     assertPublic(events, scenario === 'bumped' ? 'mature' : scenario, pins, want, scenario !== 'bumped');
+    if (scenario === 'mature') assertActionStreams(cliRun(dir, 'checkout-minor', 'default'), ['minor', 'major']);
     if (scenario === 'bumped') console.log('PASS fixtures stay valid after pins advance (runtime, provider, Paperclip, Hermes, release action)');
   }
   const dir = path.join(temporary,'instance'); fs.mkdirSync(dir);

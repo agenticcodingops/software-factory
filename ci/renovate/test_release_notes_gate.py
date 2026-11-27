@@ -560,6 +560,17 @@ class WorkflowPinTests(unittest.TestCase):
             self.assert_result(api, 1)
             self.assertFalse(any("/git/ref/tags/" in path for path, _ in api.calls))
 
+    def test_gate_workflow_is_strictly_protected_even_for_verified_bumps(self):
+        api = self.api()
+        self.assertEqual(api.protected_changes("fixture/repo", api.base_sha, api.pr["head"]["sha"]), [])
+        path = ".github/workflows/release-notes-gate.yml"
+        api.files.append({"filename":path, "status":"modified"})
+        for sha in (api.base_sha, api.pr["head"]["sha"]):
+            api.workflow_content[(sha, path)] = api.workflow_content[(sha, self.file)]
+        self.assertEqual(api.protected_changes("fixture/repo", api.base_sha, api.pr["head"]["sha"]),
+                         ["Gate, workflow, ruleset or CODEOWNERS changes require the operator"])
+        self.assert_result(api, 1)
+
     def test_work_limits_stop_before_upstream_tag_calls(self):
         api = self.api()
         api.files *= 21

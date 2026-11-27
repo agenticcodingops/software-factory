@@ -143,6 +143,9 @@
       ],
       "matchDepTypes": [
         "action"
+      ],
+      "matchFileNames": [
+        "!.github/workflows/release-notes-gate.yml"
       ]
     },
     {
@@ -159,6 +162,24 @@
       ],
       "addLabels": [
         "needs-operator"
+      ]
+    },
+    {
+      "description": "Blob-pinned gate workflow updates require the operator.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchFileNames": [
+        ".github/workflows/release-notes-gate.yml"
+      ],
+      "groupName": "Release notes gate workflow",
+      "groupSlug": "release-notes-gate-workflow",
+      "addLabels": [
+        "needs-operator"
+      ],
+      "automerge": false,
+      "prBodyNotes": [
+        "Update blob_sha in hosting/paperclip-hermes/rulesets/org-release-notes-gate.pin.json using git hash-object .github/workflows/release-notes-gate.yml in this same PR. After merge, re-apply the gate ruleset as hosting/paperclip-hermes/rulesets/README.md describes."
       ]
     },
     {
