@@ -13,7 +13,7 @@ including renames, and the 300-file cap fails closed. Only organization admins h
 
 The gate uses `pull_request_target` restricted to `main`, checks out `github.sha` (trusted default-branch code), and reads PR content only as API data. It compares tracked versions against current main, regardless of author. Required-workflow rules ignore event filters, so both the workflow job and script guard default-branch targets; the script posts no statuses or labels when the event targets another branch. A PR
 retargeted during a run fails the gate; retargeting it to main afterwards requires a
-reopen or new commit for re-evaluation. See the [required-workflow event rules](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#supported-event-triggers). Install the public branch and organization workflow payloads together before allowing agent merges. Reopen existing PRs or push a new commit to trigger newly required workflows.
+reopen or new commit for re-evaluation. See the [required-workflow event rules](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#supported-event-triggers). Install the public branch and organization workflow payloads together using the by-hand section below. Agent merges stay disabled until `software-factory-main` reads back as active: the gate trust statement depends on these branch rules. Reopen existing PRs or push a new commit to trigger newly required workflows.
 
 `public-release-tags.json` is a **disabled template** protecting `refs/tags/v*` against creation, update and deletion. Replace the Team `actor_id: 0` with a dedicated organization's release-actor team ID whose sole member is the machine user owning `RELEASE_PLEASE_TOKEN`, then set enforcement to `active`. Release Please creates tags with that token in `.github/workflows/release.yml`; the asset-upload `GITHUB_TOKEN` is not the tag actor. The only other bypass is the operator's OrganizationAdmin role, using `always` because tags have no PR path. Do not grant the shared Actions app (15368), Renovate, general write roles or agent accounts a bypass. Restrict release-token use to the reviewed release workflow. The release actor and operator must create version tags only at reviewed main commits; these rules restrict actors, not tag ancestry. Activate this tag protection before instances consume `github-tags` updates. Actions and instance-ref majors are labelled `needs-operator`. Action refs receive `agent-merge` only for digest, pinDigest, patch and minor updates; in this repository the gate permits only verified version-advancing pin bumps within one major. Runtime inputs, runners, workflow images and other workflow edits need the operator. The [Renovate README](../../../renovate/README.md) describes the exact conditions and limits.
 
@@ -23,12 +23,14 @@ Before enabling `org-merge-gate.json`, replace `repository_id: 0` with the publi
 
 `sf-bootstrap.sh rulesets [--apply]` defaults to dry-run and applies and reads back only
 `public-repo.json`, `org-merge-gate.json` and `instance-repo.json`. It prints the payloads
-it does not apply. It needs a tagged release containing `sf-merge-gate.yml`; that gate
-has not shipped yet. The `.pin.json` file is reviewed content metadata, not an API payload.
+it does not apply, but only after the release-SHA preconditions pass. Until a tagged
+release containing `sf-merge-gate.yml` exists, the command aborts at its release-SHA
+precondition, before printing NOT APPLIED and before applying anything, `public-repo.json`
+included. That gate has not shipped yet. The `.pin.json` file is reviewed content metadata, not an API payload.
 
 | Payload | Endpoint | Applied by |
 | --- | --- | --- |
-| `public-repo.json` | `repos/agenticcodingops/software-factory/rulesets` | bootstrap `rulesets` |
+| `public-repo.json` | `repos/agenticcodingops/software-factory/rulesets` | bootstrap `rulesets` once the merge gate ships; operator, by hand until then |
 | `instance-repo.json` | the instance's `repos/OWNER/REPO/rulesets` | bootstrap `rulesets` |
 | `org-merge-gate.json` | `orgs/agenticcodingops/rulesets` | bootstrap `rulesets` |
 | `org-release-notes-gate.json` | `orgs/agenticcodingops/rulesets` | operator, by hand |
@@ -49,6 +51,28 @@ the [contents API](https://docs.github.com/en/rest/repos/contents#get-repository
 The [org rules API](https://docs.github.com/en/rest/orgs/rules) accepts workflow `repository_id`, `sha` and `path`.
 
 Run these commands in Bash (the readback uses process substitution):
+
+Apply `software-factory-main` first. It takes effect at once: squash only, CODEOWNER
+approval of the latest push, and the `checks` status. Open PRs need that status on their
+head. The later bootstrap `rulesets` run finds this ruleset by name and updates it in place.
+
+```bash
+(
+set -euo pipefail
+gh api user --jq .login
+f=hosting/paperclip-hermes/rulesets/public-repo.json
+id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --jq '.[] | select(.name=="software-factory-main") | .id')
+[[ -z $id || $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset lookup is ambiguous or failed' >&2; exit 1; }
+if [ -z "$id" ]; then id=$(gh api --method POST repos/agenticcodingops/software-factory/rulesets --input "$f" --jq .id)
+else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" --input "$f" >/dev/null; fi
+[[ $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset ID is unresolved' >&2; exit 1; }
+readback=$(mktemp)
+trap 'rm -f "$readback"' EXIT
+gh api "repos/agenticcodingops/software-factory/rulesets/$id" > "$readback"
+diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$f") \
+     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$readback")
+)
+```
 
 ```bash
 d=hosting/paperclip-hermes/rulesets; f=$d/org-release-notes-gate.json; p=$d/org-release-notes-gate.pin.json

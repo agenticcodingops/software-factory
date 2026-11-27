@@ -142,7 +142,10 @@ before the first write. Terraform receives only bootstrap-controlled ARM setting
    summary as proof. API errors fail closed; unsupported org rulesets retain the
    operator-only merge path. It does not apply `org-release-notes-gate.json` or
    `public-release-tags.json`, prints them as NOT APPLIED, and the operator applies
-   them per [the rulesets README](../rulesets/README.md).
+   them per [the rulesets README](../rulesets/README.md). NOT APPLIED is printed only
+   after the release-SHA preconditions pass. Before the merge gate ships, apply
+   `public-repo.json` by hand per that README; the command otherwise aborts before
+   applying anything.
 7. `sf restore-assist --backup-account ACCOUNT --staging-account STAGING --blob backups/NAME --version VERSION --staging-blob restore/UNIQUE --ephemeral-recipient RECIPIENT --key-cmd EXECUTABLE --apply`
    reads the recorded fingerprint before retrieving a key. The adapter returns
    the password-manager key on stdout into an anonymous pipe. Bootstrap verifies

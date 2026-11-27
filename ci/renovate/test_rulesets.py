@@ -53,6 +53,11 @@ class RulesetTests(unittest.TestCase):
             self.assertIn(json.loads((RULESETS / payload).read_text())["name"], readme)
         self.assertIn("commits?sha=main&path=", readme, "manual apply must resolve the main commit")
         self.assertIn("org-release-notes-gate.pin.json", readme)
+        self.assertIn("software-factory-main", readme)
+        self.assertIn("by hand", rows["public-repo.json"])
+        self.assertIn("bootstrap", rows["public-repo.json"])
+        self.assertRegex(readme, r'f=hosting/paperclip-hermes/rulesets/public-repo.json[\s\S]*?--input "\$f"')
+        self.assertLess(readme.index("f=hosting/paperclip-hermes/rulesets/public-repo.json"), readme.index("d=hosting/paperclip-hermes/rulesets;"))
 
     def test_release_tags_only_allow_release_actor_team_and_operator(self):
         tags = json.loads((RULESETS / "public-release-tags.json").read_text())
