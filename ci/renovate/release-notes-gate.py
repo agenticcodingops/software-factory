@@ -61,7 +61,7 @@ def notes_findings(old, new, releases, pattern):
 PROTECTED_PREFIXES = (".github/workflows/", "ci/renovate/release-notes-gate", "hosting/paperclip-hermes/rulesets/")
 PROTECTED_FILES = ("CODEOWNERS",)
 
-ACTION_PIN = re.compile(r"^(\s*(?:-\s+)?uses:\s+)([A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+(?:/[^@\s]+)?)@([0-9a-f]{40})(\s+#\s+)(v\d+\.\d+\.\d+)\s*$")
+ACTION_PIN = re.compile(r"( *(?:- +)?uses: +)([A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+(?:/[^@ ]+)?)@([0-9a-f]{40})( +# +)(v[0-9]+\.[0-9]+\.[0-9]+)")
 WORKFLOW_FINDING = "Workflow changes other than verified action pin bumps require the operator"
 
 
@@ -243,8 +243,11 @@ class GitHub:
         merge_base = comparison["merge_base_commit"]["sha"]
         changed = []
         for file in workflows:
-            old = self.contents(repo, merge_base, file["filename"]).splitlines(keepends=True)
-            new = self.contents(repo, head_sha, file["filename"]).splitlines(keepends=True)
+            old_text = self.contents(repo, merge_base, file["filename"])
+            new_text = self.contents(repo, head_sha, file["filename"])
+            if any(re.search(r"[^\n\x20-\x7e]", text) for text in (old_text, new_text)):
+                return [WORKFLOW_FINDING]
+            old, new = old_text.split("\n"), new_text.split("\n")
             if len(old) != len(new):
                 return [WORKFLOW_FINDING]
             differences = [(a, b) for a, b in zip(old, new) if a != b]
@@ -253,14 +256,16 @@ class GitHub:
             changed.extend(differences)
             if len(changed) > 50:
                 return [WORKFLOW_FINDING]
-        # This proves same-action, same-major pin bumps against tags at gate time,
+        # Workflow files are printable ASCII with LF endings. Changed lines must be
+        # byte-identical except for the 40-hex SHA and version. This proves
+        # same-action, same-major pin bumps against tags at gate time,
         # not the safety of upstream action code. minimumReleaseAge and two reviews
         # remain other controls. Ref/tag API contracts:
         # https://docs.github.com/en/rest/git/refs
         # https://docs.github.com/en/rest/git/tags
         for old, new in changed:
             before, after = ACTION_PIN.fullmatch(old), ACTION_PIN.fullmatch(new)
-            if not before or not after or (before[1], before[2]) != (after[1], after[2]):
+            if not before or not after or (before[1], before[2], before[4]) != (after[1], after[2], after[4]):
                 return [WORKFLOW_FINDING]
             upstream = "/".join(after[2].split("/")[:2])
             lower = tuple(map(int, before[5][1:].split(".")))

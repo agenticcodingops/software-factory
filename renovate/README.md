@@ -118,9 +118,10 @@ The script prefix does not match `test_release_notes_gate.py`; that test remains
 A PR with 300 or more changed files fails closed because the compare list may be truncated.
 Gate script, ruleset and CODEOWNERS changes always require the operator. Workflow files
 have a verified pin-only exception: status must be `modified`, immutable merge-base and head
-contents must decode as UTF-8 with equal line counts, and every changed line must be a
+contents must be printable ASCII with LF line endings and equal line counts. Each changed
+line must be byte-identical except for the 40-hex SHA and version, and must be a
 same-action `uses: owner/repo[/path]@<40 lowercase hex> # vX.Y.Z` bump preserving the key
-and indentation. Local, Docker and same-repository references are excluded. The numeric
+and indentation and comment separator. Local, Docker and same-repository references are excluded. The numeric
 version must advance within the same major; unchanged versions with a different SHA,
 downgrades and majors fail. The new SHA must equal the upstream tag's commit, following
 at most five annotated-tag hops ([refs API](https://docs.github.com/en/rest/git/refs),

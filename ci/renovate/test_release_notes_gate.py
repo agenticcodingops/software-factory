@@ -507,6 +507,20 @@ class WorkflowPinTests(unittest.TestCase):
         self.assertIsNone(gate.ACTION_PIN.fullmatch(self.line(action="./local")))
         self.assertIsNone(gate.ACTION_PIN.fullmatch(self.line(action="docker://example/action")))
 
+    def test_workflow_pin_bumps_preserve_all_other_bytes(self):
+        old = self.line(self.old, "v7.0.1") + "        if: true\n"
+        new = self.line() + "        if: true\n"
+        variants = [new.replace("\n", char, 1) for char in ("\x0c", "\x0b", "\x1c", "\x85", "\u2028", "\r\n")]
+        for char in ("\u00a0", "\t", "  "):
+            variants += [new.replace(" # ", char + "# "), new.replace(" # ", " #" + char)]
+        variants += [new.replace("v7.0.2\n", "v7.0.2 \n"), new.replace("v7.0.2", "v7.0.\u0663"), new.replace("if: true", "if: true # caf\u00e9")]
+        for text in variants:
+            with self.subTest(text=text):
+                api = self.api(old=old, new=text)
+                api.responses["repos/actions/checkout/git/ref/tags/v7.0.\u0663"] = {"object":{"type":"commit", "sha":self.new}}
+                self.assert_result(api, 1)
+                self.assertFalse(any("/git/ref/tags/" in path for path, _ in api.calls))
+
     def test_workflow_status_and_strict_paths_are_protected(self):
         for status in ("added", "removed", "renamed", "copied", "changed", "unknown"):
             self.assert_result(self.api(status=status), 1)
