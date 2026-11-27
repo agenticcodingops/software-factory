@@ -50,7 +50,11 @@ The [commits API](https://docs.github.com/en/rest/commits/commits#list-commits) 
 the [contents API](https://docs.github.com/en/rest/repos/contents#get-repository-content) returns a Git blob `sha`.
 The [org rules API](https://docs.github.com/en/rest/orgs/rules) accepts workflow `repository_id`, `sha` and `path`.
 
-Run these commands in Bash (the readback uses process substitution):
+Run each Bash subshell below as a standalone command (the readback uses process
+substitution). Do not chain it with `&&`, `||` or `if`, which can disable errexit
+([Bash conditional command rules](https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html)).
+The first command shows the active account; use `gh auth switch` to the
+organization-admin account if it shows a different login.
 
 Apply `software-factory-main` first. It takes effect at once: squash only, CODEOWNER
 approval of the latest push, and the `checks` status. Open PRs need that status on their
@@ -61,10 +65,10 @@ head. The later bootstrap `rulesets` run finds this ruleset by name and updates 
 set -euo pipefail
 gh api user --jq .login
 f=hosting/paperclip-hermes/rulesets/public-repo.json
-id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --jq '.[] | select(.name=="software-factory-main") | .id')
+id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --jq '.[] | select(.name=="software-factory-main") | .id') || exit 1
 [[ -z $id || $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset lookup is ambiguous or failed' >&2; exit 1; }
-if [ -z "$id" ]; then id=$(gh api --method POST repos/agenticcodingops/software-factory/rulesets --input "$f" --jq .id)
-else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" --input "$f" >/dev/null; fi
+if [ -z "$id" ]; then id=$(gh api --method POST repos/agenticcodingops/software-factory/rulesets --input "$f" --jq .id) || exit 1
+else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" --input "$f" >/dev/null || exit 1; fi
 [[ $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset ID is unresolved' >&2; exit 1; }
 readback=$(mktemp)
 trap 'rm -f "$readback"' EXIT
@@ -75,19 +79,33 @@ diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$f") \
 ```
 
 ```bash
+(
+set -euo pipefail
+gh api user --jq .login
 d=hosting/paperclip-hermes/rulesets; f=$d/org-release-notes-gate.json; p=$d/org-release-notes-gate.pin.json
-path=$(jq -r .path "$p")
-sha=$(gh api "repos/agenticcodingops/software-factory/commits?sha=main&path=$path&per_page=1" --jq '.[0].sha')
-[ "$(gh api "repos/agenticcodingops/software-factory/contents/$path?ref=$sha" --jq .sha)" = "$(jq -r .blob_sha "$p")" ] || { echo 'workflow at main differs from the reviewed pin' >&2; exit 1; }
-repo_id=$(gh api repos/agenticcodingops/software-factory --jq .id)
+path=$(jq -er .path "$p")
+blob=$(jq -er .blob_sha "$p")
+[[ -n $path && $blob =~ ^[0-9a-f]{40}$ ]] || { echo 'workflow pin is unresolved' >&2; exit 1; }
+sha=$(gh api "repos/agenticcodingops/software-factory/commits?sha=main&path=$path&per_page=1" --jq '.[0].sha') || exit 1
+[[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo 'workflow commit is unresolved' >&2; exit 1; }
+actual_blob=$(gh api "repos/agenticcodingops/software-factory/contents/$path?ref=$sha" --jq .sha) || exit 1
+[ "$actual_blob" = "$blob" ] || { echo 'workflow at main differs from the reviewed pin' >&2; exit 1; }
+repo_id=$(gh api repos/agenticcodingops/software-factory --jq .id) || exit 1
+[[ $repo_id =~ ^[1-9][0-9]*$ ]] || { echo 'repository ID is unresolved' >&2; exit 1; }
 body=$(mktemp)
+readback=""
+trap 'rm -f "$body" "$readback"' EXIT
+readback=$(mktemp)
 jq --arg sha "$sha" --argjson id "$repo_id" '.enforcement = "active" | .rules[0].parameters.workflows[0] |= (.sha = $sha | .repository_id = $id)' "$f" > "$body"
-id=$(gh api 'orgs/agenticcodingops/rulesets?per_page=100' --jq '.[] | select(.name=="software-factory-release-notes-gate") | .id')
-if [ -z "$id" ]; then id=$(gh api --method POST orgs/agenticcodingops/rulesets --input "$body" --jq .id)
-else gh api --method PUT "orgs/agenticcodingops/rulesets/$id" --input "$body" >/dev/null; fi
+id=$(gh api 'orgs/agenticcodingops/rulesets?per_page=100' --jq '.[] | select(.name=="software-factory-release-notes-gate") | .id') || exit 1
+[[ -z $id || $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset lookup is ambiguous or failed' >&2; exit 1; }
+if [ -z "$id" ]; then id=$(gh api --method POST orgs/agenticcodingops/rulesets --input "$body" --jq .id) || exit 1
+else gh api --method PUT "orgs/agenticcodingops/rulesets/$id" --input "$body" >/dev/null || exit 1; fi
+[[ $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset ID is unresolved' >&2; exit 1; }
+gh api "orgs/agenticcodingops/rulesets/$id" > "$readback" || exit 1
 diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$body") \
-     <(gh api "orgs/agenticcodingops/rulesets/$id" | jq -S '{name,target,enforcement,bypass_actors,conditions,rules}')
-rm "$body"
+     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$readback")
+)
 ```
 
 For `software-factory-release-tags`, wait until the dedicated release team exists.
@@ -96,17 +114,26 @@ ruleset uninstalled and instances must not consume `github-tags` updates. Render
 team ID into a temporary body and never commit it:
 
 ```bash
+(
+set -euo pipefail
+gh api user --jq .login
 f=hosting/paperclip-hermes/rulesets/public-release-tags.json
-team=$(gh api "orgs/agenticcodingops/teams/$RELEASE_TEAM_SLUG" --jq .id)
-[ -n "$team" ] && [ "$team" != 0 ] || { echo 'release team is unresolved' >&2; exit 1; }
+team=$(gh api "orgs/agenticcodingops/teams/$RELEASE_TEAM_SLUG" --jq .id) || { echo 'release team lookup failed' >&2; exit 1; }
+[[ $team =~ ^[1-9][0-9]*$ ]] || { echo 'release team is unresolved' >&2; exit 1; }
 body=$(mktemp)
+readback=""
+trap 'rm -f "$body" "$readback"' EXIT
+readback=$(mktemp)
 jq --argjson team "$team" '(.bypass_actors[] | select(.actor_type=="Team") | .actor_id) = $team | .enforcement = "active"' "$f" > "$body"
-id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --jq '.[] | select(.name=="software-factory-release-tags") | .id')
-if [ -z "$id" ]; then id=$(gh api --method POST repos/agenticcodingops/software-factory/rulesets --input "$body" --jq .id)
-else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" --input "$body" >/dev/null; fi
+id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --jq '.[] | select(.name=="software-factory-release-tags") | .id') || exit 1
+[[ -z $id || $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset lookup is ambiguous or failed' >&2; exit 1; }
+if [ -z "$id" ]; then id=$(gh api --method POST repos/agenticcodingops/software-factory/rulesets --input "$body" --jq .id) || exit 1
+else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" --input "$body" >/dev/null || exit 1; fi
+[[ $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset ID is unresolved' >&2; exit 1; }
+gh api "repos/agenticcodingops/software-factory/rulesets/$id" > "$readback" || exit 1
 diff <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$body") \
-     <(gh api "repos/agenticcodingops/software-factory/rulesets/$id" | jq -S '{name,target,enforcement,bypass_actors,conditions,rules}')
-rm "$body"
+     <(jq -S '{name,target,enforcement,bypass_actors,conditions,rules}' "$readback")
+)
 ```
 
 Any diff line must be explained by a documented API default; otherwise the apply
