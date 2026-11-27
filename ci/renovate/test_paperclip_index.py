@@ -33,6 +33,7 @@ class FakeAPI:
         self.previous = previous
         self.branch = branch
         self.calls = []
+        self.errors = {}
         self.resolved = []
         self.error = None
         self.release_data = [RELEASE]
@@ -40,6 +41,9 @@ class FakeAPI:
 
     def request(self, path, payload=None, method=None):
         self.calls.append((path, payload, method))
+        for suffix, error in self.errors.items():
+            if path.endswith(suffix):
+                raise error
         if "/packages/" in path:
             raise AssertionError("the bounded index must never list packages")
         if path.endswith("?ref=renovate-data"):
@@ -147,14 +151,29 @@ class IndexTests(unittest.TestCase):
         self.assertNotIn("sha", writes[1][1])
         self.assertEqual(json.loads(base64.b64decode(writes[1][1]["content"])), index.build([RELEASE], {}, lambda *_: DIGEST, NOW))
 
-    def test_update_uses_previous_blob_and_errors_do_not_create_branch(self):
+    def test_update_uses_previous_blob(self):
         api = FakeAPI(index.build([RELEASE], {}, lambda *_: "sha256:" + "b" * 64, EARLIER))
         self.assertTrue(index.publish(api, "fixture/repo", NOW))
         self.assertEqual(api.calls[-1][1]["sha"], "previous-blob-placeholder")
-        api = FakeAPI()
-        with patch.object(api, "request", side_effect=HTTPError("https://fixture.invalid", 403, "forbidden", {}, None)), self.assertRaises(HTTPError):
-            index.publish(api, "fixture/repo", NOW)
-        self.assertEqual(api.calls, [])
+
+    def test_contents_and_ref_errors_abort_before_any_write(self):
+        previous = index.build([RELEASE], {}, lambda *_: DIGEST, EARLIER)
+        for code in (403, 500):
+            for suffix in ("?ref=renovate-data", "/git/ref/heads/renovate-data"):
+                with self.subTest(code=code, suffix=suffix):
+                    api = FakeAPI(previous if suffix.startswith("?") else None)
+                    api.errors[suffix] = HTTPError("https://fixture.invalid", code, "unavailable", {}, None)
+                    with self.assertRaises(HTTPError) as raised:
+                        index.publish(api, "fixture/repo", NOW)
+                    self.assertEqual(raised.exception.code, code)
+                    self.assertTrue(any(path.endswith(suffix) for path, _, _ in api.calls))
+                    self.assertTrue(all(payload is None for _, payload, _ in api.calls))
+                    self.assertFalse(any(method == "PUT" for _, _, method in api.calls))
+                    if suffix.startswith("?"):
+                        self.assertEqual(api.resolved, [])
+                        self.assertFalse(any("/releases?" in path for path, _, _ in api.calls))
+                    else:
+                        self.assertNotIn(("repos/fixture/repo", None, None), api.calls)
 
     def test_index_registry_requests_never_use_github_token(self):
         from io import BytesIO
