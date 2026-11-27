@@ -383,6 +383,23 @@ class PinExtractionTests(unittest.TestCase):
                 gate.compose_pin(variant, self.paper, "paperclip")
         self.assertEqual(gate.compose_pin(text, self.paper, "paperclip")[0], "2026.1117.0")
 
+    def test_flow_scan_single_line_rules(self):
+        rejected = [
+            '    k: "a"b', '    k: &a b', '    k: !!str b', '    k: a[b',
+            '    k: [a}', '    k: ${A', '    k: a]', '    k: [${A}]',
+            "    k: 'it''s'", '    k: [', '    k: [a${B]}',
+        ]
+        accepted = [
+            "    k: a # it's", 'x-runtime: &runtime', 'x-runtime: &runtime # c',
+            '    k: ${A:-${B:-c}}', '    k: {a: [b, "c"]}',
+        ]
+        for line in rejected:
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                gate.flow_scan(line)
+        for line in accepted:
+            with self.subTest(line=line):
+                gate.flow_scan(line)
+
     def test_comment_cannot_satisfy_the_dockerfile_pin(self):
         comment = f"# {self.hermes}:v0.23.4@{self.digest}\n"
         variants = [
