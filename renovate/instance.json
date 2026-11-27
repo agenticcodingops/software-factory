@@ -83,23 +83,6 @@
       "addLabels": [
         "agent-merge"
       ]
-    },
-    {
-      "matchManagers": [
-        "custom.regex"
-      ],
-      "matchDepTypes": [
-        "workflow"
-      ],
-      "matchPackageNames": [
-        "agenticcodingops/software-factory"
-      ],
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "addLabels": [
-        "needs-operator"
-      ]
     }
   ],
   "customManagers": [

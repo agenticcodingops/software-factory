@@ -208,10 +208,7 @@
       ]
     },
     {
-      "description": "Major Actions updates require the operator.",
-      "matchManagers": [
-        "github-actions"
-      ],
+      "description": "Major updates from every manager require the operator.",
       "matchUpdateTypes": [
         "major"
       ],

@@ -17,11 +17,11 @@ agent merges. These are operator settings changes; committing a payload does not
 
 Agents may merge `agent-merge` PRs only after required checks and two reviews of the current head.
 Renovate automerge is disabled throughout. Image digest/patch updates and Terraform runtime patches
-get that label. Actions and instance production refs get it only for digest, pinDigest, patch and minor updates; their majors get
+get that label. Actions and instance production refs get it only for digest, pinDigest, patch and minor updates. Every major from any manager gets
 `needs-operator`. Validator/release tooling updates always require the operator. Provider updates
 (including patches) and AVM 0.x minor updates get
 `needs-operator`; AVM minor changes carry Renovate's `isBreaking` flag and a major-risk PR note.
-Other image version updates have no agent-merge label. All image and Terraform commits use
+Other image minor updates carry neither merge label. All image and Terraform commits use
 `fix(deps)` so Release Please cuts releases; Actions and instance caller updates use `chore(deps)`.
 
 Updates are scheduled weekly, Monday 00:00–06:00 UTC, consistent with ADR 0001.

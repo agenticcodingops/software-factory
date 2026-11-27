@@ -49,6 +49,15 @@ function branches(events) {
   assert.ok(result, 'missing CLI branch plans');
   return result.branches;
 }
+function assertMergeLabels(plans) {
+  for (const b of plans.filter(b => b.updateType === 'major')) {
+    assert.ok((b.addLabels || []).includes('needs-operator'), `${b.branchName}: major without needs-operator`);
+  }
+  for (const b of plans) {
+    const labels = b.addLabels || [];
+    assert.ok(!(labels.includes('agent-merge') && labels.includes('needs-operator')), `${b.branchName}: conflicting merge labels`);
+  }
+}
 function assertPublic(events, scenario, pins, want, saveDigest = true) {
   const deps = extracted(events);
   const plans = branches(events);
@@ -76,6 +85,13 @@ function assertPublic(events, scenario, pins, want, saveDigest = true) {
       if (['digest','patch'].includes(b.updateType)) assert.ok(b.addLabels.includes('agent-merge'));
       for (const u of b.upgrades) assert.match(u.newDigest, /^sha256:[a-f0-9]{64}$/);
     }
+    const caddyMajor = imagePlans.find(b => b.depName === 'caddy' && b.updateType === 'major');
+    assert.ok(caddyMajor, 'Caddy 2-alpine -> 3-alpine major must be proposed');
+    assert.ok(caddyMajor.upgrades.every(u => u.newValue === '3-alpine'));
+    assert.ok((caddyMajor.addLabels || []).includes('needs-operator'));
+    assert.ok(!(caddyMajor.addLabels || []).includes('agent-merge'));
+    assertMergeLabels(plans);
+    console.log('PASS majors from every manager: needs-operator, never agent-merge');
     const provider = plans.find(b => b.depName === 'azurerm' && b.updateType === 'patch');
     assert.ok(provider.addLabels.includes('needs-operator'));
     assert.ok(!provider.addLabels.includes('agent-merge'));
@@ -144,6 +160,7 @@ function assertInstance(events) {
   assert.equal(ops.length,8);
   assert.ok(ops.every(d => d.skipReason === 'disabled' && d.updates.length === 0));
   const plans = branches(events);
+  assertMergeLabels(plans);
   const grouped = plans.filter(b => b.groupName === 'software-factory production workflows');
   assert.equal(grouped.length,2);
   const major = grouped.find(b => b.updateType === 'major');

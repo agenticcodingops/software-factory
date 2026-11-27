@@ -69,7 +69,7 @@ for (const [name, version] of modules) {
 
 // A PostgreSQL major move is a policy change and should require a test edit.
 const images = {...(pins ? {'nousresearch/hermes-agent': [pins.hermes, want.hermes, 'v2026.9.24', 'v0.99.0-canary', bump(pins.hermes, 'minor') + '-rc.1', bump(pins.hermes, 'minor') + '-desktop']} : {}),
-  'library/postgres': ['17','17.1','18'], 'library/caddy': ['2-alpine','2.1-alpine']};
+  'library/postgres': ['17','17.1','18'], 'library/caddy': ['2-alpine','2.1-alpine','3-alpine']};
 for (const [name, tags] of Object.entries(images)) {
   nock('https://hub.docker.com').persist().get(`/v2/repositories/${name}/tags`).query(true).reply(200, {
     count: tags.length, next: null, results: tags.map((name, id) => ({name, id, last_updated: age(10), tag_last_pushed: age(10), digest: digest('c')})),
