@@ -63,8 +63,9 @@ candidate appears. This bounds requests independently of GHCR's thousands of his
 
 The instance regex customManager supplies `depType: workflow` for canonical
 `uses: ...@<sha> # vX.Y.Z` caller lines. The native manager is
-disabled for factory refs to avoid duplicate updates. Six production/plan caller files are explicitly
-allowed and grouped into one PR per update stream (major and non-major stay separate). All `ph-ops*`, `ph-power*`, `ph-cost-guard*` and
+disabled for factory refs to avoid duplicate updates. Ten non-ops caller files are explicitly
+allowed, including `ph-move.yml`, `ph-rotate-age.yml`, `ph-selftest.yml` and
+`ph-host-monitor.yml`, and grouped into one PR per update stream (major and non-major stay separate). All `ph-ops*`, `ph-power*`, `ph-cost-guard*` and
 `ph-backup-verify*` callers are disabled by file name, across both managers and every target suffix.
 New caller filenames require review of the allowlist. Ops refs advance only in the approved handoff.
 

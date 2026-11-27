@@ -171,12 +171,12 @@ function assertPublic(events, scenario, pins, want, saveDigest = true) {
 function assertInstance(events) {
   const deps = extracted(events);
   const native = deps.filter(d => d.manager === 'github-actions' && d.packageName === 'agenticcodingops/software-factory');
-  assert.equal(native.length, 14);
+  assert.equal(native.length, 18);
   assert.ok(native.every(d => d.skipReason === 'disabled' && d.updates.length === 0));
   const workflows = deps.filter(d => d.manager === 'regex' && d.depType === 'workflow');
-  assert.equal(workflows.length,14);
+  assert.equal(workflows.length,18);
   const prod = workflows.filter(d => d.updates.length);
-  assert.equal(prod.length,6);
+  assert.equal(prod.length,10);
   assert.ok(prod.every(d => !/ph-(ops|power|cost-guard|backup-verify)/.test(d.packageFile)));
   const ops = workflows.filter(d => /ph-(ops|power|cost-guard|backup-verify)/.test(d.packageFile));
   assert.equal(ops.length,8);
@@ -192,7 +192,8 @@ function assertInstance(events) {
   const minor = grouped.find(b => b.updateType === 'minor');
   assert.ok(minor.addLabels.includes('agent-merge'));
   assert.ok(!minor.addLabels.includes('needs-operator'));
-  assert.equal(minor.upgrades.length,6);
+  assert.equal(minor.upgrades.length,10);
+  for (const group of grouped) assert.deepEqual(new Set(group.upgrades.map(u => u.packageFile)), new Set(['deploy','restore','vault-move','teardown','plan','tailnet-import','move','rotate-age','selftest','host-monitor'].map(n => `.github/workflows/ph-${n}.yml`)));
   assert.ok(minor.upgrades.every(u => u.newDigest === 'b'.repeat(40) && u.newValue === 'v0.2.0'));
   assert.match(minor.commitMessage,/^chore\(deps\): /);
   const action = plans.find(b => b.depName === 'actions/checkout' && b.updateType === 'patch');
@@ -202,7 +203,7 @@ function assertInstance(events) {
   assert.ok(actionMajor.addLabels.includes('needs-operator'));
   assert.ok(!actionMajor.addLabels.includes('agent-merge'));
   console.log('PASS Actions and instance workflow majors require operator; patch/minor allow agent merge');
-  console.log('PASS production workflow SHAs: six callers per update stream; eight per-target ops callers excluded');
+  console.log('PASS production workflow SHAs: ten non-ops callers per update stream; eight per-target ops callers excluded');
   console.log('PASS SHA-pinned GitHub Actions remain chore(deps), agent-merge');
 }
 try {
@@ -267,7 +268,7 @@ try {
     if (scenario === 'bumped') console.log('PASS fixtures stay valid after pins advance (runtime, provider, Paperclip, Hermes, release action)');
   }
   const dir = path.join(temporary,'instance'); fs.mkdirSync(dir);
-  for (const name of ['deploy','restore','vault-move','teardown','plan','tailnet-import','ops','power','cost-guard','backup-verify','ops-target-b','power-target-b','cost-guard-target-b','backup-verify-target-b']) {
+  for (const name of ['deploy','restore','vault-move','teardown','plan','tailnet-import','move','rotate-age','selftest','host-monitor','ops','power','cost-guard','backup-verify','ops-target-b','power-target-b','cost-guard-target-b','backup-verify-target-b']) {
     write(dir,`.github/workflows/ph-${name}.yml`, `name: fixture\non: workflow_dispatch\npermissions: {}\njobs:\n  call:\n    permissions: {}\n    uses: agenticcodingops/software-factory/.github/workflows/ph-${name.replace('-target-b','')}.yml@${'a'.repeat(40)} # v0.1.0\n`);
   }
   write(dir,'.github/workflows/ci.yml',`name: CI\non: push\npermissions: {}\njobs:\n  test:\n    permissions: {}\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@${'a'.repeat(40)} # v7.0.1\n`);

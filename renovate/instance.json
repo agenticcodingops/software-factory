@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Instance workflow callers: only production-plane release refs are proposed by Renovate.",
+  "description": "Instance workflow callers: only ten non-ops release refs are proposed by Renovate.",
   "extends": [
     "./default"
   ],
@@ -41,14 +41,19 @@
         ".github/workflows/ph-vault-move.yml",
         ".github/workflows/ph-teardown.yml",
         ".github/workflows/ph-plan.yml",
-        ".github/workflows/ph-tailnet-import.yml"
+        ".github/workflows/ph-tailnet-import.yml",
+        ".github/workflows/ph-move.yml",
+        ".github/workflows/ph-rotate-age.yml",
+        ".github/workflows/ph-selftest.yml",
+        ".github/workflows/ph-host-monitor.yml"
       ],
       "enabled": true,
       "groupName": "software-factory production workflows",
       "groupSlug": "software-factory-production",
       "pinDigests": true,
       "semanticCommitType": "chore",
-      "commitMessageTopic": "software-factory production workflows"
+      "commitMessageTopic": "software-factory production workflows",
+      "description": "Explicitly allow the ten non-ops caller files; new filenames require review."
     },
     {
       "description": "All targets ops entries advance only through the approved deploy handoff.",
