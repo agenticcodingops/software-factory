@@ -63,6 +63,9 @@ function assertPublic(events, scenario, pins, want, saveDigest = true) {
   const deps = extracted(events);
   const plans = branches(events);
   assert.ok(plans.length > 0);
+  for (const plan of plans.filter(b => b.upgrades.some(u => u.manager === 'npm'))) {
+    assert.ok(!(plan.addLabels || []).includes('agent-merge'), 'npm upgrades must never carry agent-merge');
+  }
   assert.ok(plans.every(b => b.automerge === false), 'agents, not Renovate, perform merges');
   assert.ok(deps.every(d => !(d.warnings || []).length), 'dependency lookup warning');
   const paper = deps.find(d => d.depName === 'ghcr.io/paperclipai/paperclip' && d.packageFile.startsWith('hosting/'));

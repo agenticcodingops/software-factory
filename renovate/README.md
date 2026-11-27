@@ -149,6 +149,13 @@ action together. Their version numbers are independent: grouping does not synchr
 bundled library. This repository currently tests Renovate 45.1.0 on Node 24.22.3, which supports
 relative preset resolution (Renovate 42.0.0 did not).
 
+npm copies upstream `deprecated` messages into `package-lock.json`, so an npm or
+lock-maintenance PR can fail the deny-list when a message contains a maintainer address
+([npm deprecation documentation](https://docs.npmjs.com/cli/v11/commands/npm-deprecate)).
+The operator must verify the address is public upstream metadata and add the exact value
+to `deny-list/allow.txt` with a comment naming the package; never add a path or field exclusion.
+npm PRs carry no `agent-merge` label.
+
 ## Acceptance fixture
 
 Run `npm run validate:renovate -- renovate.json renovate/default.json renovate/instance.json` and
