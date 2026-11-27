@@ -152,7 +152,7 @@ class NotesTests(unittest.TestCase):
         self.assertEqual(self.invoke(api, base="side"), 0)
         self.assertEqual(api.calls, [])
         api.pr["base"]["ref"] = "side"
-        self.assertEqual(self.invoke(api), 0)
+        self.assertEqual(self.invoke(api), 1)
         self.assertTrue(all(payload is None for _, payload in api.calls))
 
     def test_workflow_changes_fail_including_deletions_and_renames(self):
@@ -236,8 +236,10 @@ class NotesTests(unittest.TestCase):
             return result
 
         with patch.object(api, "request", side_effect=changed):
-            self.assertEqual(self.invoke(api), 0)
-        self.assertEqual([p["state"] for _, p in api.calls if p and "state" in p], ["pending"])
+            self.assertEqual(self.invoke(api), 1)
+        self.assertEqual([p["state"] for _, p in api.calls if p and "state" in p], ["pending", "error"])
+
+        self.assertFalse(any("/labels" in path for path, _ in api.calls))
 
     def test_workflow_uses_default_branch_code_only(self):
         import yaml

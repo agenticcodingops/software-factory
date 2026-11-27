@@ -243,7 +243,8 @@ def main():
     api = GitHub(os.environ["GH_TOKEN"])
     pr = api.request(f"repos/{repo}/pulls/{number}")
     if pr["base"]["ref"] != default_branch:
-        return 0
+        print("release-notes-gate: PR base changed during the run; reopen the PR or push a commit to rerun")
+        return 1
     sha = pr["head"]["sha"]
     status_path = f"repos/{repo}/statuses/{sha}"
     status = {"context": "release-notes-gate", "state": "pending", "description": "Checking upstream image release notes"}
@@ -261,7 +262,10 @@ def main():
         findings = ["Upstream notes could not be verified"]
     latest = api.request(f"repos/{repo}/pulls/{number}")
     if latest["base"]["ref"] != default_branch:
-        return 0
+        print("release-notes-gate: PR base changed during the run; reopen the PR or push a commit to rerun")
+        status.update(state="error", description="PR base changed during the run; rerun")
+        api.request(status_path, status)
+        return 1
     if latest["head"]["sha"] != sha:
         raise ValueError("PR head changed while checking notes; rerun the gate")
     if findings:
