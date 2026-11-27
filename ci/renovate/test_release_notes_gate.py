@@ -70,6 +70,22 @@ class NotesTests(unittest.TestCase):
                 self.assertEqual(len(result), 1)
                 self.assertIn("1120", result[0])
 
+    def test_deferred_notes_and_migration_stems(self):
+        for body, hazard, deferred in (
+            ("Full curated release notes for this window ship with v0.24.0. Items undocumented here on purpose: hermes gateway migrate --backends", True, True),
+            ("Full curated release notes for this window ship with v0.24.0", False, True),
+            ("migrate", True, False),
+            ("No migrations, no configuration changes, no API changes.", True, False),
+            ("## Breaking Changes\nNone of these require action...", True, False),
+            ("this release becomes the rollback floor", True, False),
+            ("Complete patch notes: corrected a typo and fixed session cleanup.", False, False),
+            ("Routine fixes.", False, False),
+        ):
+            with self.subTest(body=body):
+                result = gate.notes_findings("v0.23.3", "v0.23.4", [release("v0.23.4", body)], r"v0\.\d+\.\d+")
+                self.assertEqual(any("notes deferred" in f for f in result), deferred)
+                self.assertEqual(len(result), int(hazard) + int(deferred))
+
     def test_safe_notes_and_bad_missing_or_empty_notes(self):
         self.assertEqual(gate.notes_findings("2026.1117.0", "2026.1124.0", [release()], PATTERN), [])
         for releases in ([], [release(body="")], [dict(release(), draft=True)], [dict(release(), prerelease=True)]):

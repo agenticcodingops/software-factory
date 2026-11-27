@@ -20,7 +20,9 @@ IMAGES = {
         "hosting/paperclip-hermes/kit/Dockerfile.hermes", ("dockerfile", None),
     ),
 }
-HAZARD = re.compile(r"breaking|migration|rollback[\s-]+floor", re.IGNORECASE)
+HAZARD = re.compile(r"breaking|migrat\w*|rollback[\s-]+floor", re.IGNORECASE)
+
+DEFERRED = re.compile(r"notes\b[^.\n]{0,80}\b(?:ship|follow|land|come|publish\w*)\b[^.\n]{0,20}\b(?:with|in)\s+v?\d|undocumented here", re.IGNORECASE)
 
 
 def version(tag, pattern):
@@ -49,6 +51,8 @@ def notes_findings(old, new, releases, pattern):
             match = HAZARD.search(body)
             if match:
                 findings.append(f"{tag}: {match.group(0)}")
+            if DEFERRED.search(body):
+                findings.append(f"{tag}: notes deferred")
     if not found_target:
         raise ValueError("upstream target release notes are missing")
     return findings

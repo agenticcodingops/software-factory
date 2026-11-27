@@ -71,8 +71,14 @@ New caller filenames require review of the allowlist. Ops refs advance only in t
 The [release-notes gate](../.github/workflows/release-notes-gate.yml) reads upstream Paperclip/Hermes
 release bodies for every stable tag between the current default-branch version and PR head,
 including skipped releases, regardless of PR author.
-Case-insensitive `breaking`, `migration` or `rollback floor` text applies `needs-operator` and fails
-the `release-notes-gate` status on the exact PR head. Missing/empty notes and API failures also fail
+Case-insensitive `breaking`, `migrat*` or `rollback floor` text applies `needs-operator` and fails
+the `release-notes-gate` status on the exact PR head. Deferred notes (notes that ship,
+follow, land, come or publish with/in another version, or "undocumented here") independently
+fail the gate. This is stricter than ADR 0001's literal hazard wording; the ADR is unchanged.
+Most recent Hermes patches currently go to the operator while upstream defers patch notes
+([v0.23.4 notes](https://github.com/NousResearch/hermes-agent/releases/tag/v0.23.4)).
+Paperclip version bumps are operator-reviewed in practice because upstream bodies routinely
+contain these words, including "No migrations" ([Paperclip releases](https://github.com/paperclipai/paperclip/releases)). Missing/empty notes and API failures also fail
 closed. The gate reads `(tag, digest)` from strict physical image lines: canonical
 `    image: repository:tag@sha256:...` under the named Compose service and
 `FROM repository:tag@sha256:... [AS stage]` in the Dockerfile. Earlier Dockerfile
