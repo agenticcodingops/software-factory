@@ -52,14 +52,27 @@ with missing timestamps held.
 
 Renovate's [Docker datasource](https://docs.renovatebot.com/modules/datasource/docker/) supplies
 timestamps for Docker Hub, but **not GHCR**. Paperclip therefore uses `custom.paperclip-ghcr`:
-the [GitHub package versions API](https://docs.github.com/en/rest/packages/packages#list-package-versions-for-a-package-owned-by-an-organization)
-returns image tags, the `sha256` digest, and GitHub's `created_at` timestamp. JSONata maps these
-into releases together, preserving `tag@sha256` updates and enforcing the actual registry age.
-Renovate reuses its GitHub app token for this API; nothing secret belongs in a preset. API failure,
-an absent candidate or a missing timestamp cannot pass the age check. The custom datasource reads
-the API's first page of 100 package versions; it does not search historical pages. A stable release
-outside that window is not proposed, and an older pin may lack a digest refresh until a newer stable
-candidate appears. This bounds requests independently of GHCR's thousands of historical tags.
+a [generated release index](https://raw.githubusercontent.com/agenticcodingops/software-factory/renovate-data/paperclip-releases.json)
+on branch `renovate-data`, published by [the daily workflow](../.github/workflows/renovate-paperclip-index.yml).
+The stdlib builder reads every page of stable [GitHub releases](https://docs.github.com/en/rest/releases/releases#list-releases)
+and resolves bare and v-prefixed tags independently through anonymous registry HEAD requests.
+It never lists package versions; the index is bounded by stable releases, and contains
+version, digest and timestamp together in the [custom datasource format](https://docs.renovatebot.com/modules/datasource/custom/).
+The GitHub token goes only to `api.github.com`, never a registry or the raw index host.
+
+The timestamp records first observation of each `(version, digest)`, retaining it only
+while the digest stays the same. A re-pushed tag restarts the clock, so the soak cannot be
+shorter than the image's real age. A new entry soaks for three days from first observation;
+the first run delays all candidates by three days. An unresolved tag form (404) is omitted;
+any other registry/API/parse failure or an empty result aborts before publishing and leaves
+the previous file in place. Contents/ref API publishing uses no git push
+([contents](https://docs.github.com/en/rest/repos/contents#create-or-update-file-contents),
+[refs](https://docs.github.com/en/rest/git/refs#create-a-reference)).
+A missing index or timestamp cannot propose an unsoaked update. A stalled index cannot
+introduce new releases; previously observed entries remain available with their existing
+soak clocks. Until the operator first runs the workflow after merge, the URL returns 404
+and no Paperclip update is proposed. No dependency dashboard is configured, so a failed
+scheduled run is how a stalled index is noticed.
 
 The instance regex customManager supplies `depType: workflow` for canonical
 `uses: ...@<sha> # vX.Y.Z` caller lines. The native manager is

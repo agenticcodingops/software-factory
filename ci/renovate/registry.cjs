@@ -27,14 +27,14 @@ for (const [name, preset] of Object.entries({default: defaults, instance})) {
 if (pins) {
 const paperVersion = scenario === 'paperclip-patch' ? bump(pins.paperclip.version, 'patch') : want.paperclip;
 const paperTag = (pins.paperclip.prefix ? 'v' : '') + paperVersion;
-const packages = [
-  { name: digest('a'), created_at: age(20), metadata: { container: { tags: [pins.paperclip.version, 'v' + pins.paperclip.version] } } },
-  { name: digest('b'), created_at: scenario === 'missing' ? null : age(scenario === 'young' ? 2 : 3.1),
-    metadata: { container: { tags: [paperTag, 'nightly', want.paperclip + '-cloud', want.paperclip + '-beta'] } } },
+const entries = [
+  ...[pins.paperclip.version, 'v' + pins.paperclip.version].map(version => ({version, digest:digest('a'), releaseTimestamp:age(20)})),
+  ...[paperTag, 'nightly', want.paperclip + '-cloud', want.paperclip + '-beta'].map(version => ({version, digest:digest('b'),
+    ...(scenario === 'missing' ? {} : {releaseTimestamp:age(scenario === 'young' ? 2 : 3.1)})})),
 ];
-nock('https://api.github.com').persist()
-  .matchHeader('authorization', /^(?:Bearer|token) fixture-placeholder$/i)
-  .get('/orgs/paperclipai/packages/container/paperclip/versions').query({per_page: 100}).reply(200, packages);
+nock('https://raw.githubusercontent.com').persist()
+  .get('/agenticcodingops/software-factory/renovate-data/paperclip-releases.json')
+  .reply(200, {releases:entries, sourceUrl:'https://github.com/paperclipai/paperclip'});
 nock('https://releases.hashicorp.com').persist().get('/terraform/index.json').reply(200, {
   versions: {[pins.terraform]: {}, [want.terraform]: {}},
 });

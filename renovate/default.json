@@ -338,10 +338,7 @@
       ]
     },
     "paperclip-ghcr": {
-      "defaultRegistryUrlTemplate": "https://api.github.com/orgs/paperclipai/packages/container/paperclip/versions?per_page=100",
-      "transformTemplates": [
-        "{\"releases\": $reduce($, function($acc, $v) { $append($acc, $map($v.metadata.container.tags, function($tag) { {\"version\": $tag, \"digest\": $v.name, \"releaseTimestamp\": $v.created_at} })) }, []), \"sourceUrl\": \"https://github.com/paperclipai/paperclip\"}"
-      ]
+      "defaultRegistryUrlTemplate": "https://raw.githubusercontent.com/agenticcodingops/software-factory/renovate-data/paperclip-releases.json"
     }
   },
   "schedule": [
