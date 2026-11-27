@@ -56,7 +56,9 @@ Reusable modules follow the ADR's bounded provider-range convention. CI inspects
 plan for secret resources, private key material and network/storage controls. The ref-bump tool remains
 future work. Ops credentials require owner-authorized exact workflow identities; environment-only
 federation is unavailable. Live token-exchange and controller acceptance still block deployment release.
-Container e2e, Azure and GitHub settings checks require later packages and operator infrastructure.
+The `kit-e2e` workflow exercises container upgrade rollback and cross-version restore.
+Azure and GitHub settings checks require later packages and operator infrastructure.
+Install Docker Compose v2.33.1 or later for the unit-test profile matrix (no daemon needed).
 The kit unit tests use sudo when needed to exercise root-only ownership protections.
 WP5 Bats tests replace every cloud CLI with a fail-closed local stub and exercise reviewer gates,
 observed OIDC claims, custody, migration, secret handling and temporary-role cleanup.

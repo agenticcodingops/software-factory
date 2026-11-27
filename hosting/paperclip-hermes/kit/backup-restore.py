@@ -7,7 +7,7 @@ Application output is private staging data; failures print only the operation.
 import argparse
 import base64
 from contextlib import contextmanager, suppress
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import errno
 import hashlib
 import importlib.util
@@ -46,7 +46,8 @@ VOLUMES = {
 CONFIG = (
     'compose.yaml', 'Dockerfile.hermes', 'hermes-config.yaml', 'Caddyfile',
     'bootstrap.sh', 'host-config.py', 'block-metadata.sh', 'backup.sh',
-    'restore.sh', 'backup-restore.py', 'container', 'systemd', 'tests',
+    'restore.sh', 'backup-restore.py', 'kit-control.py', 'upgrade.sh', 'health.sh',
+    'sfctl', 'join-tailnet.sh', 'container', 'systemd', 'tests',
     '.env.example', '.dockerignore', '.gitignore', '.gitattributes', 'README.md',
     'tailscale-policy.hujson', 'backup.env.example', 'recovery-sources.md',
 )
@@ -59,7 +60,17 @@ DOCS = ('README.md', 'recovery-sources.md', 'tests')
 HOST_LOCAL = ('systemd',)
 CODE = tuple(name for name in CONFIG if name not in DOCS + HOST_LOCAL)
 MEMBER_LIMIT = 16 * 1024 * 1024
-SECRET_FILES = ('compose.env', 'github-token', 'sandbox_ed25519', 'sandbox_ed25519.pub')
+SECRET_NAMES = {
+    'postgres-password': 'POSTGRES_PASSWORD', 'better-auth-secret': 'BETTER_AUTH_SECRET',
+    'paperclip-agent-jwt-secret': 'PAPERCLIP_AGENT_JWT_SECRET',
+    'paperclip-tool-action-signing-secret': 'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET',
+    'paperclip-secrets-master-key': 'PAPERCLIP_SECRETS_MASTER_KEY',
+    'hermes-gateway-key': 'API_SERVER_KEY',
+    'hermes-dashboard-basic-auth-password': 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD',
+    'hermes-dashboard-basic-auth-secret': 'HERMES_DASHBOARD_BASIC_AUTH_SECRET',
+    'openai-api-key': 'OPENAI_API_KEY',
+}
+SECRET_FILES = ('compose.env', 'github-token', 'sandbox_ed25519', 'sandbox_ed25519.pub', *SECRET_NAMES)
 PAYLOADS = {'config.tar', 'database.dump', 'hermes.zip',
             *(name + '.tar' for name in VOLUMES)}
 PYTHON = '/opt/hermes/.venv/bin/python'
@@ -146,6 +157,15 @@ def parser():
     backup.add_argument('--project', type=project, default='paperclip-hermes')
     backup.add_argument('--work-dir', type=Path, default=Path('/var/tmp'),
                         help='Staging parent; use a host encrypted filesystem with sufficient space')
+    backup.add_argument('--canary', action='store_true')
+    backup.add_argument('--reason', choices=['nightly', 'pre-stop', 'pre-upgrade', 'canary', 'final'], default='nightly')
+    backup.add_argument('--target')
+    backup.add_argument('--vm-id')
+    backup.add_argument('--stop-operation-id')
+    point = commands.add_parser('rollback-point')
+    point.add_argument('action', choices=['create', 'restore'])
+    point.add_argument('--path', type=Path, required=True)
+    point.add_argument('--project', type=project, default='paperclip-hermes')
     restore = commands.add_parser('restore', help='Restore into an empty kit directory and new volumes')
     restore.add_argument('--fenced', action='store_true', required=True,
                          help='Confirm the old host/scheduler cannot run, including after reboot')
@@ -156,25 +176,54 @@ def parser():
     restore.add_argument('--project', type=project, default='paperclip-hermes')
     restore.add_argument('--hostname', help='Destination MagicDNS FQDN; other secret values are preserved')
     restore.add_argument('--work-dir', type=Path, default=Path('/var/tmp'))
+    restore.add_argument('--verify-only', action='store_true')
+    restore.add_argument('--staged', action='store_true', help='Require an ephemeral identity in /run; destroy it afterwards')
     return result
 
 
 def sas_url(value):
-    # A stored policy's effective permissions cannot be queried with this SAS.
-    # Require its identifier, and reject any explicit permissions beyond cw.
+    # User delegation only. Shared Key is never a fallback. Duplicate fields
+    # are ambiguous and the key expiry bounds both the grant and the SAS.
     try:
         url = urlsplit(value)
         query = parse_qs(url.query, keep_blank_values=True, strict_parsing=True)
-        if (url.scheme != 'https' or not url.hostname or url.username or url.password
+        now = datetime.now(timezone.utc)
+        def when(name):
+            value = query[name][0]
+            if not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?(?:Z|\+00:00)', value):
+                fail('Invalid container SAS timestamp')
+            return datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if (url.scheme != 'https' or not url.hostname
+                or not re.fullmatch(r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', url.hostname)
+                or url.username or url.password
                 or url.port not in (None, 443) or url.fragment
                 or not re.fullmatch(r'/[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', url.path)
+                or '--' in url.path
                 or any(len(values) != 1 for values in query.values())
-                or query.get('sr') != ['c'] or not query.get('si', [''])[0]
-                or not query.get('sig', [''])[0] or query.get('spr') != ['https']
-                or ('sp' in query and query['sp'][0] not in ('cw', 'wc'))):
-            fail('Invalid container SAS settings; require HTTPS, stored policy, and Create/Write only')
+                or query.get('sr') != ['c'] or query.get('sp') != ['cw']
+                or any(name in query for name in ('si', 'ss', 'srt'))
+                or any(not query.get(name, [''])[0] for name in
+                       ('sig', 'sv', 'skoid', 'sktid', 'skt', 'ske', 'sks', 'skv', 'se'))
+                or query.get('sks') != ['b'] or query.get('spr') != ['https']
+                or not now < when('ske') <= now + timedelta(days=7)
+                or not now < when('se') <= when('ske')
+                or when('se') - (when('st') if 'st' in query else now) > timedelta(days=7)
+                or ('st' in query and when('st') > now)
+                or when('skt') > now or when('ske') - when('skt') > timedelta(days=7)):
+            fail('Invalid container SAS settings; require a write-only user-delegation SAS, at most 7 days')
+        for name in ('skoid', 'sktid'):
+            if not re.fullmatch(r'[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}', query[name][0]):
+                fail('Invalid container SAS identity')
+        # Support the version used by the pinned uploader. Unknown service
+        # versions need explicit qualification before replacing a working grant.
+        if any(query[name][0] != '2023-11-03' for name in ('sv', 'skv')):
+            fail('Unsupported container SAS version; require 2023-11-03')
+        if set(query) - {'sv', 'sr', 'sp', 'spr', 'sig', 'skoid', 'sktid', 'skt', 'ske', 'sks', 'skv', 'se', 'st'}:
+            fail('Unsupported container SAS fields')
+        if len(base64.b64decode(query['sig'][0], validate=True)) != 32:
+            fail('Invalid container SAS signature')
         return url
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, KeyError, OverflowError):
         raise RecoveryError('Invalid container SAS settings') from None
 
 
@@ -213,7 +262,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def upload(container, archive, name):
+def upload(container, archive, name, metadata=None):
     # PUT only, no list/read/delete or redirects. Transient failures are retried
     # with backoff; a retried conditional request that finds the blob present
     # may mean the earlier attempt succeeded unseen, so it fails as uncertain.
@@ -238,6 +287,8 @@ def upload(container, archive, name):
                 try:
                     with opener.open(request, timeout=300) as response:
                         status = response.status
+                        result.update(version=response.headers.get('x-ms-version-id', ''),
+                                      etag=response.headers.get('ETag', ''))
                 except urllib.error.HTTPError as error:
                     status = error.code
                 except (OSError, http.client.HTTPException):
@@ -254,10 +305,12 @@ def upload(container, archive, name):
                     fail('Backup upload failed (expected HTTP 201)')
             fail('Backup upload failed after retries')
 
+        meta = {'x-ms-meta-' + key: str(value) for key, value in (metadata or {}).items()}
+        result = {}
         with archive.open('rb') as stream:
             if size <= SINGLE_PUT_LIMIT:
                 put(url, stream, size, {'x-ms-blob-type': 'BlockBlob',
-                    'Content-Type': 'application/octet-stream', 'If-None-Match': '*'})
+                    'Content-Type': 'application/octet-stream', 'If-None-Match': '*', **meta})
             else:
                 blocks = []
                 while data := stream.read(BLOCK_SIZE):
@@ -270,12 +323,26 @@ def upload(container, archive, name):
                         '</BlockList>').encode()
                 put(url + '&comp=blocklist', body, len(body),
                     {'Content-Type': 'application/xml', 'x-ms-blob-content-type': 'application/octet-stream',
-                     'If-None-Match': '*'})
+                     'If-None-Match': '*', **meta})
+        return result
     except RecoveryError:
         raise
     except Exception:
         # HTTPError/URLError can contain the signed URL. Never stringify them.
         raise RecoveryError('Backup upload failed; no backup was published successfully') from None
+
+
+def restart_services(compose, services):
+    # Compose 2.38 (the CI runner) has no `start --wait`. Use the loaded
+    # project model and health wait without replacing containers or images.
+    if not services:
+        return
+    try:
+        compose('up', '-d', '--no-recreate', '--no-build', '--pull', 'never',
+                '--no-deps', '--wait', '--wait-timeout', '300', *services)
+    except BaseException:
+        print('ops-alert: service restart failed', file=sys.stderr)
+        raise
 
 
 def sync_directory(path):
@@ -333,11 +400,17 @@ def publish_local(archive, destination, name):
         raise
 
 
-def run(args, *, cwd=KIT, output=None, input_file=None):
+def run(args, *, cwd=KIT, output=None, input_file=None, pass_fds=(), env=None):
     # Capture output privately rather than leaking config, archive filenames or
     # application/provider diagnostics into journald. No secret in args either.
     kwargs = {'cwd': cwd, 'stdout': output if output is not None else subprocess.PIPE,
-              'stderr': subprocess.PIPE, 'stdin': input_file or subprocess.DEVNULL}
+              'stderr': subprocess.PIPE, 'stdin': input_file or subprocess.DEVNULL, 'pass_fds': pass_fds}
+    if env is not None:
+        kwargs['env'] = env
+    if str(args[0]) == 'git':
+        # Host operations always name the intended checkout explicitly. Inherited
+        # Git context must not redirect its repository, index or configuration.
+        kwargs['env'] = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
     try:
         result = subprocess.run([str(arg) for arg in args], check=False, **kwargs)
     except OSError:
@@ -352,13 +425,41 @@ class Compose:
         self.kit = kit
         self.name = name
         self.files = []
+        self.image_tag = kit_image_tag(kit)
+        env = kit / '.secrets/compose.env'
+        profiles = 'paperclip,hermes'
+        if env.exists():
+            for line in env.read_text().splitlines():
+                if line.startswith('COMPOSE_PROFILES='):
+                    profiles = line.split('=', 1)[1]
+        if not profiles or not set(profiles.split(',')) <= {'paperclip', 'hermes'}:
+            fail('Select paperclip, hermes or both profiles')
+        self.profiles = [item for profile in profiles.split(',') for item in ('--profile', profile)]
 
     def __call__(self, *args, **kwargs):
         return run(['docker', 'compose', '--project-name', self.name,
-                    '--env-file', '.secrets/compose.env', *self.files, *args], cwd=self.kit, **kwargs)
+                    '--env-file', '.secrets/compose.env', *self.profiles, *self.files, *args], cwd=self.kit,
+                   env={**os.environ, 'KIT_IMAGE_TAG': self.image_tag}, **kwargs)
+
+    def services(self):
+        return self('config', '--services').split()
+
+    def preserve_build_images(self):
+        # An older upgrader or manual Compose invocation may have used a
+        # fallback tag. Preserve the actual installed build before a candidate
+        # can retag anything, including when every service is stopped.
+        for service in self.services():
+            if service in ('hermes', 'sandbox'):
+                image = run(['docker', 'inspect', '--format', '{{.Image}}', self.container(service)]).strip()
+                run(['docker', 'image', 'tag', image, 'software-factory-' + service + ':' + self.image_tag])
 
     def container(self, service):
-        ids = self('ps', '--all', '--quiet', service).split()
+        # Compose ps can include a run container left by a killed client.
+        # Identify the persistent service independently of those one-offs.
+        ids = run(['docker', 'container', 'ls', '--all', '--quiet', '--filter',
+                   'label=com.docker.compose.project=' + self.name, '--filter',
+                   'label=com.docker.compose.service=' + service, '--filter',
+                   'label=com.docker.compose.oneoff=False']).split()
         if len(ids) != 1:
             fail('Expected exactly one container for ' + service)
         return ids[0]
@@ -372,7 +473,7 @@ class Compose:
 
     def require_host_only(self, path):
         path = path.resolve()
-        for service in ('postgres', *SERVICES):
+        for service in self.services():
             raw = run(['docker', 'inspect', '--format', '{{json .Mounts}}', self.container(service)])
             for mount in json.loads(raw):
                 if mount.get('Source'):
@@ -382,7 +483,7 @@ class Compose:
 
     def images(self):
         images = {}
-        for service in ('postgres', *SERVICES):
+        for service in self.services():
             image_id = run(['docker', 'inspect', '--format', '{{.Image}}', self.container(service)]).strip()
             raw = run(['docker', 'image', 'inspect', '--format', '{{json .RepoDigests}}', image_id])
             images[service] = {'image_id': image_id, 'repo_digests': json.loads(raw) or []}
@@ -404,7 +505,9 @@ class Compose:
     def hermes(self, stage, *args):
         # Bypass s6/the gateway completely. Only a one-shot CLI owns the stopped
         # home; neither backup nor import can start the application entrypoint.
-        return self('run', '--rm', '--no-deps', '-T', '--user', '10000:10000',
+        labels = (['--label', 'org.software-factory.recovery-run=' + self.recovery_run]
+                  if hasattr(self, 'recovery_run') else [])
+        return self('run', '--rm', '--no-deps', '-T', *labels, '--user', '10000:10000',
                     '--volume', str(stage) + ':/recovery',
                     '--env', 'HERMES_HOME=/opt/data', '--env', 'HOME=/opt/data',
                     '--entrypoint', PYTHON, 'hermes', '/kit/recovery-hermes.py', *args)
@@ -437,18 +540,44 @@ def image_pins(kit):
     return sorted(set(re.findall(r'[A-Za-z0-9][A-Za-z0-9._/:+-]*@sha256:[a-f0-9]{64}', text)))
 
 
-def kit_commit():
+def kit_image_tag(kit):
+    # Independent of the project name, checkout location and copied secrets.
+    # The commit also separates identical code rebuilt for distinct releases.
+    # Candidate builds cannot retag the previous kit's local images.
+    files = {name: digest(path) for name, path in kit_files(kit, CODE).items()}
+    return hashlib.sha256(json.dumps({'commit': kit_commit(kit), 'files': files}, sort_keys=True).encode()).hexdigest()
+
+
+def installed_provenance(kit=None):
+    kit = kit or KIT
+    path = kit / '.kit-provenance.json'
+    if not path.exists():
+        return None
+    record = json.loads(read_private(path))
+    files = {name: digest(path) for name, path in kit_files(kit, CODE).items()}
+    return record, files != record['files']
+
+
+def kit_commit(kit=None):
     # The commit restore must check out. Git refuses a checkout root does not
     # own (safe.directory) rather than run its hooks or config: then 'unknown',
     # and the operator's pilot log is the record.
+    kit = kit or KIT
+    provenance = installed_provenance(kit)
+    if provenance is not None:
+        record, modified = provenance
+        return 'unknown' if modified else commit_label(record['kit_commit'])
     try:
-        value = run(['git', '-C', KIT, 'rev-parse', '--verify', 'HEAD']).strip()
+        value = run(['git', '-C', kit, 'rev-parse', '--verify', 'HEAD']).strip()
     except RecoveryError:
         return 'unknown'
     return commit_label(value)
 
 
 def kit_modified():
+    provenance = installed_provenance()
+    if provenance is not None:
+        return provenance[1]
     # Local edits to compared files make a later restore from the recorded
     # commit refuse, so record them.
     try:
@@ -480,10 +609,23 @@ def utc():
     return datetime.now(timezone.utc).isoformat()
 
 
+def validate_staging_parent(parent):
+    # A private child is insufficient if another uid can rename it through a
+    # writable parent. Standard root-owned sticky /tmp and /var/tmp are safe.
+    parent = Path(parent).resolve(strict=True)
+    for directory in (parent, *parent.parents):
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            fail('Staging ancestors must be root-owned and protected against renames')
+    return parent
+
+
 @contextmanager
 def staging(parent):
     # A root-only tree on host storage. Nothing below it is mounted into an
     # application; only the one-shot Hermes CLI sees its own uid-owned subdir.
+    parent = validate_staging_parent(parent)
     with tempfile.TemporaryDirectory(prefix='paperclip-hermes-recovery-', dir=parent) as directory:
         os.chmod(directory, 0o700)
         try:
@@ -529,6 +671,7 @@ def purge(stage, keep=()):
 def clear_stale(parent):
     # Called under the lock: a root-owned staging tree is a remnant of a run
     # that could not clean up (SIGKILL, power loss). Other owners' are not ours.
+    parent = validate_staging_parent(parent)
     for path in parent.glob('paperclip-hermes-recovery-*'):
         info = path.lstat()
         if stat.S_ISDIR(info.st_mode) and info.st_uid == 0:
@@ -544,14 +687,14 @@ def locked():
     with suppress(FileExistsError):
         LOCK_DIR.mkdir(mode=0o700)
     private_directory(LOCK_DIR)
-    descriptor = os.open(LOCK_DIR / 'recovery.lock',
+    descriptor = os.open(LOCK_DIR / 'op.lock',
                          os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RecoveryError('Another backup or restore is running') from None
-        yield None
+            raise RecoveryError('Another host operation is running') from None
+        yield descriptor
     finally:
         os.close(descriptor)
 
@@ -568,7 +711,12 @@ def validate_config(kit):
     finally:
         os.chdir(previous)
     private_directory(kit / '.secrets')
-    for name in SECRET_FILES[:-1]:
+    profiles = Compose(kit, 'paperclip-hermes').profiles
+    for name in SECRET_FILES:
+        if name == 'openai-api-key' and 'hermes' not in profiles:
+            continue
+        if name.endswith('.pub'):
+            continue
         private_file(kit / '.secrets' / name)
 
 
@@ -587,22 +735,73 @@ def config_backup(stage):
 def wait_stack(compose):
     # Persistent timers can fire while the daemon is still restoring containers.
     # Wait for existing services; never start a deliberately stopped project.
+    expected = set(compose.services())
     for attempt in range(61):
         running = compose('ps', '--services', '--status', 'running').split()
-        if set(running) == {'postgres', *SERVICES}:
+        if set(running) == expected:
             healthy = [run(['docker', 'inspect', '--format', '{{.State.Health.Status}}',
                             compose.container(service)]).strip() == 'healthy'
-                       for service in ('postgres', *SERVICES)]
+                       for service in sorted(expected)]
             if all(healthy):
                 return running
         if attempt < 60:
             time.sleep(5)
-    missing = sorted({'postgres', *SERVICES} - set(running))
-    fail('Backup requires all five existing services healthy within five minutes'
+    missing = sorted(expected - set(running))
+    fail('Backup requires every selected existing service healthy within five minutes'
          + ('; not running: ' + ', '.join(missing) if missing else '; some are not healthy'))
 
 
+def service_operation(args, compose, running=None, stage=None):
+    if not getattr(args, '_track_service_operation', False):
+        return
+    record = {'protocol': 1, 'operation': args.command, 'phase': 'running',
+              'run_id': uuid.uuid4().hex, 'kit_commit': kit_commit(),
+              'kit_path': str(compose.kit.resolve()), 'project': compose.name,
+              'previous_running': running or [],
+              'containers': {name: compose.container(name) for name in (running or [])},
+              'stage': str(stage) if stage is not None else None}
+    atomic_json(STATE_DIR / 'service-op.json', record)
+    args._service_operation = record
+    compose.recovery_run = record['run_id']
+
+
+def finish_service_operation(args):
+    record = getattr(args, '_service_operation', None)
+    if record is not None:
+        atomic_json(STATE_DIR / 'service-op.json', {**record, 'phase': 'complete'})
+
+
+def require_no_service_operation():
+    path = STATE_DIR / 'service-op.json'
+    if path.exists() and json.loads(read_private(path)).get('phase') != 'complete':
+        fail('Recover the interrupted backup/restore before another operation')
+
+
+def require_resolved_upgrade():
+    path = STATE_DIR / 'last-op.json'
+    if path.exists():
+        record = json.loads(read_private(path))
+        if record.get('operation') == 'upgrade' and record.get('phase') not in ('complete', 'rolled-back', 'prepare-failed'):
+            fail('Recover the unresolved upgrade before taking a backup')
+
+
 def backup(args):
+    require_resolved_upgrade()
+    args._restart_services = None
+    try:
+        return data_backup(args)
+    except BaseException:
+        # Only a pre-stop backup that actually reached writer shutdown needs
+        # this restart. Invalid credentials/arguments must not start a stack.
+        if args._restart_services is not None:
+            compose, writers = args._restart_services
+            with deferred_signals():
+                restart_services(compose, writers)
+            finish_service_operation(args)
+        raise
+
+
+def data_backup(args):
     if args.local_dir:
         if not args.recipient:
             fail('--local-dir requires --recipient')
@@ -615,6 +814,27 @@ def backup(args):
         if args.recipient:
             fail('--recipient is only for --local-dir; configure the host settings file')
         public_key, container = backup_settings(args.env_file, KIT)
+    config = {}
+    host_config = BACKUP_ENV_FILE.parent / 'config.json'
+    if container and host_config.exists():
+        config = json.loads(read_private(host_config))
+    args.target = getattr(args, 'target', None) or config.get('target') or ('local' if not container else None)
+    args.vm_id = getattr(args, 'vm_id', None) or config.get('vm_id') or ('local' if not container else None)
+    if not args.target or not args.vm_id:
+        fail('Off-site backup requires target and VM identity, from arguments or host config.json')
+    for value in (args.target, args.vm_id):
+        if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_./:-]{1,512}', value):
+            fail('Invalid backup target or VM identity')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,255}', args.target):
+        fail('Invalid backup target name')
+    reason = 'canary' if getattr(args, 'canary', False) else getattr(args, 'reason', 'nightly')
+    if reason in ('pre-stop', 'final') and not getattr(args, 'stop_operation_id', None):
+        fail('Pre-stop/final backups require --stop-operation-id')
+    stop_id = getattr(args, 'stop_operation_id', None)
+    if stop_id is not None and not re.fullmatch(r'[A-Za-z0-9_-]{1,255}', stop_id):
+        fail('Invalid stop operation identity')
+    if reason == 'canary':
+        return canary(args, public_key, container)
     validate_config(KIT)
     compose = Compose(KIT, args.project)
     if container:
@@ -631,20 +851,31 @@ def backup(args):
         # failure; a partial stop also takes this path. A restart error fails.
         # On an error or signal, staged plaintext is deleted before the restart.
         try:
-            compose('stop', '--timeout', '90', *SERVICES)
-            schema = schema_state(compose)
+            service_operation(args, compose, running, stage)
+            if reason in ('pre-stop', 'final'):
+                args._restart_services = (compose, [s for s in SERVICES if s in running])
+            compose('stop', '--timeout', '90', *(s for s in SERVICES if s in running))
+            schema = schema_state(compose) if 'postgres' in running else {}
             with open(stage / 'database.dump', 'wb') as stream:
-                compose('exec', '-T', 'postgres', 'pg_dump', '-U', 'paperclip', '-d', 'paperclip',
-                        '--format=custom', '--no-owner', '--no-acl', output=stream)
+                if 'postgres' in running:
+                    compose('exec', '-T', 'postgres', 'pg_dump', '-U', 'paperclip', '-d', 'paperclip',
+                            '--format=custom', '--no-owner', '--no-acl', output=stream)
             config_backup(stage)
             for name, (service, destination) in VOLUMES.items():
+                if service not in running:
+                    with tarfile.open(stage / (name + '.tar'), 'w'):
+                        pass
+                    continue
                 run(['tar', '--numeric-owner', '--acls', '--xattrs', '-cf', stage / (name + '.tar'),
                      '-C', compose.mount(service, destination), '.'])
             hermes_stage = stage / 'hermes-cli'
             hermes_stage.mkdir(mode=0o700)
             os.chown(hermes_stage, 10000, 10000)
-            compose.hermes(hermes_stage, 'backup', '--output', '/recovery/hermes.zip', '--keep', '0')
-            shutil.move(hermes_stage / 'hermes.zip', stage / 'hermes.zip')
+            if 'hermes' in running:
+                compose.hermes(hermes_stage, 'backup', '--output', '/recovery/hermes.zip', '--keep', '0')
+                shutil.move(hermes_stage / 'hermes.zip', stage / 'hermes.zip')
+            else:
+                (stage / 'hermes.zip').touch()
             record = manifest(stage, compose.images(), schema, args.project, started)
             (stage / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')
         except BaseException:
@@ -660,8 +891,10 @@ def backup(args):
         finally:
             # A stop signal during the restart waits until it ends, so the
             # services this job stopped always come back.
-            with deferred_signals():
-                compose('start', '--wait', '--wait-timeout', '300', *(service for service in SERVICES if service in running))
+            if reason not in ('pre-stop', 'final'):
+                with deferred_signals():
+                    restart_services(compose, [service for service in SERVICES if service in running])
+                    finish_service_operation(args)
         # No plaintext aggregate archive is written: stream tar directly to age.
         with open(stage / 'backup.age', 'xb') as encrypted:
             process = subprocess.Popen(['age', '--encrypt', '--recipient', public_key],
@@ -680,11 +913,92 @@ def backup(args):
                 process.wait()
                 raise
         name = 'paperclip-hermes-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex + '.tar.age'
-        if container:
-            upload(container, stage / 'backup.age', name)
-        else:
-            publish_local(stage / 'backup.age', args.local_dir, name)
-        print('Backup published: ' + name)
+        receipt = publish_backup(args, public_key, container, stage / 'backup.age', name, record)
+        if reason in ('pre-stop', 'final'):
+            compose('stop', '--timeout', '90', *(s for s in SERVICES if s in running))
+        finish_service_operation(args)
+        print('Backup published: ' + receipt['blob'])
+
+
+def durable_private_directory(path):
+    missing = []
+    for directory in (path, *path.parents):
+        if directory.exists():
+            break
+        missing.append(directory)
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+        sync_directory(directory.parent)
+    private_directory(path)
+    # Also covers retry after a previous mkdir's parent fsync failed.
+    for directory in (path, *path.parents):
+        sync_directory(directory)
+
+
+def atomic_json(path, record):
+    durable_private_directory(path.parent)
+    descriptor, name = tempfile.mkstemp(prefix='.status-', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w') as stream:
+            json.dump(record, stream, separators=(',', ':'))
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+        sync_directory(path.parent)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+STATE_DIR = Path('/data/paperclip-hermes')
+
+
+def publish_backup(args, public_key, container, archive, name, record=None):
+    reason = 'canary' if getattr(args, 'canary', False) else getattr(args, 'reason', 'nightly')
+    schema = (record or {}).get('paperclip_schema', {})
+    pins = image_pins(KIT)
+    # Full inventories stay in the encrypted manifest. Metadata and the public
+    # receipt contain bounded identifiers, comfortably below Azure's 8 KiB cap.
+    compact_digest = lambda value: hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    metadata = {
+        'kit_commit': kit_commit(), 'image_digests': compact_digest(pins),
+        'image_count': len(pins), 'schema': compact_digest(schema),
+        'schema_count': len(schema.get('applied', [])),
+        'recipient_fp': hashlib.sha256(public_key.encode()).hexdigest(),
+        'target': getattr(args, 'target', 'local'), 'vm_id': getattr(args, 'vm_id', 'local'),
+        'backup_id': uuid.uuid4().hex, 'completed_at': utc(), 'reason': reason,
+    }
+    if reason in ('pre-stop', 'final'):
+        metadata.update(pre_stop='true', stop_operation_id=args.stop_operation_id)
+    receipt = {**metadata, 'blob': 'backups/' + name, 'sha256': digest(archive),
+               'size': archive.stat().st_size, 'success': True, 'data_backup': reason != 'canary'}
+    if container:
+        receipt.update(upload(container, archive, receipt['blob'], metadata) or {})
+        receipt['completed_at'] = utc()
+        # The receipt is an independent unique object, accessible without the VM.
+        with tempfile.TemporaryDirectory(dir=archive.parent) as directory:
+            path = Path(directory) / 'receipt.json'
+            path.write_text(json.dumps(receipt) + '\n')
+            upload(container, path, 'receipts/' + quote(metadata['target'], safe='') + '/' + metadata['backup_id'] + '.json')
+    else:
+        publish_local(archive, args.local_dir, name)
+    atomic_json(STATE_DIR / ('last-canary.json' if reason == 'canary' else 'last-backup.json'), receipt)
+    return receipt
+
+
+def canary(args, public_key, container):
+    # Credential proof only: no application stop and no data-backup clock reset.
+    if container is None:
+        fail('Canary requires an off-site upload credential')
+    args.canary = True
+    with staging(args.work_dir) as stage:
+        archive = stage / 'canary.age'
+        with archive.open('wb') as encrypted:
+            run(['age', '--encrypt', '--recipient', public_key], output=encrypted)
+        receipt = publish_backup(args, public_key, container, archive, 'canary-' + uuid.uuid4().hex + '.age')
+    print('Canary published: ' + receipt['blob'])
+    return receipt
 
 
 def unpack_bundle(bundle, stage):
@@ -706,12 +1020,19 @@ def unpack_bundle(bundle, stage):
     if (not isinstance(record, dict) or record.get('format') != 1
             or not isinstance(record.get('files'), dict) or set(record['files']) != PAYLOADS
             or not isinstance(record.get('images'), dict)
-            or set(record['images']) != {'postgres', *SERVICES}
+            or not set(record['images']) <= {'postgres', *SERVICES}
+            or not record['images']
             or not isinstance(record.get('paperclip_schema'), dict)
-            or not record['paperclip_schema'].get('applied')
+            or ('postgres' in record['images'] and not record['paperclip_schema'].get('applied'))
             or not all(isinstance(record.get(key), str) and UTC_TIME.fullmatch(record[key])
                        for key in ('started_at', 'completed_at'))):
         fail('Unsupported or incomplete recovery manifest')
+    try:
+        started, completed = (datetime.fromisoformat(record[key]) for key in ('started_at', 'completed_at'))
+        if completed < started:
+            fail('Recovery manifest timestamps are reversed')
+    except ValueError:
+        raise RecoveryError('Invalid recovery manifest timestamp') from None
     if any(digest(stage / name) != record['files'][name] for name in PAYLOADS):
         fail('Recovery payload checksum mismatch')
     return record
@@ -786,6 +1107,12 @@ def restore_config(archive, destination, commit='unknown', modified=False):
     if any(value is None for value in secrets.values()):
         fail('Configuration archive lacks the kit secrets')
     install_kit(destination)
+    # Provenance comes from the trusted restore code's checkout, never the
+    # untrusted archive's claimed commit. Hashes detect later local code edits.
+    write_private(destination / '.kit-provenance.json', json.dumps({
+        'kit_commit': kit_commit(),
+        'files': {name: digest(path) for name, path in kit_files(destination, CODE).items()},
+    }).encode(), 0o600)
     (destination / '.secrets').mkdir(mode=0o700)
     os.chmod(destination / '.secrets', 0o700)
     for name, data in secrets.items():
@@ -874,6 +1201,16 @@ def restore(args):
     if not args.fenced:
         fail('Restore requires --fenced before any operation')
     private_file(args.identity)
+    if getattr(args, 'verify_only', False):
+        work = args.work_dir.resolve()
+        if work == KIT or KIT in work.parents:
+            fail('Verification staging must be outside the kit')
+        with staging(work) as stage:
+            with (stage / 'bundle.tar').open('xb') as stream:
+                run(['age', '--decrypt', '--identity', args.identity.resolve(), args.archive.resolve()], output=stream)
+            unpack_bundle(stage / 'bundle.tar', stage)
+            print('Verified recovery bundle hashes and manifest')
+        return
     # Check labels, including stopped containers and orphan volumes, before any
     # overwrite. Never restore into a project which has previous durable state.
     for kind, extra in (('container', ['--all']), ('volume', []), ('network', [])):
@@ -905,6 +1242,11 @@ def restore(args):
             env_file = target / '.secrets/compose.env'
             env_file.write_text(restored_settings(env_file.read_text(), args.hostname))
             validate_config(target)
+            # The destination was empty when the first Compose object was
+            # constructed. Load the restored profile selection before create.
+            compose = Compose(target, args.project)
+            if set(compose.services()) != set(record['images']):
+                fail('Restored profile selection differs from the backup')
             # A prepared host's mount marker belongs to this host, never the backup.
             if (KIT / '.secrets/bootstrap-mount').exists():
                 shutil.copyfile(KIT / '.secrets/bootstrap-mount', target / '.secrets/bootstrap-mount')
@@ -931,14 +1273,26 @@ def restore(args):
                 empty_target(target)
             raise
         home = None
+        installed = set(record['images'])
         try:
+            service_operation(args, compose, stage=stage)
+            intent = getattr(args, '_service_operation', None)
+            if intent is not None:
+                # Generation label survives the ephemeral volume override.
+                override_config = json.loads(override.read_text())
+                for item in override_config['services'].values():
+                    item['labels'] = {'org.software-factory.recovery-run': intent['run_id']}
+                override.write_text(json.dumps(override_config))
             compose('create', '--build')
             # The policy is this kit's; defence in depth: check it against the
             # validator's own safety baseline with the pinned image's YAML
             # parser before any service reads it.
-            compose('run', '--rm', '--no-deps', '-T', '--entrypoint', PYTHON, 'hermes',
-                    '/kit/validate-hermes-config.py', '/kit-config.yaml')
+            if 'hermes' in installed:
+                compose('run', '--rm', '--no-deps', '-T', '--entrypoint', PYTHON, 'hermes',
+                        '/kit/validate-hermes-config.py', '/kit-config.yaml')
             for name, (service, destination) in VOLUMES.items():
+                if service not in installed:
+                    continue
                 volume = compose.mount(service, destination)
                 if any(volume.iterdir()):
                     fail('Restore refuses a nonempty destination volume')
@@ -946,36 +1300,42 @@ def restore(args):
                      '--numeric-owner', '--same-owner', '--acls', '--xattrs'])
             # Start only the DB while restoring. No application scheduler exists
             # in any one-shot container: entrypoint is explicitly overridden.
-            compose('up', '-d', '--no-deps', '--wait', '--wait-timeout', '180', 'postgres')
-            with open(stage / 'database.dump', 'rb') as stream:
-                compose('exec', '-T', 'postgres', 'pg_restore', '--exit-on-error', '--single-transaction',
-                        '--no-owner', '--no-acl', '-U', 'paperclip', '-d', 'paperclip', input_file=stream)
-            if schema_state(compose) != record['paperclip_schema']:
-                fail('Restored migration journal differs from the backup')
-            hermes_stage = stage / 'hermes-cli'
-            hermes_stage.mkdir(mode=0o700)
-            shutil.copyfile(stage / 'hermes.zip', hermes_stage / 'hermes.zip')
-            os.chown(hermes_stage, 10000, 10000)
-            os.chown(hermes_stage / 'hermes.zip', 10000, 10000)
-            # A nocopy volume root is root:root 0755; give the home to the
-            # Hermes user as the upstream s6 entrypoint would before import.
-            home = compose.mount('hermes', '/opt/data')
-            os.chown(home, 10000, 10000)
-            os.chmod(home, 0o700)
-            # Seed the kit policy before --keep-host merges the portable state.
-            compose('run', '--rm', '--no-deps', '-T', '--entrypoint', PYTHON, 'hermes', '/kit/configure-hermes.py')
-            try:
-                compose.hermes(hermes_stage, 'import', '/recovery/hermes.zip', '--force', '--keep-host', '--messaging-off')
-            finally:
-                # On a signal the import may still be running in its one-off
-                # container; the failure path removes it and repeats this.
-                remove_import_undo(home)
+            if 'postgres' in installed:
+                compose('up', '-d', '--no-deps', '--wait', '--wait-timeout', '180', 'postgres')
+                # Commit restore statements separately to bound schema locks.
+                # Applications start only after a successful, checked restore.
+                with open(stage / 'database.dump', 'rb') as stream:
+                    compose('exec', '-T', 'postgres', 'pg_restore', '--exit-on-error',
+                            '--no-owner', '--no-acl', '-U', 'paperclip', '-d', 'paperclip', input_file=stream)
+                if schema_state(compose) != record['paperclip_schema']:
+                    fail('Restored migration journal differs from the backup')
+            if 'hermes' in installed:
+                hermes_stage = stage / 'hermes-cli'
+                hermes_stage.mkdir(mode=0o700)
+                shutil.copyfile(stage / 'hermes.zip', hermes_stage / 'hermes.zip')
+                os.chown(hermes_stage, 10000, 10000)
+                os.chown(hermes_stage / 'hermes.zip', 10000, 10000)
+                # A nocopy volume root is root:root 0755; give the home to the
+                # Hermes user as the upstream s6 entrypoint would before import.
+                home = compose.mount('hermes', '/opt/data')
+                os.chown(home, 10000, 10000)
+                os.chmod(home, 0o700)
+                # Seed the kit policy before --keep-host merges the portable state.
+                compose('run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', 'hermes',
+                        '-ec', '. /kit/hermes-secrets.sh; exec ' + PYTHON + ' /kit/configure-hermes.py')
+                try:
+                    compose.hermes(hermes_stage, 'import', '/recovery/hermes.zip', '--force', '--keep-host', '--messaging-off')
+                finally:
+                    # On a signal the import may still be running in its one-off
+                    # container; the failure path removes it and repeats this.
+                    remove_import_undo(home)
             # The root config.yaml is rewritten from this kit's policy on every
             # start (configure-hermes.py), as on the original host: no archive
             # setting reaches it. KIT_MESSAGING_OFF (restored_settings) makes
             # every start switch off each messaging platform in the root and
             # every profile, whatever credential the restored home holds.
             compose('up', '-d', '--wait', '--wait-timeout', '300')
+            finish_service_operation(args)
         except BaseException:
             hold_signals()
             # abandon() still runs compose with the override file, which
@@ -995,7 +1355,7 @@ def restore(args):
                 if home is not None:
                     remove_import_undo(home)
             raise
-        # Nothing below can fail: the manifest was checked by unpack_bundle.
+        # The manifest was checked before applications started.
         print('Restore complete; messaging is off until you remove KIT_MESSAGING_OFF. '
               'Recovery point: ' + record['completed_at'])
         print('Reauthenticate OAuth logins and reconcile in-flight run IDs before submitting work.')
@@ -1016,10 +1376,46 @@ def main(argv=None):
     for number in SIGNALS:
         signal.signal(number, interrupted)
     with locked():
-        if args.command == 'backup':
-            backup(args)
-        else:
-            restore(args)
+        if args.command in ('backup', 'restore'):
+            require_no_service_operation()
+            if args.command == 'backup':
+                require_resolved_upgrade()
+            args._track_service_operation = True
+            status = {'protocol': 1, 'operation': args.command, 'phase': 'running', 'started_at': utc()}
+            old = STATE_DIR / 'last-op.json'
+            prior = json.loads(read_private(old)) if old.exists() else {}
+            preserve = prior.get('operation') == 'upgrade' and prior.get('phase') not in ('complete', 'rolled-back', 'prepare-failed')
+            if not preserve:
+                atomic_json(old, status)
+            try:
+                if args.command == 'backup':
+                    backup(args)
+                else:
+                    if args.staged and Path('/run') not in args.identity.resolve().parents:
+                        fail('Staged restore identity must be in /run')
+                    try:
+                        restore(args)
+                    finally:
+                        if args.staged:
+                            args.identity.unlink(missing_ok=True)
+                status['phase'] = 'complete'
+            except BaseException:
+                status['phase'] = 'failed'
+                raise
+            finally:
+                if not preserve:
+                    atomic_json(old, {**status, 'completed_at': utc()})
+        elif args.command == 'rollback-point':
+            require_no_service_operation()
+            prior_path = STATE_DIR / 'last-op.json'
+            prior = json.loads(read_private(prior_path)) if prior_path.exists() else {}
+            if prior.get('operation') == 'upgrade' and prior.get('phase') not in ('complete', 'rolled-back', 'prepare-failed'):
+                fail('Recover the interrupted upgrade before standalone rollback-point actions')
+            spec = importlib.util.spec_from_file_location('kit_control', KIT / 'kit-control.py')
+            control = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(control)
+            control.r.RecoveryError = RecoveryError
+            control.rollback_point(args.action, args.path, Compose(KIT, args.project))
 
 
 GENERIC_FAILURE = ('Recovery failed; no successful result. '

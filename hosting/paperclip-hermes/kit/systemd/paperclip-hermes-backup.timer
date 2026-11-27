@@ -2,8 +2,8 @@
 Description=Nightly Paperclip and Hermes encrypted backup
 
 [Timer]
-OnCalendar=*-*-* 00:15:00
-Persistent=true
+OnCalendar=*-*-* 21:15:00
+Persistent=false
 RandomizedDelaySec=0
 Unit=paperclip-hermes-backup.service
 
