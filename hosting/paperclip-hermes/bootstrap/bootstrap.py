@@ -869,6 +869,9 @@ class Bootstrap:
                                "location": self.cfg("location"), "rg_managed_by": owner}
         if self.a.apply:
             self.validate_ops_refs(variables)
+            ops_refs = variables.get("workflow_refs", {}).get("ops", {})
+            caller_refs = (self.ops_caller_refs(target, ops_refs, variables)
+                           if ops_refs and not self.a.remove_target else None)
         require(variables.get("target_tenant_id", target_tenant) == target_tenant, "Multiple foreign target tenants require an Owner-reviewed root composition")
         require(variables["role_home_target"] in targets, "Trust home must be a registered target")
         if home in previous:
@@ -1002,8 +1005,8 @@ class Bootstrap:
                                                          tenant=target_tenant, client_ids=clients, role_home_target=variables["role_home_target"],
                                                          plan_inputs={"vault": {"client_id": clients["vault"]["plan"]}, "target": {"target_client_id": clients["target"]["plan"]}}, authorization=auth,
                                                          ops_workflow_refs=ops_refs))
-            if ops_refs or self.a.remove_target:
-                self.ops_callers(target, ops_refs, self.a.remove_target)
+            if caller_refs is not None or self.a.remove_target:
+                self.ops_callers(target, caller_refs or {}, self.a.remove_target, prepared=True)
         if self.a.close_pilot:
             self.close_pilot(variables, vault)
         usage = self.az("vm", "list-usage", "--location", self.cfg("location"), "--subscription", sub)
@@ -1146,7 +1149,21 @@ class Bootstrap:
                         raise
                     raise Refusal(f"Ops SHA {sha}: release metadata read failed") from exc
 
-    def ops_callers(self, target, refs, removing):
+    def ops_caller_refs(self, target, refs, variables):
+        # Run live-tag refusals before trust mutates Azure or saves state.
+        self.validate_source_refs({**variables.get("workflow_refs", {}), "ops": refs})
+        tags = self.live_target_tags(variables["targets"][target])
+        if tags is None:
+            progress(f"Target {target} has no live sf-approved-sha; callers cannot be staged")
+            return None
+        sha = tags.get("sf-approved-sha", "")
+        require(re.fullmatch(r"[a-f0-9]{40}", sha), f"Target {target} has no live sf-approved-sha; callers cannot be staged")
+        selected = {workflow_file(ref).removesuffix(".yml"): ref for ref in refs.values() if ref.endswith("@" + sha)}
+        require(set(selected) == {f.removesuffix(".yml") for f in allowlist()["identities"]["ops"]},
+                f"Target {target} live approved SHA {sha} needs all four authorized ops refs")
+        return selected
+
+    def ops_callers(self, target, refs, removing, *, prepared=False):
         # Stage a reviewable local change. Never overwrite other targets' current
         # approved refs with stale local copies, and never push callers to main.
         variables = self.load("config/instance.tfvars.json", {})
@@ -1155,17 +1172,10 @@ class Bootstrap:
             import yaml
         except ImportError as exc:
             raise Refusal("PyYAML is required to preserve existing static caller entries") from exc
-        if not removing:
-            tags = self.live_target_tags(variables["targets"][target])
-            if tags is None:
-                progress(f"Target {target} has no live sf-approved-sha; callers cannot be staged")
+        if not removing and not prepared:
+            refs = self.ops_caller_refs(target, refs, variables)
+            if refs is None:
                 return
-            sha = tags.get("sf-approved-sha", "")
-            require(re.fullmatch(r"[a-f0-9]{40}", sha), f"Target {target} has no live sf-approved-sha; callers cannot be staged")
-            selected = {workflow_file(ref).removesuffix(".yml"): ref for ref in refs.values() if ref.endswith("@" + sha)}
-            require(set(selected) == {f.removesuffix(".yml") for f in allowlist()["identities"]["ops"]},
-                    f"Target {target} live approved SHA {sha} needs all four authorized ops refs")
-            refs = selected
         tree = self.gh(f"repos/{self.repo()}/git/trees/main?recursive=1")
         require(not tree.get("truncated"), "Caller inventory is truncated")
         paths = {entry["path"] for entry in tree["tree"]}

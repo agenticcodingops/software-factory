@@ -260,9 +260,9 @@ if exe == 'az':
     if args[:2] == ['group', 'exists']:
         out(option('--name') not in state.get('missing_rgs', []))
     if args[:2] == ['vm', 'list']:
-        out([] if state.get('no_vm') or option('--resource-group') in state.get('empty_vm_rgs', []) else [{'id': '/mock/virtualMachines/target'}] * state.get('vm_count', 1))
+        out([] if state.get('no_vm') or option('--resource-group') in state.get('empty_vm_rgs', []) else [{'id': state.get('vm_ids', {}).get(option('--resource-group'), '/mock/virtualMachines/target')}] * state.get('vm_count', 1))
     if args[:2] == ['vm', 'show']:
-        out({'tags': state.get('target_tags', {'sf-approved-sha': SHA})})
+        out({'tags': state.get('vm_tags', {}).get(option('--ids'), state.get('target_tags', {'sf-approved-sha': SHA}))})
     if args[:2] == ['account', 'show']:
         out({'user': {'type': 'servicePrincipal' if os.environ.get('APP_LOGIN') else 'user'}, 'tenantId': 'target-tenant-placeholder' if os.environ.get('CROSS_TENANT') and option('--subscription') != VAULT_SUB else 'tenant-placeholder',
              'subscriptionPolicies': {'spendingLimit': os.environ.get('SPENDING', 'Off')}})

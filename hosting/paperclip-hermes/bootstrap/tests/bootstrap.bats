@@ -1474,12 +1474,23 @@ if mode=='removed':
 PYSECOND
 }
 
-@test 'WP6 fix1 parked target contributes no approval and does not block trust' {
+
+@test 'WP6 fix2 parked target and active target without VM do not block trust' {
   wp6_config ops
   wp6_second_target parked
+  python3 - <<'PYCASE'
+import json, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR'])
+p=home/'config/instance.tfvars.json'; v=json.loads(p.read_text())
+v['targets']['gamma']=dict(v['targets']['primary'], resource_group_name='rg-unbuilt'); p.write_text(json.dumps(v))
+(home/'config/targets/gamma.json').write_text(json.dumps({'status':'active'}))
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['empty_vm_rgs'].append('rg-unbuilt'); p.write_text(json.dumps(v))
+PYCASE
   run trust --apply
   [ "$status" -eq 0 ]
   refute_match 'vm list --resource-group rg-second' "$CALLS"
+  grep -F 'vm list --resource-group rg-unbuilt' "$CALLS"
   assert_clean
 }
 
@@ -1593,4 +1604,65 @@ PY
   [ "$status" -eq 0 ]
   refute_match 'vm list --resource-group rg-second' "$CALLS"
   assert_clean
+}
+
+assert_no_trust_mutation() {
+  refute_match '^terraform .* apply|^az .* (create|update|delete|register|set) |^az rest --method (post|put|patch|delete)' "$CALLS"
+  cmp "$FAKE_DB" "$BATS_TEST_TMPDIR/cloud-before"
+  cmp "$SF_INSTANCE_DIR/config/instance.tfvars.json" "$BATS_TEST_TMPDIR/vars-before"
+}
+
+@test 'WP6 fix2 new target VM without valid approval refuses before any mutation' {
+  wp6_config ops
+  wp6_second_target active
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR'])
+p=home/'config/instance.tfvars.json'; v=json.loads(p.read_text()); del v['targets']['beta']; p.write_text(json.dumps(v))
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['empty_vm_rgs']=[]
+v['vm_ids']={'rg-second':'/mock/virtualMachines/beta'}; p.write_text(json.dumps(v))
+PY
+  for approval in missing invalid; do
+    python3 - "$approval" <<'PY'
+import json, os, sys
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text())
+v['vm_tags']={'/mock/virtualMachines/beta': {} if sys.argv[1]=='missing' else {'sf-approved-sha':'invalid'}}
+p.write_text(json.dumps(v))
+PY
+    cp "$FAKE_DB" "$BATS_TEST_TMPDIR/cloud-before"
+    cp "$SF_INSTANCE_DIR/config/instance.tfvars.json" "$BATS_TEST_TMPDIR/vars-before"
+    cp "$SF_INSTANCE_DIR/config/targets/beta.json" "$BATS_TEST_TMPDIR/target-before"
+    : > "$CALLS"
+    run boot trust --target beta --vault-subscription "$VAULT_SUB" --subscription "$TARGET_SUB" --resource-group rg-second --location example-region --apply
+    [ "$status" -eq 1 ]
+    [[ "$output" == *'Target beta has no live sf-approved-sha; callers cannot be staged'* ]]
+    assert_no_trust_mutation
+    cmp "$SF_INSTANCE_DIR/config/targets/beta.json" "$BATS_TEST_TMPDIR/target-before"
+  done
+}
+
+@test 'WP6 fix2 removal of sole ops SHA approver refuses without mutation' {
+  wp6_config ops
+  wp6_second_target removed
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text())
+v['empty_vm_rgs']=[]; v['target_tags']={}
+v['vm_ids']={'rg-second':'/mock/virtualMachines/beta'}
+v['vm_tags']={'/mock/virtualMachines/beta':{'sf-approved-sha':'a'*40}}
+p.write_text(json.dumps(v))
+PY
+  cp "$FAKE_DB" "$BATS_TEST_TMPDIR/cloud-before"
+  cp "$SF_INSTANCE_DIR/config/instance.tfvars.json" "$BATS_TEST_TMPDIR/vars-before"
+  run boot trust --target beta --vault-subscription "$VAULT_SUB" --subscription "$TARGET_SUB" --resource-group rg-second --location example-region --remove-target --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Stale ops SHAs'* ]]
+  for workflow in ph-ops ph-power ph-cost-guard ph-backup-verify; do
+    [[ "$output" == *"workflow_refs.ops.$workflow = \"example-org/example-instance/.github/workflows/$workflow.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""* ]]
+  done
+  refute_match 'vm list --resource-group rg-second' "$CALLS"
+  assert_no_trust_mutation
 }
