@@ -177,6 +177,12 @@ class MintBoundaryTests(unittest.TestCase):
                          "change": {"after": {"role_definition_id": "/mock/role", "scope": scope}}}
                     ]}
                     self.assertTrue(inspector.inspect_plan(plan))
+                    # AzureRM computes a name when a custom role ID is supplied;
+                    # after an apply the mock name is arbitrary. Audit the resolved ID's actions.
+                    plan["resource_changes"][1]["change"]["after"]["role_definition_name"] = "computed-custom-role"
+                    self.assertTrue(inspector.inspect_plan(plan))
+                    plan["resource_changes"][0]["change"]["after"]["permissions"] = [{"actions": ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"]}]
+                    self.assertFalse(inspector.inspect_plan(plan))
 
     def test_mint_builtin_compute_roles_are_rejected(self):
         for role in ("Contributor", "Reader", "Virtual Machine Contributor"):

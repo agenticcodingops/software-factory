@@ -60,8 +60,7 @@ def mint_boundary_findings(plan):
             # Built-in reader/contributor roles have Compute rights even if mocked IDs collide.
             name = after.get("role_definition_name")
             role_id = after.get("role_definition_id")
-            if (name not in (None, "Storage Blob Data Reader") or
-                    (name is None and role_id not in definitions) or
+            if ((role_id not in definitions and name != "Storage Blob Data Reader") or
                     any(a.lower().startswith("microsoft.compute/") or a == "*" for a in definitions.get(role_id, []))):
                 errors.append("mint has Microsoft.Compute or non-backup rights at " + str(after.get("scope")))
             if 'module.target_identities["mint"]' in address:
