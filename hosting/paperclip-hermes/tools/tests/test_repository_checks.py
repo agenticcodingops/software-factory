@@ -1,5 +1,6 @@
 """Acceptance checks run the real command-line tools in isolated Git repositories."""
 
+import ast
 import hashlib
 import json
 import os
@@ -12,6 +13,42 @@ import unittest
 
 TOOLS = Path(__file__).resolve().parents[1]
 ROOT = TOOLS.parents[2]
+
+
+def scan_unittest_only(roots):
+    """Find tests that unittest discovery would silently omit or cannot run."""
+    findings = []
+    for root in map(Path, roots):
+        for path in sorted(root.rglob("test*.py")):
+            tree = ast.parse(path.read_text(), filename=str(path))
+            prefix = str(path) + ": "
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                    findings.append(prefix + "module-level test function " + node.name)
+                if isinstance(node, ast.ClassDef):
+                    tests = any(isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and
+                                child.name.startswith("test") for child in node.body)
+                    if tests and not any(not isinstance(base, ast.Name) or base.id != "object" for base in node.bases):
+                        findings.append(prefix + "test class has no TestCase base: " + node.name)
+            pytest_names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name == "pytest" or alias.name.startswith("pytest."):
+                            pytest_names.add(alias.asname or "pytest")
+                            findings.append(prefix + "pytest import")
+                elif isinstance(node, ast.ImportFrom) and node.module and (node.module == "pytest" or node.module.startswith("pytest.")):
+                    pytest_names.update(alias.asname or alias.name for alias in node.names)
+                    findings.append(prefix + "pytest import")
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in pytest_names:
+                    findings.append(prefix + "pytest attribute access")
+            directory = path.parent
+            while directory != root:
+                if not (directory / "__init__.py").is_file():
+                    findings.append(prefix + "undiscoverable directory " + str(directory))
+                directory = directory.parent
+    return findings
 
 
 class RepositoryChecks(unittest.TestCase):
@@ -30,6 +67,57 @@ class RepositoryChecks(unittest.TestCase):
                                 cwd=self.root, env=env, text=True, capture_output=True)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
+
+    def unittest_tree(self, source, relative="test_case.py"):
+        root = self.root / "tests"
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+        return scan_unittest_only([root])
+
+    def test_unittest_only_in_discovered_dirs(self):
+        roots = [TOOLS / "tests", ROOT / "ci/renovate"]
+        self.assertEqual(scan_unittest_only(roots), [])
+        cases = [
+            ("module_level", "def test_x(): pass", "test_case.py", True),
+            ("pytest_import", "import pytest", "test_case.py", True),
+            ("bare_class", "class TestFoo:\n    def test_a(self): pass", "test_case.py", True),
+            ("missing_init", "import unittest\nclass Tests(unittest.TestCase):\n    def test_y(self): pass", "sub/test_y.py", True),
+            ("testcase", "import unittest\nclass Tests(unittest.TestCase):\n    def test_x(self): pass", "test_case.py", False),
+        ]
+        for name, source, relative, rejected in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source)
+                self.assertEqual(bool(scan_unittest_only([root])), rejected)
+
+    def test_unittest_only_acceptance_module_level(self):
+        for source in ("def test_x(): pass", "async def test_x(): pass"):
+            with self.subTest(source=source):
+                self.assertTrue(self.unittest_tree(source))
+
+    def test_unittest_only_acceptance_pytest_import(self):
+        for source in ("import pytest", "from pytest import fixture", "import pytest as p\np.mark.slow", "from pytest import mark as m\nm.slow"):
+            with self.subTest(source=source):
+                self.assertTrue(self.unittest_tree(source))
+
+    def test_unittest_only_acceptance_bare_class(self):
+        for base in ("", "(object)"):
+            with self.subTest(base=base):
+                self.assertTrue(self.unittest_tree(f"class TestFoo{base}:\n    def test_a(self): pass"))
+
+    def test_unittest_only_acceptance_missing_init(self):
+        source = "import unittest\nclass Tests(unittest.TestCase):\n    def test_y(self): pass"
+        self.assertTrue(self.unittest_tree(source, "sub/nested/test_y.py"))
+        (self.root / "tests/sub/__init__.py").touch()
+        self.assertTrue(scan_unittest_only([self.root / "tests"]))
+        (self.root / "tests/sub/nested/__init__.py").touch()
+        self.assertEqual(scan_unittest_only([self.root / "tests"]), [])
+
+    def test_unittest_only_acceptance_testcase(self):
+        self.assertEqual(self.unittest_tree("import unittest\nclass Tests(unittest.TestCase):\n    def test_x(self): pass"), [])
 
     def test_empty_tree(self):
         self.run_check("deny-list.py", 0)
