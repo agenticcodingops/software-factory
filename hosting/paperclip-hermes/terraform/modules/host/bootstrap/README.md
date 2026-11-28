@@ -116,16 +116,23 @@ exit 6. See [Azure disk mapping](https://learn.microsoft.com/en-us/azure/virtual
 and [Ubuntu's image notes](https://ubuntu.com/blog/ubuntu-azure-vm-utils-included).
 P19 must confirm the exact link on Ubuntu 24.04 for the chosen `vm_size`,
 including a SCSI default and an NVMe override, and test retained-disk rebuilds.
-`disk_setup` and `fs_setup` use `overwrite: false` with `partition: any`.
-This preserves only filesystems that the probes can detect, without relabeling
-them. **A retained partition with a damaged or unreadable superblock, whose
-filesystem blkid cannot detect, can be reformatted and lose recoverable data.**
-`overwrite: false` does not protect that case. P19's retained-disk rebuild test
-must include a disposable copy with a blkid-undetected ext4 superblock and check
-recovery from a backup superblock before attempting rebuild. Do not rebuild a
-suspect retained disk until operator recovery preserves its data. A future disk
-initialization change must distinguish a proven-new disk from a retained disk;
-the new-VM render flag alone proves nothing about data-disk provenance.
+The root-only cloud-init per-boot initializer formats only a whole LUN-0 disk
+with no partition table, signatures or partitions, and all-zero first and last
+1 MiB. It also checks every interior byte before writing, so even a disk with
+zeroed boundaries and retained interior data is refused. This full read can
+delay first-boot initialization on large disks. Both `blkid -p` and read-only `wipefs -n` must report no signatures;
+`lsblk` must report only the whole disk. Probe errors refuse initialization.
+It then creates one GPT partition and ext4 labeled `sf-data`. On every boot,
+an existing `sf-data` label is mounted without formatting. All other disks are
+left untouched, `/data` stays unmounted and one journal line requests inspection.
+See [cloud-init per-boot scripts](https://cloudinit.readthedocs.io/en/latest/reference/modules.html#scripts-per-boot),
+[blkid](https://man7.org/linux/man-pages/man8/blkid.8.html),
+[wipefs](https://man7.org/linux/man-pages/man8/wipefs.8.html) and
+[lsblk](https://man7.org/linux/man-pages/man8/lsblk.8.html).
+P19's retained-disk rebuild probe must include a disposable retained ext4 disk
+with a damaged primary superblock and a recoverable backup superblock, including
+a blkid-undetected filesystem. Verify that it is NOT formatted and its bytes
+remain unchanged across rebuild and reboot; recover it explicitly afterward.
 New disks get ext4 labeled `sf-data`, mounted by label at `/data` with `nofail`.
 A retained disk without this label leaves `/data` unmounted: preparation fails
 closed with exit 6. The kit requires a dedicated mount and places Docker and

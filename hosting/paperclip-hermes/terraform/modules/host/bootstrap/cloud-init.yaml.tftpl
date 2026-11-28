@@ -67,18 +67,77 @@ write_files:
     content: ${agent_gz_b64}
     owner: root:root
     permissions: '0755'
-# P19: verify this LUN-0 link on the selected Ubuntu 24.04 Azure image.
-disk_setup:
-  /dev/disk/azure/scsi1/lun0:
-    table_type: gpt
-    layout: true
-    overwrite: false
-fs_setup:
-  - label: sf-data
-    filesystem: ext4
-    device: /dev/disk/azure/scsi1/lun0
-    partition: any
-    overwrite: false
+  # P19: verify the LUN-0 link and retained-disk safety on the Azure image.
+  # Cloud-init scripts-per-boot runs this before user runcmd and on reboots.
+  - path: /var/lib/cloud/scripts/per-boot/10-sf-data
+    owner: root:root
+    permissions: '0700'
+    content: |
+      #!/usr/bin/python3 -I
+      """Initialize only a demonstrably blank LUN-0 disk; retain everything else."""
+      from pathlib import Path
+      import subprocess
+
+      DEVICE = '/dev/disk/azure/scsi1/lun0'
+      MIB = 1024 * 1024
+
+
+      def run(*args, codes=(0,), allow_stderr=False):
+          result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+          if result.returncode not in codes or (result.stderr.strip() and not allow_stderr):
+              raise ValueError('probe failed')
+          return result.stdout.strip()
+
+
+      def initialize():
+          # A retained filesystem needs no initialization, even on a rebuilt OS disk.
+          if run('blkid', '-L', 'sf-data', codes=(0, 2)):
+              run('mount', '-a')
+              return
+          disk = str(Path(DEVICE).resolve(strict=True))
+          run('udevadm', 'settle')
+          if run('lsblk', '-dn', '-o', 'TYPE', disk) != 'disk':
+              raise ValueError('not a whole disk')
+          if run('blkid', '-p', disk, codes=(2,)):
+              raise ValueError('signature')
+          if run('wipefs', '-n', '--noheadings', '--output', 'TYPE,OFFSET', disk):
+              raise ValueError('signature')
+          if run('lsblk', '-nr', '-o', 'TYPE', disk) != 'disk':
+              raise ValueError('existing children')
+          size = int(run('lsblk', '-bdn', '-o', 'SIZE', disk))
+          if size < 2 * MIB:
+              raise ValueError('too small')
+          with open(disk, 'rb', buffering=0) as stream:
+              for offset in (0, size - MIB):
+                  stream.seek(offset)
+                  data = stream.read(MIB)
+                  if len(data) != MIB or any(data):
+                      raise ValueError('nonzero or unreadable disk')
+              # Also refuse interior data, even if both boundary windows are zero.
+              stream.seek(MIB)
+              remaining = size - 2 * MIB
+              while remaining:
+                  data = stream.read(min(4 * MIB, remaining))
+                  if not data or data.count(0) != len(data):
+                      raise ValueError('nonzero or unreadable disk')
+                  remaining -= len(data)
+          # No disk-writing command is reachable until every independent probe passed.
+          run('parted', '--script', disk, 'mklabel', 'gpt', 'mkpart', 'primary',
+              'ext4', '1MiB', '100%')
+          run('udevadm', 'settle')
+          entries = [line.split() for line in run('lsblk', '-nrp', '-o', 'NAME,TYPE', disk).splitlines()]
+          if len(entries) != 2 or entries[0] != [disk, 'disk'] or entries[1][1:] != ['part']:
+              raise ValueError('partition not ready')
+          run('mkfs.ext4', '-L', 'sf-data', entries[1][0], allow_stderr=True)
+          run('mount', '-a')
+
+
+      try:
+          initialize()
+      except (OSError, ValueError, subprocess.SubprocessError):
+          subprocess.run(['logger', '-t', 'sf-data',
+                          'Data disk left uninitialized; inspect retained data before recovery.'],
+                         timeout=30, check=False)
 mounts:
   - [LABEL=sf-data, /data, ext4, 'defaults,nofail', '0', '2']
 runcmd:

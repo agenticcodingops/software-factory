@@ -188,6 +188,10 @@ run "rendered_bootstrap_for_new_vm" {
     bootstrap_render_for_new_vm = true
   }
   assert {
+    condition     = !strcontains(base64decode(output.invariants.custom_data), "disk_setup:") && !strcontains(base64decode(output.invariants.custom_data), "fs_setup:") && !strcontains(base64decode(output.invariants.custom_data), "partition: any") && !strcontains(base64decode(output.invariants.custom_data), "partition: none") && strcontains(base64decode(output.invariants.custom_data), "/var/lib/cloud/scripts/per-boot/10-sf-data") && strcontains(base64decode(output.invariants.custom_data), "LABEL=sf-data, /data, ext4")
+    error_message = "Data disk initialization must fail closed and run on every boot before preparation."
+  }
+  assert {
     condition     = startswith(base64decode(output.invariants.custom_data), "#cloud-config\n") && strcontains(base64decode(output.invariants.custom_data), base64gzip(file("../../modules/host/bootstrap/sf-host-agent")))
     error_message = "New VM creation data installs the fixed compressed agent."
   }

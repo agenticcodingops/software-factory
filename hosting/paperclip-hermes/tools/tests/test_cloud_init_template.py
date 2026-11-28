@@ -4,9 +4,11 @@ import base64
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -29,7 +31,10 @@ class CloudInitTemplateTests(unittest.TestCase):
         self.assertEqual(re.findall(r'(?<!\$)\$\{[^}]+\}', self.text), ['${agent_gz_b64}'])
         self.assertNotIn('%{', self.text)
         self.assertLessEqual(len(self.agent), 24 * 1024)
-        entry, = self.config['write_files']
+        entry, initializer = self.config['write_files']
+        self.assertEqual(initializer['path'], '/var/lib/cloud/scripts/per-boot/10-sf-data')
+        self.assertEqual(initializer['owner'], 'root:root')
+        self.assertEqual(initializer['permissions'], '0700')
         self.assertEqual(entry, {'path': '/usr/local/sbin/sf-host-agent', 'encoding': 'gz+b64',
                                  'content': '${agent_gz_b64}', 'owner': 'root:root', 'permissions': '0755'})
         self.assertTrue(self.agent.startswith(b'#!/usr/bin/python3 -I\n'))
@@ -94,7 +99,8 @@ class CloudInitTemplateTests(unittest.TestCase):
     def test_retained_disk_rebuild_probe_documents_undetected_filesystem(self):
         readme = (BOOT / 'README.md').read_text()
         storage = readme.split('## Storage and package pins', 1)[1].split('The age pin', 1)[0]
-        for phrase in ('P19', 'blkid-undetected', 'backup superblock', 'can be reformatted',
+        self.assertNotIn('can be reformatted', storage)
+        for phrase in ('P19', 'blkid-undetected', 'backup superblock', 'NOT formatted',
                        'vm_size', 'NVMe', 'exit 6'):
             with self.subTest(requirement=phrase):
                 self.assertIn(phrase, storage)
@@ -118,12 +124,128 @@ class CloudInitTemplateTests(unittest.TestCase):
                       'kit_ref', 'kit_commit', 'tskey-', 'sig='):
             with self.subTest(value=value):
                 self.assertNotIn(value, self.text)
-        device = '/dev/disk/azure/scsi1/lun0'
-        self.assertEqual(self.config['disk_setup'][device], {'table_type': 'gpt', 'layout': True, 'overwrite': False})
-        self.assertEqual(self.config['fs_setup'], [{'label': 'sf-data', 'filesystem': 'ext4', 'device': device,
-                                                  'partition': 'any', 'overwrite': False}])
+        for config in (self.config, yaml.safe_load(FIXTURE.read_text())):
+            with self.subTest(rendered=config is not self.config):
+                self.assertNotIn('disk_setup', config)
+                self.assertNotIn('fs_setup', config)
+        for value in ('partition: any', 'partition: none'):
+            with self.subTest(value=value):
+                self.assertNotIn(value, self.text)
+                self.assertNotIn(value, FIXTURE.read_text())
         self.assertEqual(self.config['mounts'], [['LABEL=sf-data', '/data', 'ext4', 'defaults,nofail', '0', '2']])
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux disk tooling fixture')
+    def test_data_initializer_fails_closed_and_is_idempotent(self):
+        # Execute the shipped script, substituting only the fixed device path.
+        # No block devices, loop mounts, privileges or network are needed.
+        entries = [entry for entry in self.config['write_files']
+                   if entry['path'] == '/var/lib/cloud/scripts/per-boot/10-sf-data']
+        self.assertEqual(len(entries), 1, 'fail-closed disk initializer is missing')
+        script = entries[0]['content']
+        cases = ('zero', 'gpt', 'ext4', 'backup-superblock', 'end', 'start', 'interior',
+                 'partition', 'blkid-signature', 'wipefs-signature', 'blkid-error',
+                 'wipefs-error', 'lsblk-error', 'not-whole', 'missing', 'label')
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                disk = root / 'disk'
+                disk.write_bytes(bytes(4 * 1024 * 1024))
+                offset, payload = {'gpt': (512, b'EFI PART'), 'ext4': (1080, b'\x53\xef'),
+                                   'backup-superblock': (4 * 1024 * 1024 - 65536 + 56, b'\x53\xef'),
+                                   'end': (4 * 1024 * 1024 - 1, b'x'),
+                                   'start': (0, b'x'), 'interior': (2 * 1024 * 1024, b'x')}.get(case, (0, b''))
+                with disk.open('r+b') as stream:
+                    stream.seek(offset)
+                    stream.write(payload)
+                if case == 'missing':
+                    disk.unlink()
+                before = hashlib.sha256(disk.read_bytes()).hexdigest() if disk.exists() else None
+                (root / 'case').write_text(case)
+                stub = root / 'stub'
+                stub.write_text('#!/usr/bin/python3\n' + r"""
+import json
+from pathlib import Path
+import sys
+root = Path(__file__).parent
+case = (root / 'case').read_text()
+name, args = Path(sys.argv[0]).name, sys.argv[1:]
+with (root / 'calls').open('a') as stream:
+    stream.write(json.dumps([name, *args]) + '\n')
+disk = str(root / 'disk')
+partitioned = (root / 'partitioned').exists()
+if name == 'blkid':
+    if args == ['-L', 'sf-data']:
+        if case == 'label' or (root / 'labeled').exists():
+            print(disk + '1')
+        else:
+            sys.exit(2)
+    else:
+        assert args == ['-p', disk]
+        if case == 'blkid-error':
+            sys.exit(4)
+        if case == 'blkid-signature':
+            print('PTTYPE="gpt"')
+            sys.exit(0)
+        sys.exit(2)
+elif name == 'wipefs':
+    assert args == ['-n', '--noheadings', '--output', 'TYPE,OFFSET', disk]
+    if case == 'wipefs-error':
+        sys.exit(1)
+    if case == 'wipefs-signature':
+        print('ext4 0x438')
+elif name == 'lsblk':
+    if case == 'lsblk-error':
+        sys.exit(1)
+    column = args[args.index('-o') + 1]
+    if column == 'SIZE':
+        print((root / 'disk').stat().st_size)
+    elif column == 'TYPE':
+        print('part' if case == 'not-whole' else 'disk')
+        if '-nr' in args and (case == 'partition' or partitioned):
+            print('part')
+    else:
+        assert column == 'NAME,TYPE' and partitioned
+        print(disk + ' disk\n' + disk + '1 part')
+elif name == 'parted':
+    assert args == ['--script', disk, 'mklabel', 'gpt', 'mkpart', 'primary', 'ext4', '1MiB', '100%']
+    (root / 'partitioned').touch()
+    with (root / 'disk').open('r+b') as stream:
+        stream.seek(512)
+        stream.write(b'EFI PART')
+elif name == 'mkfs.ext4':
+    assert args == ['-L', 'sf-data', disk + '1'] and partitioned
+    (root / 'labeled').touch()
+    print('fixture mkfs progress', file=sys.stderr)
+elif name == 'mount':
+    assert args == ['-a']
+elif name == 'udevadm':
+    assert args == ['settle']
+elif name == 'logger':
+    assert args[0:2] == ['-t', 'sf-data'] and len(args) == 3
+else:
+    raise AssertionError(name)
+""")
+                stub.chmod(0o755)
+                for command in ('blkid', 'wipefs', 'lsblk', 'parted', 'mkfs.ext4',
+                                'udevadm', 'mount', 'logger'):
+                    (root / command).symlink_to(stub)
+                program = root / 'initialize'
+                program.write_text(script.replace('/dev/disk/azure/scsi1/lun0', str(disk)))
+                env = dict(os.environ, PATH=str(root) + os.pathsep + os.defpath)
+                for boot in range(2):
+                    with self.subTest(boot=boot):
+                        result = subprocess.run(['/usr/bin/python3', '-I', str(program)], env=env,
+                                                capture_output=True, timeout=10)
+                        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b'', b''))
+                        calls = [json.loads(line) for line in (root / 'calls').read_text().splitlines()]
+                        names = [call[0] for call in calls]
+                        self.assertEqual(names.count('parted'), int(case == 'zero'))
+                        self.assertEqual(names.count('mkfs.ext4'), int(case == 'zero'))
+                        self.assertEqual(names.count('mount'), boot + 1 if case in ('zero', 'label') else 0)
+                        self.assertEqual(names.count('logger'), 0 if case in ('zero', 'label') else boot + 1)
+                        if case != 'zero':
+                            after = hashlib.sha256(disk.read_bytes()).hexdigest() if disk.exists() else None
+                            self.assertEqual(before, after, 'retained disk bytes changed')
     def test_forbidden_patterns_match_module_regex(self):
         text = (HOST / 'bootstrap.tf').read_text()
         pattern = re.search(r'forbidden_pattern\s*=\s*"([^"]+)"', text).group(1)

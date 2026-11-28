@@ -189,12 +189,24 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
 
     def test_status_rejects_existing_unsafe_tools(self):
         original = Path(self.age).read_text()
+        tools = self.root / 'tools'
+        tools.mkdir(mode=0o755)
+        self.age = str(tools / 'age-keygen')
+        Path(self.age).write_text(original)
         for variant in ('writable', 'owner', 'escape', 'dangling', 'directory'):
             with self.subTest(variant=variant):
                 tool = Path(self.age)
                 tool.unlink()
                 if variant in ('escape', 'dangling'):
-                    tool.symlink_to('/usr/bin/bash' if variant == 'escape' else self.root / 'missing-target')
+                    if variant == 'escape':
+                        other = self.root / 'other'
+                        other.mkdir(mode=0o755)
+                        target = other / 'age-keygen'
+                        target.write_text(original)
+                        target.chmod(0o755)
+                    else:
+                        target = self.root / 'missing-target'
+                    tool.symlink_to(target)
                 elif variant == 'directory':
                     tool.mkdir()
                 else:
@@ -202,7 +214,12 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
                     tool.chmod(0o775 if variant == 'writable' else 0o755)
                 with self.main_paths():
                     if variant == 'owner':
-                        with mock.patch.object(self.agent, 'safe_path', side_effect=self.agent.Failure(10)):
+                        safe_path = self.agent.safe_path
+                        def tool_owner(path, *args, **kwargs):
+                            if Path(path) == tool:
+                                raise self.agent.Failure(10)
+                            return safe_path(path, *args, **kwargs)
+                        with mock.patch.object(self.agent, 'safe_path', side_effect=tool_owner):
                             code, out, _ = self.capture(self.agent.main, ['status'])
                     else:
                         code, out, _ = self.capture(self.agent.main, ['status'])
@@ -362,7 +379,9 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
         self.private_key()
         child_lock, child_pid = self.root / 'child.lock', self.root / 'child.pid'
         child = self.root / 'child.py'
+        # Force startup past the old 0.5-second race; readiness gates the timeout.
         child.write_text('import fcntl, os, signal, time\n'
+                         'time.sleep(1)\n'
                          'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
                          'lock = open(' + repr(str(child_lock)) + ', "w")\n'
                          'fcntl.flock(lock, fcntl.LOCK_EX)\n'
@@ -375,16 +394,18 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
         self.sha = self.git('rev-parse', 'HEAD', cwd=self.source)
         self.git('tag', 'v2.0.0', cwd=self.source)
         self.git('push', self.remote, 'HEAD', 'refs/tags/v2.0.0', cwd=self.source)
-        run, wait, killpg = subprocess.run, subprocess.Popen.wait, os.killpg
-        def short_run(*args, **kwargs):
-            if kwargs.get('timeout') == 3600:
-                kwargs['timeout'] = 0.5
-            return run(*args, **kwargs)
+        wait, killpg = subprocess.Popen.wait, os.killpg
         def short_wait(process, timeout=None):
-            return wait(process, timeout=0.5 if timeout == 3600 else 0.1 if timeout == 5 else timeout)
+            if timeout == 3600:
+                deadline = time.monotonic() + 30
+                while not child_pid.exists() or not child_pid.read_text():
+                    if time.monotonic() >= deadline:
+                        self.fail('fixture child never signaled readiness')
+                    time.sleep(0.01)
+                timeout = 0.5
+            return wait(process, timeout=0.1 if timeout == 5 else timeout)
         try:
             with mock.patch.object(self.agent.os.path, 'ismount', return_value=True), \
-                    mock.patch.object(self.agent.subprocess, 'run', side_effect=short_run), \
                     mock.patch.object(subprocess.Popen, 'wait', autospec=True, side_effect=short_wait), \
                     mock.patch.object(self.agent.os, 'killpg', wraps=killpg) as signals:
                 self.assertEqual(self.fetch(prepare=True)[0], 7)
