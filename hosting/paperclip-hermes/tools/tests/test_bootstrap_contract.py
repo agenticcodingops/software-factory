@@ -17,10 +17,14 @@ spec.loader.exec_module(bootstrap)
 class BootstrapContractTests(unittest.TestCase):
     def test_allowlist_equals_actual_trust_root_variables(self):
         import re
+        # Inputs only a deployment workflow may set; bootstrap must never pass them through.
+        workflow_only = {'trust': set(), 'host': {'bootstrap_render_for_new_vm'}}
         for stack, allowed in (('trust', bootstrap.TRUST_VARIABLES), ('host', bootstrap.HOST_VARIABLES)):
             variables = {name for path in (BASE / 'stacks' / stack).glob('*.tf')
                          for name in re.findall(r'^variable "([^"]+)"', path.read_text(), re.M)}
-            self.assertEqual(allowed, variables)
+            with self.subTest(stack=stack):
+                self.assertFalse(allowed & workflow_only[stack])
+                self.assertEqual(allowed | workflow_only[stack], variables)
 
     def test_renderers_reject_source_symlink_escapes_before_execution(self):
         for selected in ('modules/host/main.tf', 'stacks/trust', 'modules/host'):
