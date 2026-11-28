@@ -137,9 +137,11 @@ New disks get ext4 labeled `sf-data`, mounted by label at `/data` with `nofail`.
 A retained disk without this label leaves `/data` unmounted: preparation fails
 closed with exit 6. The kit requires a dedicated mount and places Docker and
 containerd there. See the [cloud-init module reference](https://cloudinit.readthedocs.io/en/latest/reference/modules.html)
-for disk setup, filesystem selection, mounts, pinned packages, `gz+b64` write_files,
-apt sources and runcmd. In particular, do not use `partition: none`, which can
-format even with overwrite false.
+for mounts, pinned packages, `gz+b64` write_files, apt sources and runcmd. The
+template deliberately uses no `disk_setup` or `fs_setup`, and the tests assert
+that both are absent. Do not reintroduce them: their `overwrite: false` does not
+protect a retained disk whose filesystem blkid cannot detect, and
+`partition: none` can format even with overwrite false.
 
 The age pin is `1.1.1-1ubuntu0.24.04.3` from noble-security (also in updates).
 See [package metadata](https://packages.ubuntu.com/noble/age) and the

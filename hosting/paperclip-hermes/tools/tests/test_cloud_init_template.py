@@ -246,6 +246,7 @@ else:
                         if case != 'zero':
                             after = hashlib.sha256(disk.read_bytes()).hexdigest() if disk.exists() else None
                             self.assertEqual(before, after, 'retained disk bytes changed')
+
     def test_forbidden_patterns_match_module_regex(self):
         text = (HOST / 'bootstrap.tf').read_text()
         pattern = re.search(r'forbidden_pattern\s*=\s*"([^"]+)"', text).group(1)

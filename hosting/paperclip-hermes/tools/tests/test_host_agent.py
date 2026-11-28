@@ -193,7 +193,7 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
         tools.mkdir(mode=0o755)
         self.age = str(tools / 'age-keygen')
         Path(self.age).write_text(original)
-        for variant in ('writable', 'owner', 'escape', 'dangling', 'directory'):
+        for variant in ('writable', 'owner', 'link-owner', 'target-owner', 'escape', 'dangling', 'directory'):
             with self.subTest(variant=variant):
                 tool = Path(self.age)
                 tool.unlink()
@@ -209,17 +209,31 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
                     tool.symlink_to(target)
                 elif variant == 'directory':
                     tool.mkdir()
+                elif variant in ('link-owner', 'target-owner'):
+                    # A same-directory link to a safe executable. link-owner can
+                    # only be refused by the link inode's owner check, and
+                    # target-owner only by safe_path on the resolved target.
+                    target = tool.parent / 'age-keygen-real'
+                    target.write_text(original)
+                    target.chmod(0o755)
+                    tool.symlink_to(target)
                 else:
                     tool.write_text(original)
                     tool.chmod(0o775 if variant == 'writable' else 0o755)
                 with self.main_paths():
-                    if variant == 'owner':
-                        safe_path = self.agent.safe_path
-                        def tool_owner(path, *args, **kwargs):
-                            if Path(path) == tool:
-                                raise self.agent.Failure(10)
-                            return safe_path(path, *args, **kwargs)
-                        with mock.patch.object(self.agent, 'safe_path', side_effect=tool_owner):
+                    if variant in ('owner', 'link-owner', 'target-owner'):
+                        # Report a foreign owner for one inode only, so the
+                        # agent's real uid comparisons decide the outcome.
+                        real_lstat = Path.lstat
+                        foreign = tool.parent / 'age-keygen-real' if variant == 'target-owner' else tool
+                        def foreign_owner(path, *args, **kwargs):
+                            info = real_lstat(path, *args, **kwargs)
+                            if Path(path) == foreign:
+                                fields = list(info)
+                                fields[stat.ST_UID] = info.st_uid + 1
+                                return os.stat_result(fields)
+                            return info
+                        with mock.patch.object(Path, 'lstat', autospec=True, side_effect=foreign_owner):
                             code, out, _ = self.capture(self.agent.main, ['status'])
                     else:
                         code, out, _ = self.capture(self.agent.main, ['status'])
@@ -230,6 +244,7 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
                 elif tool.is_symlink():
                     tool.unlink()
                     tool.write_text(original)
+                (tool.parent / 'age-keygen-real').unlink(missing_ok=True)
                 tool.chmod(0o755)
 
     def test_recipient_requires_private_key(self):
