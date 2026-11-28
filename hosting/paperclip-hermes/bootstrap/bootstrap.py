@@ -693,7 +693,7 @@ class Bootstrap:
     def federation(self):
         self.gate_check()
         receipt = self.load("config/receipts/oidc.json", {})
-        require(receipt, "Run and collect environment-scoped oidc-probe first")
+        require(receipt, "Run and collect environment-scoped oidc-probe first; collect sf-merge-gate with oidc-probe --gate-run RUN")
         variables = self.load("config/instance.tfvars.json", {})
         refs = variables.get("workflow_refs", {})
         require(refs, "Owner-authorized workflow_refs required")
@@ -713,7 +713,8 @@ class Bootstrap:
             # Gate evidence may have been recorded with another local entry key.
             if workflow_file(ref) == "sf-merge-gate.yml":
                 claim = next((c for c in receipt.get("claims", {}).get("plan", {}).values()
-                              if c.get("job_workflow_ref") == ref), {})
+                              if c.get("job_workflow_ref") == ref and
+                              c.get("sub") == f"{receipt['sub_claim_prefix']}:environment:{env}:job_workflow_ref:{ref}"), {})
                 require(claim, f"Gate ref {ref} has no recorded claim; run oidc-probe --gate-run RUN")
             require(claim.get("job_workflow_ref") == ref and
                     claim.get("sub") == f"{receipt['sub_claim_prefix']}:environment:{env}:job_workflow_ref:{ref}",

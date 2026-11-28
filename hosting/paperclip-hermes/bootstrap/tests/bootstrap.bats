@@ -1302,6 +1302,10 @@ PY
   run boot --print-subject
   [ "$status" -eq 1 ]
   [[ "$output" == *'oidc-probe --gate-run'* ]]
+  rm "$SF_INSTANCE_DIR/config/receipts/oidc.json"
+  run boot --print-subject
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'oidc-probe --gate-run'* ]]
 }
 
 @test 'WP6 probe workflow is never federated' {
