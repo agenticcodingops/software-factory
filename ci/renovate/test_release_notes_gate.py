@@ -23,6 +23,10 @@ def release(tag="v2026.1124.0", body="Routine fixes."):
     return {"tag_name": tag, "body": body}
 
 
+def status_calls(api):
+    return [(path, payload) for path, payload in api.calls if "/statuses/" in path]
+
+
 class FakeAPI:
     def __init__(self, body="Routine fixes.", image="paperclip"):
         self.body = body
@@ -117,20 +121,31 @@ class NotesTests(unittest.TestCase):
             api = FakeAPI(word)
             self.assertEqual(self.invoke(api), 1)
             self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
-            self.assertEqual(api.calls[-1][0], "repos/fixture/repo/statuses/" + "b" * 40)
-            self.assertEqual(api.calls[-1][1]["state"], "failure")
+            self.assertEqual(status_calls(api)[-1][0], "repos/fixture/repo/statuses/" + "b" * 40)
+            self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
+
+    def test_label_failure_still_publishes_failure_status(self):
+        api = FakeAPI("breaking")
+        labels = "repos/fixture/repo/issues/7/labels"
+        api.responses[labels] = ValueError("unexpected GitHub status")
+        self.assertEqual(self.invoke(api), 1)
+        self.assertEqual([payload["state"] for _, payload in status_calls(api)], ["pending", "failure"])
+        self.assertFalse(any(payload and payload.get("state") == "success" for _, payload in api.calls))
+        self.assertIn((labels, {"labels": ["needs-operator"]}), api.calls)
+        self.assertLess(next(i for i, (_, p) in enumerate(api.calls) if p and p.get("state") == "failure"),
+                        next(i for i, (path, _) in enumerate(api.calls) if path == labels))
 
     def test_safe_notes_pass(self):
         api = FakeAPI()
         self.assertEqual(self.invoke(api), 0)
-        self.assertEqual(api.calls[-1][1]["state"], "success")
+        self.assertEqual(status_calls(api)[-1][1]["state"], "success")
         self.assertFalse(any("/labels" in path for path, _ in api.calls))
 
     def test_fetch_failure_labels_and_fails_closed(self):
         api = FakeAPI()
         with patch.object(api, "releases", side_effect=OSError("unavailable")):
             self.assertEqual(self.invoke(api), 1)
-        self.assertEqual(api.calls[-1][1]["state"], "failure")
+        self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
 
     def test_plain_scalar_quote_hidden_upgrade_fails_before_network(self):
         api = FakeAPI()
@@ -148,7 +163,7 @@ class NotesTests(unittest.TestCase):
             self.assertEqual(self.invoke(api), 1)
         registry.assert_not_called()
         releases.assert_not_called()
-        self.assertEqual(api.calls[-1][1]["state"], "failure")
+        self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
         self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
 
     def test_digest_only_needs_no_release_notes(self):
@@ -163,11 +178,11 @@ class NotesTests(unittest.TestCase):
             with patch.object(api, "registry_digest", return_value="sha256:" + "e" * 64):
                 self.assertEqual(self.invoke(api), 1)
             self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
-            self.assertEqual(api.calls[-1][1]["state"], "failure")
+            self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
         api = FakeAPI()
         with patch.object(api, "registry_digest", side_effect=OSError("offline")):
             self.assertEqual(self.invoke(api), 1)
-        self.assertEqual(api.calls[-1][1]["state"], "failure")
+        self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
 
     def test_hidden_upgrade_fails_closed_end_to_end(self):
         api = FakeAPI(image="hermes")
@@ -178,7 +193,7 @@ class NotesTests(unittest.TestCase):
             return before(repo, sha, file)
         with patch.object(api, "contents", side_effect=hidden):
             self.assertEqual(self.invoke(api), 1)
-        self.assertEqual(api.calls[-1][1]["state"], "failure")
+        self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
         self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
 
     def test_compose_block_scalar_hidden_upgrade_fails_before_network(self):
@@ -196,7 +211,7 @@ class NotesTests(unittest.TestCase):
             self.assertEqual(self.invoke(api), 1)
         registry.assert_not_called()
         releases.assert_not_called()
-        self.assertEqual(api.calls[-1][1]["state"], "failure")
+        self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
         self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
 
     def test_any_author_and_both_images_are_checked_against_current_main(self):
@@ -226,13 +241,13 @@ class NotesTests(unittest.TestCase):
             api = FakeAPI()
             api.files = [{"filename": f"docs/{i}.md"} for i in range(100)] + [file]
             self.assertEqual(self.invoke(api), 1)
-            self.assertEqual(api.calls[-1][1]["state"], "failure")
+            self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
 
     def test_truncated_diff_fails_closed(self):
         api = FakeAPI()
         api.files = [{"filename": "docs/file.md"}] * 3000
         self.assertEqual(self.invoke(api), 1)
-        self.assertEqual(api.calls[-1][1]["state"], "failure")
+        self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
 
     def test_workflow_check_is_bound_to_captured_shas_not_live_pr_files(self):
         api = FakeAPI()
@@ -249,7 +264,7 @@ class NotesTests(unittest.TestCase):
         self.assertFalse(any("/pulls/7/files" in path for path in paths))
         self.assertIn(f"repos/fixture/repo/compare/{'a' * 40}...{'b' * 40}?per_page=1&page=1", paths)
         self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
-        self.assertEqual(api.calls[-1][1]["state"], "failure")
+        self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
 
     def test_compare_file_cap_fails_closed_at_300(self):
         for count, expected in ((299, 0), (300, 1)):
@@ -291,7 +306,7 @@ class NotesTests(unittest.TestCase):
 
         with patch.object(api, "request", side_effect=changed):
             self.assertEqual(self.invoke(api), 1)
-        self.assertEqual(api.calls[-1][1]["state"], "failure")
+        self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
 
     def test_retarget_during_run_posts_no_result(self):
         api = FakeAPI()
@@ -638,7 +653,7 @@ class ComposeOracleTests(unittest.TestCase):
                     with self.fake_binary(directory, program), patch.object(api, "contents", side_effect=unchanged), patch.object(gate, "COMPOSE_TIMEOUT", 5 if name == "timeout" else 60):
                         self.assertEqual(self.invoke(api), 1)
                     self.assertEqual(int((Path(directory) / "calls").read_text()), 1 + int(side == "head"))
-                    self.assertEqual(api.calls[-1][1]["state"], "failure")
+                    self.assertEqual(status_calls(api)[-1][1]["state"], "failure")
                     self.assertIn(("repos/fixture/repo/issues/7/labels", {"labels": ["needs-operator"]}), api.calls)
 
     def test_missing_verified_binary_fails(self):
@@ -748,7 +763,7 @@ class WorkflowPinTests(unittest.TestCase):
 
     def assert_result(self, api, expected):
         self.assertEqual(self.invoke(api), expected)
-        self.assertEqual(api.calls[-1][1]["state"], "failure" if expected else "success")
+        self.assertEqual(status_calls(api)[-1][1]["state"], "failure" if expected else "success")
         self.assertEqual(any("/labels" in path for path, _ in api.calls), bool(expected))
 
     def test_verified_lightweight_and_annotated_patch_bumps_pass(self):

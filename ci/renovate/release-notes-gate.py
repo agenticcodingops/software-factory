@@ -491,11 +491,15 @@ def main():
         return 1
     if latest["head"]["sha"] != sha:
         raise ValueError("PR head changed while checking notes; rerun the gate")
-    if findings:
-        api.request(f"repos/{repo}/issues/{number}/labels", {"labels": ["needs-operator"]})
     status.update(state="failure" if findings else "success",
                   description="Operator required: gate, workflow, ruleset, CODEOWNERS change, release risk or unavailable data" if findings else "Upstream release notes passed")
     api.request(status_path, status)
+    if findings:
+        try:
+            api.request(f"repos/{repo}/issues/{number}/labels", {"labels": ["needs-operator"]})
+        except Exception as error:
+            print(f"release-notes-gate: could not add needs-operator label: {type(error).__name__}")
+            return 1
     # Avoid emitting upstream text into workflow command processing.
     print(f"release-notes-gate: {'needs-operator' if findings else 'passed'} ({len(findings)} finding(s))")
     return int(bool(findings))
