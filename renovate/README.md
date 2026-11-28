@@ -129,7 +129,13 @@ mismatched digests fail closed ([registry authentication](https://docs.docker.co
 [OCI digest header contract](https://raw.githubusercontent.com/opencontainers/distribution-spec/main/spec.md)).
 Digest-only updates with a matching digest need no release notes.
 The Compose scanner accepts one canonical form and is not a YAML parser. It rejects multi-line
-plain scalars (including continuations across blank lines), multi-line flow collections,
+plain scalars with a stricter line rule: only a line of the form `key:`, `key: &anchor`,
+`- key:` or a bare `-` (unquoted keys of `[A-Za-z0-9_.-]`, optionally followed by a comment
+that starts after a space) may be followed by more deeply indented lines. After any other line
+the next non-blank line, comment lines included, must not be indented deeper than that line's
+key: the dash column plus two for `- key: value` with one space after the dash, and the line's
+own indent otherwise. Deeper comments, children of a quoted key and children of a `- &anchor`
+dash therefore fail too. It also rejects block scalars (`|`, `>`), multi-line flow collections,
 multi-line quoted scalars, YAML tags at node start, explicit (`?`) and alias keys, any merge other
 than `<<: *runtime` indented exactly four spaces, and any 1-space or 3-space indentation.
 It also rejects a quote outside the start of a value or key, brackets inside a plain

@@ -163,6 +163,8 @@ def flow_scan(line):
             start = True
         elif ch == "-" and nxt in ("", " ") and start and not stack:
             pass
+        elif ch == "?" and nxt in ("", " ") and start:
+            raise ValueError("compose explicit and alias keys are unsupported")
         elif ch == "!" and start:
             raise ValueError("compose YAML tags are unsupported")
         elif ch == "&" and start:
@@ -196,7 +198,12 @@ def compose_pin(text, image, service):
             raise ValueError("compose multi-line plain scalars are unsupported")
         if line.lstrip(" ").startswith("#"):
             continue
-        container = re.fullmatch(r" *(?:(?:- +)?[A-Za-z0-9_.-]+: *(?:&[A-Za-z0-9_-]+ *)?|- *)(?:#.*)?", line)
+        # Block scalars are scalar content the scanner cannot see into; give them their own error.
+        # https://yaml.org/spec/1.2.2/#81-block-scalar-styles
+        if re.fullmatch(r" *(?:- +)*(?:[^ #][^#]*?: +)?[|>][0-9+-]{0,2} *(?:(?<= )#.*)?", line):
+            raise ValueError("compose block scalars are unsupported")
+        # "#" starts a comment only after whitespace: https://yaml.org/spec/1.2.2/#66-comments
+        container = re.fullmatch(r" *(?:(?:- +)?[A-Za-z0-9_.-]+: *(?:&[A-Za-z0-9_-]+ *)?|- *)(?:(?<= )#.*)?", line)
         # A sequence mapping's key starts after "- "; its next key is a sibling.
         key_indent = indent + 2 if re.match(r" *- [A-Za-z0-9_.-]+: ", line) else indent
         pending_indent = None if container else key_indent

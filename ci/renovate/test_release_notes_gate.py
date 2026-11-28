@@ -370,7 +370,37 @@ class PinExtractionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "multi-line plain scalars"):
             gate.compose_pin(text.replace("  restart: unless-stopped\n", "  restart: unless-stopped\n    other\n"),
                              self.paper, "paperclip")
+        # "#" without a preceding space is scalar content, so these are folded plain scalars.
+        for fragment in ("x-foo:\n  -#x\n    y\n", "x-foo:\n  - a:#x\n    y\n", "x-foo:\n  a: &b#x\n    y\n"):
+            with self.subTest(fragment=fragment), self.assertRaisesRegex(ValueError, "multi-line plain scalars"):
+                gate.compose_pin(fragment + text, self.paper, "paperclip")
+        self.assertEqual(gate.compose_pin("x-foo:\n  - a: # c\n    b: c\n" + text, self.paper, "paperclip")[0],
+                         "2026.1117.0")
         self.assertEqual(gate.compose_pin(text, self.paper, "paperclip")[0], "2026.1117.0")
+
+    def test_block_scalars_are_rejected_with_their_own_error(self):
+        root = Path(__file__).resolve().parents[2]
+        text = (root / gate.IMAGES[self.paper][2]).read_text()
+        command = "    command: [node, server/dist-runtime/index.mjs]\n"
+        healthcheck = next(line for line in text.splitlines(True) if line.startswith("        - 'fetch("))
+        self.assertIn(command, text)
+        variants = [text.replace(command, "    command: >\n      node server/dist-runtime/index.mjs\n", 1),
+                    text.replace(command, "    command: |2-\n      node server/dist-runtime/index.mjs\n", 1),
+                    text.replace(command, "    command: > # folded\n      node server/dist-runtime/index.mjs\n", 1),
+                    text.replace(healthcheck, "        - >-\n          " + healthcheck.lstrip(" "), 1)]
+        for variant in variants:
+            with self.subTest(text=variant), self.assertRaisesRegex(ValueError, "block scalars are unsupported"):
+                gate.compose_pin(variant, self.paper, "paperclip")
+        tracked = next(line for line in text.splitlines(True) if line.startswith("    image: " + self.paper))
+        with self.assertRaises(ValueError):
+            gate.compose_pin(text.replace(tracked, "    image: >\n  " + tracked, 1), self.paper, "paperclip")
+
+    def test_explicit_keys_after_a_dash_are_rejected(self):
+        root = Path(__file__).resolve().parents[2]
+        text = (root / gate.IMAGES[self.paper][2]).read_text()
+        for fragment in ("x-foo:\n  - ? !!str a\n", "x-foo:\n  - ? a\n", "x-foo:\n  - - ? a\n", "x-foo: [? a]\n"):
+            with self.subTest(fragment=fragment), self.assertRaisesRegex(ValueError, "explicit and alias keys"):
+                gate.compose_pin(fragment + text, self.paper, "paperclip")
 
     def test_yaml_tags_are_rejected(self):
         root = Path(__file__).resolve().parents[2]
