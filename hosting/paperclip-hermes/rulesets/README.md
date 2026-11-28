@@ -8,7 +8,7 @@ These are [repository ruleset request payloads](https://docs.github.com/en/rest/
 ([pull_request_target semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target)).
 The logic is trusted because main is protected by CODEOWNER review of the latest push and
 the gate fails PRs touching its own script prefix, gate workflow, rulesets or [every CODEOWNERS location GitHub reads](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners)
-(`.github/`, root, `docs/`), and workflow changes other than verified same-action, same-major pin bumps.
+(`.github/`, root, `docs/`), the tool installer it runs (`ci/install-tools.sh`), and workflow changes other than verified same-action, same-major pin bumps.
 The captured main/head SHAs bind that [comparison](https://docs.github.com/en/rest/commits/commits#compare-two-commits),
 including renames, and the 300-file cap fails closed. Only organization admins have a PR-only bypass of this workflow requirement.
 

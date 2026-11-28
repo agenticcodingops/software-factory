@@ -283,7 +283,9 @@ class NotesTests(unittest.TestCase):
                      {"filename": ".github/CODEOWNERS"},
                      {"filename": "docs/CODEOWNERS"},
                      {"filename": ".github/CODEOWNERS", "previous_filename": "docs/notes.md"},
-                     {"filename": "docs/x.md", "previous_filename": ".github/CODEOWNERS"}):
+                     {"filename": "docs/x.md", "previous_filename": ".github/CODEOWNERS"},
+                     {"filename": "ci/install-tools.sh"},
+                     {"filename": "ci/tools.sh", "previous_filename": "ci/install-tools.sh"}):
             with self.subTest(file=file):
                 api = FakeAPI()
                 api.files = [file]
@@ -331,6 +333,13 @@ class NotesTests(unittest.TestCase):
         checkout = workflow["jobs"]["notes"]["steps"][0]
         self.assertEqual(checkout["with"]["ref"], "${{ github.sha }}")
         self.assertFalse(checkout["with"]["persist-credentials"])
+        steps = workflow["jobs"]["notes"]["steps"]
+        self.assertEqual(steps[1]["run"], 'bash ci/install-tools.sh "$RUNNER_TEMP/wp7-bin"')
+        # Isolated mode keeps the script directory off sys.path, so no sibling module can shadow stdlib.
+        self.assertIn(" python3 -I ci/renovate/release-notes-gate.py", steps[2]["run"])
+        index = yaml.safe_load((Path(__file__).resolve().parents[2] / ".github/workflows/renovate-paperclip-index.yml").read_text())
+        self.assertEqual([s["run"] for s in index["jobs"]["index"]["steps"] if "run" in s],
+                         ["python3 -I ci/renovate/paperclip-index.py"])
 
     def test_pagination_checks_intermediate_page(self):
         api = gate.GitHub("fixture")

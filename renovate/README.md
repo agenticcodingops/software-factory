@@ -160,7 +160,9 @@ Dockerfiles (including `COPY --from=<image>`), override files or env files. Prot
 captured head SHA using the [three-dot compare API](https://docs.github.com/en/rest/commits/commits#compare-two-commits),
 including previous filenames on renames. The protected paths are `.github/workflows/`,
 `ci/renovate/release-notes-gate`, `hosting/paperclip-hermes/rulesets/` and [every CODEOWNERS location GitHub reads](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners)
-(`.github/`, root, `docs/`).
+(`.github/`, root, `docs/`), plus `ci/install-tools.sh`, which the gate workflow runs before the
+gate script. The workflow starts the script with `python3 -I`, so a module added next to it cannot
+shadow the standard library ([isolated mode](https://docs.python.org/3/using/cmdline.html#cmdoption-I)).
 The script prefix does not match `test_release_notes_gate.py`; that test remains unprotected.
 A PR with 300 or more changed files fails closed because the compare list may be truncated.
 Gate script, gate workflow, ruleset and CODEOWNERS changes always require the operator. Other workflow files

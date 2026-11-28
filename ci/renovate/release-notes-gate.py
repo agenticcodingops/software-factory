@@ -62,7 +62,9 @@ def notes_findings(old, new, releases, pattern):
 
 
 PROTECTED_PREFIXES = (".github/workflows/", "ci/renovate/release-notes-gate", "hosting/paperclip-hermes/rulesets/")
-PROTECTED_FILES = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS", ".github/workflows/release-notes-gate.yml")
+# The gate workflow runs ci/install-tools.sh before the gate script, so it is part of the trusted base.
+PROTECTED_FILES = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS", ".github/workflows/release-notes-gate.yml",
+                   "ci/install-tools.sh")
 
 ACTION_PIN = re.compile(r"( *(?:- +)?uses: +)([A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+(?:/[^@ ]+)?)@([0-9a-f]{40})( +# +)(v[0-9]+\.[0-9]+\.[0-9]+)")
 WORKFLOW_FINDING = "Workflow changes other than verified action pin bumps require the operator"

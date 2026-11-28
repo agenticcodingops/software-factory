@@ -34,4 +34,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          PATH="$RUNNER_TEMP/wp7-bin:$PATH" python3 ci/renovate/release-notes-gate.py
+          PATH="$RUNNER_TEMP/wp7-bin:$PATH" python3 -I ci/renovate/release-notes-gate.py

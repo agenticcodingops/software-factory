@@ -24,4 +24,4 @@ jobs:
       - name: Refresh stable Paperclip releases
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 ci/renovate/paperclip-index.py
+        run: python3 -I ci/renovate/paperclip-index.py
