@@ -139,7 +139,7 @@ other than end of line, a space, a final `:`, `:` followed by a space, or (insid
 `{"a": "b"}`, and an anchor followed by a value on
 the same line. The plain-key form `{a:"b"}` also fails the quote-start rule.
 After the scanner accepts each base/head Compose file, the gate independently runs the
-checksum-verified standalone [Compose v2.40.3](https://github.com/docker/compose/releases/tag/v2.40.3)
+checksum-verified standalone [Compose v5.8.1](https://github.com/docker/compose/releases/tag/v5.8.1)
 installed by `ci/install-tools.sh` in both CI and the trusted-default-branch gate workflow.
 It writes only the API-fetched Compose bytes into a fresh private directory and runs
 [`config --format json`](https://docs.docker.com/reference/cli/docker/compose/config/)
