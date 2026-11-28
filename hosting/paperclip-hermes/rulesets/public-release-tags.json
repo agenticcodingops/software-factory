@@ -1,0 +1,35 @@
+{
+  "name": "software-factory-release-tags",
+  "target": "tag",
+  "enforcement": "disabled",
+  "bypass_actors": [
+    {
+      "actor_type": "Team",
+      "actor_id": 0,
+      "bypass_mode": "always"
+    },
+    {
+      "actor_type": "OrganizationAdmin",
+      "bypass_mode": "always"
+    }
+  ],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/tags/v*"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "creation"
+    },
+    {
+      "type": "update"
+    },
+    {
+      "type": "deletion"
+    }
+  ]
+}

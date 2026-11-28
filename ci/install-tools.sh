@@ -19,4 +19,9 @@ curl --fail --silent --show-error --location --retry 3 \
   https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o gitleaks.tar.gz
 echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz' | sha256sum -c -
 tar -xzf gitleaks.tar.gz gitleaks
-install -m 0755 actionlint tflint gitleaks "$destination/"
+# Current stable release, the line the kit host gets from docker-compose-plugin: https://github.com/docker/compose/releases/tag/v5.8.1
+# Standalone invocation: https://docs.docker.com/compose/install/standalone/
+curl --fail --silent --show-error --location --retry 3 \
+  https://github.com/docker/compose/releases/download/v5.8.1/docker-compose-linux-x86_64 -o docker-compose
+echo 'cf2713394ca63900da5d00e0be12045634cea93a504e1ab2f2ae24eed7f2d359  docker-compose' | sha256sum -c -
+install -m 0755 actionlint tflint gitleaks docker-compose "$destination/"

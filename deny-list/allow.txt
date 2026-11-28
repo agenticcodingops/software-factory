@@ -1,4 +1,4 @@
-# Exact, case-insensitive public placeholders only; no regexes or path exclusions.
+# Exact, case-insensitive public placeholders and upstream metadata only; no regexes or path exclusions.
 # The only permitted GUID is the all-zero documentation placeholder.
 00000000-0000-0000-0000-000000000000
 # Existing kit policy example and URL user-info test fixture, never real addresses.
@@ -6,3 +6,6 @@ operator@example.com
 # Synthetic non-operator for the tailnet deny-test fixture.
 user@example.com
 password@storage.example.test
+
+# Public glob maintainer contact in npm package-lock deprecation metadata.
+i@izs.me

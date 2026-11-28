@@ -1,0 +1,369 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Software Factory dependency policy; agents merge only after required checks and review.",
+  "enabledManagers": [
+    "docker-compose",
+    "dockerfile",
+    "terraform",
+    "github-actions",
+    "custom.regex",
+    "npm"
+  ],
+  "semanticCommits": "enabled",
+  "semanticCommitScope": "deps",
+  "automerge": false,
+  "pinDigests": true,
+  "rangeStrategy": "replace",
+  "prHourlyLimit": 2,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 4am on the first day of the month"
+    ],
+    "semanticCommitType": "fix",
+    "addLabels": [
+      "needs-operator"
+    ],
+    "automerge": false
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.terraform-version$/"
+      ],
+      "matchStrings": [
+        "^(?<currentValue>\\d+\\.\\d+\\.\\d+)\\s*$"
+      ],
+      "depNameTemplate": "hashicorp/terraform",
+      "datasourceTemplate": "custom.hashicorp",
+      "versioningTemplate": "hashicorp"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Images and Terraform changes must trigger Release Please.",
+      "matchManagers": [
+        "docker-compose",
+        "dockerfile",
+        "terraform",
+        "custom.regex"
+      ],
+      "semanticCommitType": "fix"
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "semanticCommitType": "chore"
+    },
+    {
+      "description": "Missing timestamps cannot bypass the image soak period.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "minimumReleaseAge": "3 days",
+      "minimumReleaseAgeBehaviour": "timestamp-required"
+    },
+    {
+      "description": "Paperclip stable CalVer, preserving a leading v when present.",
+      "matchPackageNames": [
+        "ghcr.io/paperclipai/paperclip"
+      ],
+      "versioning": "regex:^v?(?<major>\\d{4})\\.(?<minor>\\d{3,4})\\.(?<patch>\\d+)$",
+      "allowedVersions": "/^v?\\d{4}\\.\\d{3,4}\\.\\d+$/",
+      "sourceUrl": "https://github.com/paperclipai/paperclip",
+      "overrideDatasource": "custom.paperclip-ghcr",
+      "registryUrls": [],
+      "minimumReleaseAge": "3 days",
+      "minimumReleaseAgeBehaviour": "timestamp-required"
+    },
+    {
+      "matchPackageNames": [
+        "nousresearch/hermes-agent"
+      ],
+      "versioning": "semver",
+      "allowedVersions": "/^v0\\.\\d+\\.\\d+$/",
+      "sourceUrl": "https://github.com/NousResearch/hermes-agent"
+    },
+    {
+      "matchPackageNames": [
+        "postgres"
+      ],
+      "allowedVersions": "/^17(?:\\.|$)/"
+    },
+    {
+      "description": "Agents may merge these only after the required checks and two current-head reviews.",
+      "matchManagers": [
+        "docker-compose",
+        "dockerfile"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "patch"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ],
+      "matchPackageNames": [
+        "!ghcr.io/paperclipai/paperclip"
+      ]
+    },
+    {
+      "description": "Paperclip version bumps are operator-reviewed; only digest updates allow agent merge.",
+      "matchPackageNames": [
+        "ghcr.io/paperclipai/paperclip"
+      ],
+      "matchManagers": [
+        "docker-compose",
+        "dockerfile"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ]
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest",
+        "patch",
+        "minor"
+      ],
+      "matchPackageNames": [
+        "!googleapis/release-please-action"
+      ],
+      "matchDepTypes": [
+        "action"
+      ],
+      "matchFileNames": [
+        "!.github/workflows/release-notes-gate.yml"
+      ]
+    },
+    {
+      "description": "Runtime, runner and workflow-image versions are not the Actions carve-out.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "uses-with",
+        "github-runner",
+        "docker",
+        "container",
+        "service"
+      ],
+      "addLabels": [
+        "needs-operator"
+      ]
+    },
+    {
+      "description": "Blob-pinned gate workflow updates require the operator.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchFileNames": [
+        ".github/workflows/release-notes-gate.yml"
+      ],
+      "groupName": "Release notes gate workflow",
+      "groupSlug": "release-notes-gate-workflow",
+      "addLabels": [
+        "needs-operator"
+      ],
+      "automerge": false,
+      "prBodyNotes": [
+        "Update blob_sha in hosting/paperclip-hermes/rulesets/org-release-notes-gate.pin.json using git hash-object .github/workflows/release-notes-gate.yml in this same PR. After merge, re-apply the gate ruleset as hosting/paperclip-hermes/rulesets/README.md describes."
+      ]
+    },
+    {
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchPackageNames": [
+        "hashicorp/terraform"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ]
+    },
+    {
+      "description": "All provider bumps require the operator, including patch releases.",
+      "matchManagers": [
+        "terraform"
+      ],
+      "matchDepTypes": [
+        "required_provider",
+        "provider"
+      ],
+      "addLabels": [
+        "needs-operator"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "AVM 0.x minor releases have major-change risk; operator review is mandatory.",
+      "matchDatasources": [
+        "terraform-module"
+      ],
+      "matchPackageNames": [
+        "/^Azure/avm-/"
+      ],
+      "matchCurrentVersion": "/^0\\./",
+      "matchUpdateTypes": [
+        "minor",
+        "major"
+      ],
+      "addLabels": [
+        "needs-operator"
+      ],
+      "automerge": false,
+      "prPriority": 10,
+      "prBodyNotes": [
+        "AVM 0.x minor bumps are treated as major changes. Operator review is required."
+      ]
+    },
+    {
+      "description": "The runtime file and exact stack requirements advance together.",
+      "matchPackageNames": [
+        "hashicorp/terraform"
+      ],
+      "overrideDatasource": "custom.hashicorp",
+      "groupName": "Terraform runtime",
+      "extractVersion": "^(?<version>.*)$"
+    },
+    {
+      "description": "Reusable modules keep the ADR bounded compatibility ranges; exact root pins drive upgrades.",
+      "matchManagers": [
+        "terraform"
+      ],
+      "matchFileNames": [
+        "hosting/paperclip-hermes/terraform/modules/**/versions.tf"
+      ],
+      "matchDepTypes": [
+        "required_provider",
+        "required_version"
+      ],
+      "enabled": false
+    },
+    {
+      "matchPackageNames": [
+        "hashicorp/terraform"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ]
+    },
+    {
+      "description": "Major updates from every manager require the operator.",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "addLabels": [
+        "needs-operator"
+      ]
+    },
+    {
+      "description": "Only the kit image sources belong to the image policy.",
+      "matchManagers": [
+        "docker-compose",
+        "dockerfile"
+      ],
+      "matchFileNames": [
+        "!hosting/paperclip-hermes/kit/**"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Only the deployment Terraform tree belongs to the provider policy.",
+      "matchManagers": [
+        "terraform"
+      ],
+      "matchFileNames": [
+        "!hosting/paperclip-hermes/terraform/**"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "npm"
+      ],
+      "semanticCommitType": "chore"
+    },
+    {
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "!{package.json,package-lock.json}"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Review validator and release tooling together, including the release action.",
+      "matchPackageNames": [
+        "renovate",
+        "release-please",
+        "nock",
+        "googleapis/release-please-action"
+      ],
+      "matchManagers": [
+        "npm",
+        "github-actions"
+      ],
+      "groupName": "Renovate validators and release tooling",
+      "groupSlug": "validator-release-tooling",
+      "separateMajorMinor": false,
+      "addLabels": [
+        "needs-operator"
+      ],
+      "semanticCommitType": "chore",
+      "prBodyNotes": [
+        "Verify the release-please library and release action together; grouping does not guarantee identical bundled library versions."
+      ]
+    },
+    {
+      "description": "Provider majors may exceed reusable-module bounds; update those bounds in the same PR.",
+      "matchManagers": [
+        "terraform"
+      ],
+      "matchDepTypes": [
+        "required_provider",
+        "provider"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "prBodyNotes": [
+        "Raise reusable-module provider compatibility bounds in this PR if the new major exceeds them; regenerate stack locks."
+      ]
+    }
+  ],
+  "customDatasources": {
+    "hashicorp": {
+      "defaultRegistryUrlTemplate": "https://releases.hashicorp.com/terraform/index.json",
+      "transformTemplates": [
+        "{\"releases\": [$each(versions, function($v, $k) { {\"version\": $k} })], \"sourceUrl\": \"https://github.com/hashicorp/terraform\"}"
+      ]
+    },
+    "paperclip-ghcr": {
+      "defaultRegistryUrlTemplate": "https://raw.githubusercontent.com/agenticcodingops/software-factory/renovate-data/paperclip-releases.json"
+    }
+  },
+  "schedule": [
+    "* 0-5 * * 1"
+  ],
+  "timezone": "Etc/UTC"
+}

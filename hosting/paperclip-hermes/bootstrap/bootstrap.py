@@ -1228,9 +1228,14 @@ class Bootstrap:
         require(any(t["commit"]["sha"] == sha and re.fullmatch(r"v\d+\.\d+\.\d+", t["name"]) for t in tags), "Gate SHA must be a tagged release")
         self.gh(f"repos/{source}/contents/.github/workflows/sf-merge-gate.yml?ref={sha}")
         source_id = self.gh(f"repos/{source}")["id"]
-        for template, endpoint in (("public-repo", f"repos/{source}/rulesets"),
-                                   ("org-merge-gate", f"orgs/{self.cfg('org')}/rulesets"),
-                                   ("instance-repo", f"repos/{repo}/rulesets")):
+        targets = (("public-repo", f"repos/{source}/rulesets"),
+                   ("org-merge-gate", f"orgs/{self.cfg('org')}/rulesets"),
+                   ("instance-repo", f"repos/{repo}/rulesets"))
+        unmanaged = sorted(p.name for p in (HERE.parent / "rulesets").glob("*.json")
+                           if not p.name.endswith(".pin.json") and p.stem not in {t for t, _ in targets})
+        if unmanaged:
+            progress("NOT APPLIED by rulesets (operator applies by hand, see rulesets/README.md): " + ", ".join(unmanaged))
+        for template, endpoint in targets:
             body = json.loads((HERE.parent / "rulesets" / (template + ".json")).read_text())
             body["enforcement"] = "active"
             if template == "org-merge-gate":

@@ -1,0 +1,109 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Instance workflow callers: only ten non-ops release refs are proposed by Renovate.",
+  "extends": [
+    "./default"
+  ],
+  "enabledManagers": [
+    "github-actions",
+    "custom.regex"
+  ],
+  "packageRules": [
+    {
+      "description": "The workflow customManager owns canonical factory SHA/comment refs; disable native duplicates.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "agenticcodingops/software-factory"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepTypes": [
+        "workflow"
+      ],
+      "matchPackageNames": [
+        "agenticcodingops/software-factory"
+      ],
+      "matchFileNames": [
+        ".github/workflows/ph-deploy.yml",
+        ".github/workflows/ph-restore.yml",
+        ".github/workflows/ph-vault-move.yml",
+        ".github/workflows/ph-teardown.yml",
+        ".github/workflows/ph-plan.yml",
+        ".github/workflows/ph-tailnet-import.yml",
+        ".github/workflows/ph-move.yml",
+        ".github/workflows/ph-rotate-age.yml",
+        ".github/workflows/ph-selftest.yml",
+        ".github/workflows/ph-host-monitor.yml"
+      ],
+      "enabled": true,
+      "groupName": "software-factory production workflows",
+      "groupSlug": "software-factory-production",
+      "pinDigests": true,
+      "semanticCommitType": "chore",
+      "commitMessageTopic": "software-factory production workflows",
+      "description": "Explicitly allow the ten non-ops caller files; new filenames require review."
+    },
+    {
+      "description": "All targets ops entries advance only through the approved deploy handoff.",
+      "matchManagers": [
+        "github-actions",
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        ".github/workflows/ph-ops*.yml",
+        ".github/workflows/ph-power*.yml",
+        ".github/workflows/ph-cost-guard*.yml",
+        ".github/workflows/ph-backup-verify*.yml"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepTypes": [
+        "workflow"
+      ],
+      "matchPackageNames": [
+        "agenticcodingops/software-factory"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest",
+        "patch",
+        "minor"
+      ],
+      "addLabels": [
+        "agent-merge"
+      ]
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ph-[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "uses:[ \\t]+(?<depName>agenticcodingops/software-factory/\\.github/workflows/ph-[a-z-]+\\.ya?ml)@(?<currentDigest>[a-f0-9]{40})[ \\t]+#[ \\t]*(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "packageNameTemplate": "agenticcodingops/software-factory",
+      "datasourceTemplate": "github-tags",
+      "depTypeTemplate": "workflow",
+      "versioningTemplate": "semver",
+      "autoReplaceStringTemplate": "uses: {{{depName}}}@{{{newDigest}}} # {{{newValue}}}"
+    }
+  ]
+}

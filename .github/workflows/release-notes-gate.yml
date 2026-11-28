@@ -1,0 +1,37 @@
+name: Release notes gate
+
+on:
+  # Trusted default-branch checkout only; PR source is read as data, never checked out or executed.
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+permissions: {}
+
+concurrency:
+  group: release-notes-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  notes:
+    if: github.event.pull_request.base.ref == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      statuses: write
+      pull-requests: read
+    steps:
+      # Only trusted default-branch code runs with the labeling/status token. PR files are API data.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install verified Compose from the trusted checkout
+        run: bash ci/install-tools.sh "$RUNNER_TEMP/wp7-bin"
+      - name: Publish the gate on the current PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PATH="$RUNNER_TEMP/wp7-bin:$PATH" python3 -I ci/renovate/release-notes-gate.py

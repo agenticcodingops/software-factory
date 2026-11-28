@@ -1,0 +1,41 @@
+{
+  "name": "software-factory-release-notes-gate",
+  "target": "branch",
+  "enforcement": "disabled",
+  "bypass_actors": [
+    {
+      "actor_type": "OrganizationAdmin",
+      "bypass_mode": "pull_request"
+    }
+  ],
+  "conditions": {
+    "repository_name": {
+      "include": [
+        "software-factory"
+      ],
+      "exclude": [],
+      "protected": false
+    },
+    "ref_name": {
+      "include": [
+        "refs/heads/main"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "workflows",
+      "parameters": {
+        "do_not_enforce_on_create": false,
+        "workflows": [
+          {
+            "path": ".github/workflows/release-notes-gate.yml",
+            "repository_id": 0,
+            "sha": "0000000000000000000000000000000000000000"
+          }
+        ]
+      }
+    }
+  ]
+}
