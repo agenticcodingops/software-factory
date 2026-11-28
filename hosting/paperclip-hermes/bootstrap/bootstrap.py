@@ -191,7 +191,7 @@ class Bootstrap:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def run(self, *args, data=None, change=False, raw=False, pass_fds=(), env=None):
+    def run(self, *args, data=None, change=False, raw=False, pass_fds=(), env=None, not_found=False):
         progress(("APPLY " if change else "READ ") + shlex.join(map(str, args)) +
               (" < [in-memory stdin]" if data is not None else ""), flush=True)
         if change and not self.a.apply:
@@ -201,7 +201,8 @@ class Bootstrap:
             environment.update(AZURE_LOGGING_ENABLE_LOG_FILE="false", AZURE_CORE_COLLECT_TELEMETRY="false")
         proc = subprocess.run(list(map(str, args)), input=data, stdin=subprocess.DEVNULL if data is None else None, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, check=False, pass_fds=pass_fds, env=environment)
-        require(proc.returncode == 0, f"{args[0]} operation failed (diagnostics withheld; may contain secrets)")
+        require(proc.returncode == 0 or (not_found and re.match(rb"HTTP/\S+ 404[ \r\n]", proc.stdout)),
+                f"{args[0]} operation failed (diagnostics withheld; may contain secrets)")
         if raw:
             return proc.stdout
         return json.loads(proc.stdout) if proc.stdout.strip() else {}
@@ -209,7 +210,9 @@ class Bootstrap:
     def az(self, *args, **kwargs):
         return self.run("az", *args, "--only-show-errors", "--output", "json", **kwargs)
 
-    def gh(self, path, method="GET", body=None, raw=False):
+    def gh(self, path, method="GET", body=None, raw=False, missing_ok=False):
+        require(not missing_ok or (method == "GET" and "/releases/tags/" in path and not raw),
+                "Optional GitHub response is restricted to release-by-tag reads")
         if method != "GET" and not self.gh_verified:
             expected = self.cfg("operator_login")
             user = self.run("gh", "api", "--hostname", "github.com", "user")
@@ -220,6 +223,13 @@ class Bootstrap:
         args += ["--hostname", "github.com"]
         if body is not None:
             args += ["--input", "/dev/stdin"]
+        if missing_ok:
+            # https://cli.github.com/manual/gh_api (--include exposes HTTP status).
+            response = self.run(*args, "--include", raw=True, not_found=True)
+            header, payload = re.split(rb"\r?\n\r?\n", response, maxsplit=1)
+            status = re.match(rb"HTTP/\S+ ([0-9]{3})[ \r\n]", header)
+            require(status and status[1] in (b"200", b"404"), "Unexpected release HTTP status")
+            return None if status[1] == b"404" else json.loads(payload)
         return self.run(*args, data=pack(body) if body is not None else None,
                         change=method != "GET", raw=raw)
 
@@ -556,11 +566,14 @@ class Bootstrap:
         nonce = pending["nonce"] if pending.get("refs") == refs else str(uuid.uuid4())
         if self.a.apply:
             self.save("probe-pending.json", {"nonce": nonce, "refs": refs})
-        jobs, seen = [], set()
+        jobs, seen, job_ids = [], set(), set()
         for identity, key, ref, env in credential_entries(refs, probe=True):
             if (env, ref) in seen:
                 continue
             seen.add((env, ref))
+            job_id = f"{identity}-{key}"
+            require(job_id not in job_ids, "Credential keys collide after environment expansion; use distinct workflow_refs keys")
+            job_ids.add(job_id)
             jobs.append(f"  {identity}-{key}:\n    permissions:\n      contents: read\n      id-token: write\n    uses: {ref} # v1.0.0\n    with:\n      environment: {env}\n      probe_only: true\n      nonce: {nonce}\n")
         require(jobs, "No reusable refs to probe; collect sf-merge-gate with oidc-probe --gate-run")
         text = "name: Bootstrap OIDC probe\non: workflow_dispatch\npermissions: {}\njobs:\n" + "".join(jobs)
@@ -826,8 +839,6 @@ class Bootstrap:
 
     def trust(self):
         oidc, variables = self.federation()
-        if self.a.apply:
-            self.validate_ops_refs(variables)
         target = self.cfg("target")
         require(re.fullmatch(r"[a-z][a-z0-9-]*", target), "Invalid target name")
         vault, sub = self.cfg("vault_subscription"), self.cfg("subscription")
@@ -856,6 +867,8 @@ class Bootstrap:
             owner = ("host" if self.a.scope == "subscription" else "trust") if self.a.scope else previous.get(target, {}).get("rg_managed_by", "trust")
             targets[target] = {"subscription_resource_id": f"/subscriptions/{sub}", "resource_group_name": self.cfg("resource_group"),
                                "location": self.cfg("location"), "rg_managed_by": owner}
+        if self.a.apply:
+            self.validate_ops_refs(variables)
         require(variables.get("target_tenant_id", target_tenant) == target_tenant, "Multiple foreign target tenants require an Owner-reviewed root composition")
         require(variables["role_home_target"] in targets, "Trust home must be a registered target")
         if home in previous:
@@ -1046,7 +1059,15 @@ class Bootstrap:
     def live_target_tags(self, target):
         subscription = target["subscription_resource_id"].split("/")[2]
         # Protocol tags belong to the VM, never to alert text or local receipts.
+        # https://learn.microsoft.com/en-us/cli/azure/group#az-group-exists
+        exists = self.az("group", "exists", "--name", target["resource_group_name"], "--subscription", subscription)
+        require(isinstance(exists, bool), "Resource group existence could not be read uniquely")
+        if not exists:
+            return None
         vms = self.az("vm", "list", "--resource-group", target["resource_group_name"], "--subscription", subscription)
+        require(isinstance(vms, list), "Target VM inventory could not be read uniquely")
+        if not vms:
+            return None
         require(len(vms) == 1, "Expected exactly one live target VM for approval tags")
         return self.az("vm", "show", "--ids", vms[0]["id"], "--subscription", subscription).get("tags", {})
 
@@ -1065,7 +1086,9 @@ class Bootstrap:
                 seen.add(obj["sha"])
                 obj = self.gh(f"repos/{source}/git/tags/{obj['sha']}")["object"]
             require(obj.get("type") == "commit" and obj.get("sha") == sha, f"Ops SHA {sha}: release tag differs")
-            release = self.gh(f"repos/{source}/releases/tags/{name}")
+            release = self.gh(f"repos/{source}/releases/tags/{name}", missing_ok=True)
+            if release is None:
+                continue
             if (release.get("tag_name") == name and release.get("draft") is False and
                     release.get("prerelease") is False and release.get("published_at")):
                 comparison = self.gh(f"repos/{source}/compare/{sha}...main")
@@ -1073,8 +1096,16 @@ class Bootstrap:
                 return name
         raise Refusal(f"Ops SHA {sha}: no published non-prerelease vX.Y.Z release")
 
+    def validate_source_refs(self, refs):
+        for identity in ("ops", "mint", "deploy"):
+            for ref in refs.get(identity, {}).values():
+                workflow_file(ref)
+                require(ref.split("/.github/", 1)[0] == self.cfg("source_repo"),
+                        f"Identity {identity} ref {ref} must name configured source_repo {self.cfg('source_repo')}")
+
     def validate_ops_refs(self, variables):
         from datetime import datetime, timedelta, timezone
+        self.validate_source_refs(variables.get("workflow_refs", {}))
         groups = {}
         for key, ref in variables.get("workflow_refs", {}).get("ops", {}).items():
             envs_for("ops", ref)
@@ -1090,7 +1121,7 @@ class Bootstrap:
             status = self.load(f"config/targets/{key}.json", {}).get("status", "active")
             if status != "active":
                 continue
-            tags = self.live_target_tags(target)
+            tags = self.live_target_tags(target) or {}
             if re.fullmatch(r"[a-f0-9]{40}", tags.get("sf-approved-sha", "")):
                 approved.add(tags["sf-approved-sha"])
             try:
@@ -1118,13 +1149,17 @@ class Bootstrap:
     def ops_callers(self, target, refs, removing):
         # Stage a reviewable local change. Never overwrite other targets' current
         # approved refs with stale local copies, and never push callers to main.
+        variables = self.load("config/instance.tfvars.json", {})
+        self.validate_source_refs({**variables.get("workflow_refs", {}), "ops": refs})
         try:
             import yaml
         except ImportError as exc:
             raise Refusal("PyYAML is required to preserve existing static caller entries") from exc
         if not removing:
-            variables = self.load("config/instance.tfvars.json", {})
             tags = self.live_target_tags(variables["targets"][target])
+            if tags is None:
+                progress(f"Target {target} has no live sf-approved-sha; callers cannot be staged")
+                return
             sha = tags.get("sf-approved-sha", "")
             require(re.fullmatch(r"[a-f0-9]{40}", sha), f"Target {target} has no live sf-approved-sha; callers cannot be staged")
             selected = {workflow_file(ref).removesuffix(".yml"): ref for ref in refs.values() if ref.endswith("@" + sha)}

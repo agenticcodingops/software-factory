@@ -48,7 +48,7 @@ def initialize():
     variables = {'prefix': 'example', 'state_account_name': 'examplestate', 'location': 'example-region', 'workflow_refs': refs,
                  'custody': 'vault', 'pilot_end_date': '2030-01-01T00:00:00Z', 'monthly_credit': 100, 'role_home_target': 'primary',
                  'targets': {'primary': {'subscription_resource_id': '/subscriptions/' + TARGET_SUB, 'resource_group_name': 'rg-example', 'location': 'example-region', 'rg_managed_by': 'trust'}}}
-    write(HOME / 'bootstrap.json', {'org': 'sample', 'operator_login': 'operator', 'instance_repo': 'instance', 'subscription': VAULT_SUB, 'staging_account': 'examplestaging',
+    write(HOME / 'bootstrap.json', {'source_repo': 'example-org/example-instance', 'org': 'sample', 'operator_login': 'operator', 'instance_repo': 'instance', 'subscription': VAULT_SUB, 'staging_account': 'examplestaging',
           'backends': {'trust': {'storage_account_name': 'examplestate', 'resource_group_name': 'rg-example-vault', 'subscription_id': VAULT_SUB, 'tenant_id': 'tenant-placeholder', 'key': 'trust.tfstate'}},
           'key_vault_id': f'/subscriptions/{VAULT_SUB}/resourceGroups/rg-example-vault/providers/Microsoft.KeyVault/vaults/examplevault',
           'key_vault_name': 'examplevault'})
@@ -235,6 +235,12 @@ if exe == 'gh':
         out({'object': {'type': 'tag' if state.get('annotated') else 'commit', 'sha': sha}})
     if '/git/tags/' in path: out({'object': {'type': 'commit', 'sha': path.rsplit('/', 1)[1]}})
     if '/releases/tags/' in path:
+        status = state.get('release_status', {}).get(path.rsplit('/', 1)[1], 200)
+        if '--include' in args:
+            print(f'HTTP/2.0 {status} Status\r\nContent-Type: application/json\r\n\r\n', end='')
+        if status != 200:
+            print(json.dumps({'message': 'fixture HTTP error'}))
+            sys.exit(1)
         out(dict({'tag_name': path.rsplit('/', 1)[1], 'draft': False, 'prerelease': False, 'published_at': '2026-11-28T00:00:00Z'}, **state.get('release_overrides', {})))
     if '/compare/' in path: out({'status': state.get('compare_status', 'ahead')})
     if '/rulesets' in path:
@@ -251,8 +257,10 @@ if exe == 'gh':
             key = str(len(rules) + 1); rules[key] = dict(value, id=int(key)); out(rules[key])
         out(list(rules.values()))
 if exe == 'az':
+    if args[:2] == ['group', 'exists']:
+        out(option('--name') not in state.get('missing_rgs', []))
     if args[:2] == ['vm', 'list']:
-        out([{'id': '/mock/virtualMachines/target'}] if not state.get('no_vm') else [])
+        out([] if state.get('no_vm') or option('--resource-group') in state.get('empty_vm_rgs', []) else [{'id': '/mock/virtualMachines/target'}] * state.get('vm_count', 1))
     if args[:2] == ['vm', 'show']:
         out({'tags': state.get('target_tags', {'sf-approved-sha': SHA})})
     if args[:2] == ['account', 'show']:

@@ -1455,3 +1455,142 @@ PY
   [[ "$output" == *'Missing or ambiguous real gate claim'* ]]
   cmp "$SF_INSTANCE_DIR/config/receipts/oidc.json" "$BATS_TEST_TMPDIR/oidc-before"
 }
+
+
+wp6_second_target() {
+  python3 - "$1" <<'PYSECOND'
+import json, os, sys
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR']); db=Path(os.environ['FAKE_DB'])
+p=home/'config/instance.tfvars.json'; v=json.loads(p.read_text())
+v['targets']['beta']=dict(v['targets']['primary'], resource_group_name='rg-second')
+p.write_text(json.dumps(v))
+mode=sys.argv[1]
+(home/'config/targets').mkdir(exist_ok=True)
+(home/'config/targets/beta.json').write_text(json.dumps({'status': mode if mode in ('parked','decommissioned') else 'active'}))
+cloud=json.loads(db.read_text()); cloud['empty_vm_rgs']=['rg-second']; db.write_text(json.dumps(cloud))
+if mode=='removed':
+ (home/'config/receipts/destroy-beta.json').write_text(json.dumps({'target':'beta','destroyed':True}))
+PYSECOND
+}
+
+@test 'WP6 fix1 parked target contributes no approval and does not block trust' {
+  wp6_config ops
+  wp6_second_target parked
+  run trust --apply
+  [ "$status" -eq 0 ]
+  refute_match 'vm list --resource-group rg-second' "$CALLS"
+  assert_clean
+}
+
+@test 'WP6 fix1 registered target with no VM does not block trust' {
+  wp6_config ops
+  wp6_second_target active
+  run trust --apply
+  [ "$status" -eq 0 ]
+  grep -F 'vm list --resource-group rg-second' "$CALLS"
+  assert_clean
+}
+
+@test 'WP6 fix1 destroyed target removal keeps surviving ops refs' {
+  wp6_config ops
+  wp6_second_target removed
+  run boot trust --target beta --vault-subscription "$VAULT_SUB" --subscription "$TARGET_SUB" --resource-group rg-second --location example-region --remove-target --apply
+  [ "$status" -eq 0 ]
+  refute_match 'vm list --resource-group rg-second' "$CALLS"
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+v=json.loads((Path(os.environ['SF_INSTANCE_DIR'])/'config/instance.tfvars.json').read_text())
+assert set(v['targets'])=={'primary'} and len(v['workflow_refs']['ops'])==4
+PY
+  assert_clean
+}
+
+@test 'WP6 fix1 new target without a VM finishes trust and stages no caller' {
+  wp6_config ops
+  wp6_second_target active
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['SF_INSTANCE_DIR'])/'config/instance.tfvars.json'; v=json.loads(p.read_text()); del v['targets']['beta']; p.write_text(json.dumps(v))
+PY
+  run boot trust --target beta --vault-subscription "$VAULT_SUB" --subscription "$TARGET_SUB" --resource-group rg-second --location example-region --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'Target beta has no live sf-approved-sha; callers cannot be staged'* ]]
+  [[ "$output" == *'vCPU headroom:'* && "$output" == *'Cost headroom:'* ]]
+  [ ! -f "$SF_INSTANCE_DIR/.github/workflows/ph-ops.yml" ]
+  run trust --apply
+  [ "$status" -eq 0 ]
+  assert_clean
+}
+
+@test 'WP6 fix1 ambiguous VM inventory still refuses before apply' {
+  wp6_config ops
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['vm_count']=2; p.write_text(json.dumps(v))
+PY
+  run trust --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Expected exactly one live target VM'* ]]
+  refute_match 'assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 fix1 missing release on first matching tag checks next tag' {
+  wp6_config ops
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['release_shas']=['a'*40,'a'*40]; v['release_status']={'v1.0.0':404}; p.write_text(json.dumps(v))
+PY
+  run trust --apply
+  [ "$status" -eq 0 ]
+  grep -F '/releases/tags/v1.0.1' "$CALLS"
+  assert_clean
+}
+
+@test 'WP6 fix1 release lookup fails closed on HTTP errors other than 404' {
+  wp6_config ops
+  for code in 403 500; do
+    python3 - "$code" <<'PY'
+import json, os, sys
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['release_shas']=['a'*40,'a'*40]; v['release_status']={'v1.0.0':int(sys.argv[1])}; p.write_text(json.dumps(v))
+PY
+    run trust --apply
+    [ "$status" -eq 1 ]
+    [[ "$output" == *'release metadata read failed'* ]]
+  done
+  refute_match '/releases/tags/v1.0.1|assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 fix1 probe refuses job IDs colliding after environment expansion' {
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['SF_INSTANCE_DIR'])/'config/instance.tfvars.json'; v=json.loads(p.read_text())
+source='example-org/example-instance/.github/workflows/'
+v['workflow_refs']={'deploy':{'a':source+'ph-move.yml@'+'a'*40,'a-restore':source+'ph-deploy.yml@'+'b'*40}}
+p.write_text(json.dumps(v))
+PY
+  run boot oidc-probe --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Credential keys collide after environment expansion'* ]]
+  refute_match 'GH_BODY|/git/trees/|/contents/|/pulls' "$CALLS"
+}
+
+@test 'WP6 fix1 target with no resource group approves nothing' {
+  wp6_config ops
+  wp6_second_target active
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['missing_rgs']=['rg-second']; p.write_text(json.dumps(v))
+PY
+  run trust --apply
+  [ "$status" -eq 0 ]
+  refute_match 'vm list --resource-group rg-second' "$CALLS"
+  assert_clean
+}

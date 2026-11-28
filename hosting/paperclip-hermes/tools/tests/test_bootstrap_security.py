@@ -26,6 +26,28 @@ class BootstrapSecurityTests(unittest.TestCase):
         self.home = Path(self.temporary.name)
         self.app = b.Bootstrap(b.parser().parse_args(['init', '--apply', '--instance-dir', str(self.home), '--org', 'sample', '--instance-repo', 'instance']))
         self.app.config['operator_login'] = 'operator'
+        self.app.config['source_repo'] = 'example-org/example-instance'
+
+    def test_ops_refs_and_callers_require_configured_source_before_lookup(self):
+        source = "agenticcodingops/software-factory"
+        self.app.config["source_repo"] = source
+        files = {"ops": ["ph-ops", "ph-power", "ph-cost-guard", "ph-backup-verify"],
+                 "mint": ["ph-deploy"], "deploy": ["ph-deploy"]}
+        for identity in files:
+            for operation in ("validate_ops_refs", "ops_callers"):
+                with self.subTest(identity=identity, operation=operation):
+                    refs = {i: {f: f"{source}/.github/workflows/{f}.yml@" + "a" * 40 for f in names}
+                            for i, names in files.items()}
+                    refs[identity][files[identity][0]] = "example-org/example-instance/.github/workflows/" + files[identity][0] + ".yml@" + "a" * 40
+                    variables = {"workflow_refs": refs, "targets": {"primary": {}}}
+                    with patch.object(self.app, "load", return_value=variables), patch.object(self.app, "live_target_tags", return_value={"sf-approved-sha": "a" * 40}), patch.object(self.app, "release_for_sha") as release, patch.object(self.app, "gh") as gh:
+                        with self.assertRaisesRegex(b.Refusal, identity + ".*configured source_repo"):
+                            if operation == "validate_ops_refs":
+                                self.app.validate_ops_refs(variables)
+                            else:
+                                self.app.ops_callers("primary", refs["ops"], False)
+                        release.assert_not_called()
+                        gh.assert_not_called()
 
     def test_closed_output_cannot_skip_role_or_token_cleanup(self):
         class Closed(io.StringIO):
@@ -234,6 +256,8 @@ class BootstrapSecurityTests(unittest.TestCase):
             self.assertIn('/git/trees/', path)
             return {'tree': [], 'truncated': False}
         def az(*args):
+            if args[:2] == ('group', 'exists'):
+                return True
             if args[:2] == ('vm', 'list'):
                 return [{'id': '/mock/vm'}]
             self.assertEqual(args[:2], ('vm', 'show'))
