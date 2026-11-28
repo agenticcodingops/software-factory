@@ -70,7 +70,7 @@ class CloudInitTemplateTests(unittest.TestCase):
                 calls = root / 'calls'
                 rewritten = script.replace('/etc/paperclip-hermes', str(identity))
                 rewritten = rewritten.replace('/usr/bin/age-keygen', 'printf fixture-identity')
-                prefix = ('chown() { :; }\n'
+                prefix = ('install() { :; }\nchown() { :; }\n'
                           'sync() { printf "%s\n" "$1" >> ' + str(calls) + '; '
                           'if [ "' + failure + '" = file ] && [ -f "$1" ]; then return 1; fi; '
                           'if [ "' + failure + '" = directory ] && [ -d "$1" ]; then return 1; fi; }\n')
