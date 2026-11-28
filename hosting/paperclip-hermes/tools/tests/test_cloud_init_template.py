@@ -6,6 +6,8 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -49,6 +51,53 @@ class CloudInitTemplateTests(unittest.TestCase):
         self.assertNotIn('mv -n', script)
         self.assertNotIn('.new', script)
         self.assertLess(script.index('chmod 0600'), script.index('ln "$tmp"'))
+
+    def test_delivery_key_synced_before_publication(self):
+        script, = self.config['runcmd']
+        commands = ['chown root:root "$tmp"', 'sync "$tmp"',
+                    'ln "$tmp" /etc/paperclip-hermes/delivery.key',
+                    'sync /etc/paperclip-hermes', 'rm -f "$tmp"\n']
+        positions = [script.index(command) for command in commands]
+        self.assertEqual(positions, sorted(positions))
+        # Execute the actual template shell against a private filesystem fixture.
+        # Failure before publication leaves no key; failure after publication
+        # leaves the already-synced key and cleans up the temporary in both cases.
+        for failure in ('none', 'file', 'directory'):
+            with self.subTest(sync_failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                identity = root / 'identity'
+                identity.mkdir(mode=0o700)
+                calls = root / 'calls'
+                rewritten = script.replace('/etc/paperclip-hermes', str(identity))
+                rewritten = rewritten.replace('/usr/bin/age-keygen', 'printf fixture-identity')
+                prefix = ('chown() { :; }\n'
+                          'sync() { printf "%s\n" "$1" >> ' + str(calls) + '; '
+                          'if [ "' + failure + '" = file ] && [ -f "$1" ]; then return 1; fi; '
+                          'if [ "' + failure + '" = directory ] && [ -d "$1" ]; then return 1; fi; }\n')
+                run = subprocess.run(['/usr/bin/bash', '-c', prefix + rewritten],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                self.assertEqual(run.returncode, 0 if failure == 'none' else 1)
+                key = identity / 'delivery.key'
+                self.assertEqual(key.exists(), failure != 'file')
+                if key.exists():
+                    self.assertEqual(key.read_text(), 'fixture-identity')
+                self.assertEqual(list(identity.glob('.delivery.*')), [])
+                self.assertEqual(len(calls.read_text().splitlines()), 1 if failure == 'file' else 2)
+
+    def test_age_identity_forbidden_in_receipt_bytes(self):
+        pattern = re.search(r'forbidden_pattern\s*=\s*"([^"\n]+)"', (HOST / 'bootstrap.tf').read_text()).group(1)
+        prefix = '-'.join(('AGE', 'SECRET', 'KEY', '1'))
+        for value in (prefix, prefix.lower(), prefix.title()):
+            with self.subTest(case=value):
+                self.assertIsNotNone(re.search(pattern, '#cloud-config\n' + value + 'Q' * 58))
+
+    def test_retained_disk_rebuild_probe_documents_undetected_filesystem(self):
+        readme = (BOOT / 'README.md').read_text()
+        storage = readme.split('## Storage and package pins', 1)[1].split('The age pin', 1)[0]
+        for phrase in ('P19', 'blkid-undetected', 'backup superblock', 'can be reformatted',
+                       'vm_size', 'NVMe', 'exit 6'):
+            with self.subTest(requirement=phrase):
+                self.assertIn(phrase, storage)
 
     def test_packages_pinned_exactly(self):
         packages = self.config['packages']

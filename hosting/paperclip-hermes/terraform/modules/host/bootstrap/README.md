@@ -11,7 +11,7 @@ There is no configuration file or repository input: the fixed source is
 ## Machine contract
 
 [contract.json](contract.json) records the agent file's SHA-256, argv shapes,
-stdout formats, lock behavior, exit codes and runtime bounds. The SHA argument
+stdout formats, lock behavior, exit codes, runtime outcomes and runtime bounds. The SHA argument
 uses exactly `^[0-9a-f]{40}$`; matching uses fullmatch, including at end of input.
 The agent uses only Python's standard library and runs with isolated Python.
 Root ownership and non-writable-by-others checks cover the agent, its directory,
@@ -26,21 +26,26 @@ targets and parent directories must pass ownership/mode checks.
 | `fetch <sha> [--prepare-only]` | Nonblocking exclusive | JSON with `fetched`, `path`; `prepared: true` after preparation |
 | `status` | None, read-only | One JSON object, at most 2048 bytes including newline |
 
-| Exit | Meaning |
-| --- | --- |
-| 0 | Success |
-| 1 | Internal error, generic stderr only |
-| 2 | Usage or invalid SHA |
-| 3 | Missing or unsafe delivery key, or recipient conversion failure |
-| 4 | Checkout, release or fetch verification failure |
-| 6 | Data disk is not mounted |
-| 7 | Preparation failed or timed out |
-| 8 | Lock busy; retry later |
-| 10 | Not root, or unsafe executable/directory |
+| Exit | Meaning | Runtime outcome |
+| --- | --- | --- |
+| 0 | Success | success |
+| 1 | Internal error, generic stderr only | agent-unavailable |
+| 2 | Usage or invalid SHA | invalid-request |
+| 3 | Missing or unsafe delivery key, or recipient conversion failure | agent-unavailable |
+| 4 | Checkout, release or fetch verification failure | verification-failed |
+| 6 | Data disk is not mounted | recovery-required |
+| 7 | Preparation failed or timed out | prepare-failed |
+| 8 | Lock busy | retry-later |
+| 10 | Not root, or unsafe executable/directory | unsafe-host |
 
-The agent never returns 127. The `wp6/workflow-runtime` mapping treats 127
-(absent agent), 3, 1 and any unlisted code as **agent-unavailable**. Code 8 means
-retry later. A status `cloud_init` other than `done` means not ready. Compare
+The agent never returns 127. The `runtime_outcome` map also defines 127 (absent
+agent) and unknown exits as **agent-unavailable**. Consumers stop on
+invalid-request, verification-failed and prepare-failed; they do not continue
+to deliveries or activation. Recovery-required routes to approved restore or
+operator recovery; unsafe-host stops and alerts. Retry-later permits a bounded
+retry. A failed recipient conversion (exit 3) means agent-unavailable; no failed
+invocation may pin a recipient.
+A status `cloud_init` other than `done` means not ready. Compare
 status `agent_sha256` with the contract before invoking the agent for deployment.
 `cloud-init status --format json` is parsed even on exit 1 or 2: degraded, error
 and disabled are errors; running and not started are running; invalid output or
@@ -57,6 +62,19 @@ it; each state file is 0600. No subprocess diagnostic or key content enters the
 status or journal. Status reports at most eight sorted checkout SHAs and a
 `truncated` marker, a validated projection of `last.json`, the mount and key
 safety, cloud-init readiness and the agent's descriptor-read file digest.
+Status reports `tools` as an executable-name map with `ok` or `missing` values.
+Missing package tools do not prevent polling during boot or after failed package
+installation: status exits 0, and missing cloud-init yields `unknown`. An existing
+unsafe tool still causes exit 10. Recipient requires age-keygen; fetch requires
+Git and adds Bash for preparation. All commands check the agent and interpreter.
+
+Preparation runs in a new session. On timeout the agent signals the process
+group with TERM, then KILL, and waits for Bash so children cannot retain the kit
+lock. See [Python subprocess](https://docs.python.org/3/library/subprocess.html).
+If preparation and activation succeeded but journaling fails, fetch preserves
+exit 0 and the success JSON and adds `journal_error: true`. The runtime must
+surface that diagnostic and use status to reconcile `current`; it must not
+repeat successful preparation just to repair the journal. `last` can be stale.
 
 ## Runtime ordering and receipt preservation
 
@@ -81,17 +99,33 @@ this fixed agent. It does not fetch Git, select a release or join a tailnet.
 After a rebuild onto a new OS disk, cloud-init creates a fresh identity and the
 workflows pin it again. A preexisting key or symlink is never overwritten. The
 creation block uses a private temporary, cleanup traps and an exclusive hard
-link so a racing target is preserved.
+link so a racing target is preserved. It syncs the completed identity before
+linking and the containing directory after linking, before reporting success.
+See [GNU sync](https://www.gnu.org/software/coreutils/manual/html_node/sync-invocation.html).
+An existing empty key is reported as unsafe and requires operator recovery;
+it is never automatically replaced.
 
 ## Storage and package pins
 
 The template uses `/dev/disk/azure/scsi1/lun0`, the documented SCSI path for the
-selected B-series host. See [Azure disk mapping](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/azure-to-guest-disk-mapping),
+default `B*as_v2` sizes with SCSI controllers. The `vm_size` override is not
+validated for controller type. An NVMe-controller override has no matching SCSI
+path; a new unlabeled disk then leaves `/data` unmounted and causes preparation
+exit 6. See [Azure disk mapping](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/azure-to-guest-disk-mapping),
 [azure-vm-utils](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/azure-virtual-machine-utilities)
 and [Ubuntu's image notes](https://ubuntu.com/blog/ubuntu-azure-vm-utils-included).
-P19 must confirm the exact link on Ubuntu 24.04 and test retained-disk rebuilds.
-`disk_setup` and `fs_setup` use `overwrite: false`; filesystem selection uses
-`partition: any`, preserving existing filesystems without relabeling them.
+P19 must confirm the exact link on Ubuntu 24.04 for the chosen `vm_size`,
+including a SCSI default and an NVMe override, and test retained-disk rebuilds.
+`disk_setup` and `fs_setup` use `overwrite: false` with `partition: any`.
+This preserves only filesystems that the probes can detect, without relabeling
+them. **A retained partition with a damaged or unreadable superblock, whose
+filesystem blkid cannot detect, can be reformatted and lose recoverable data.**
+`overwrite: false` does not protect that case. P19's retained-disk rebuild test
+must include a disposable copy with a blkid-undetected ext4 superblock and check
+recovery from a backup superblock before attempting rebuild. Do not rebuild a
+suspect retained disk until operator recovery preserves its data. A future disk
+initialization change must distinguish a proven-new disk from a retained disk;
+the new-VM render flag alone proves nothing about data-disk provenance.
 New disks get ext4 labeled `sf-data`, mounted by label at `/data` with `nofail`.
 A retained disk without this label leaves `/data` unmounted: preparation fails
 closed with exit 6. The kit requires a dedicated mount and places Docker and
@@ -168,3 +202,11 @@ a fix requires a rebuild. A later **kit PR** owns that replacement step, alignme
 of kit-control.py checkout with this tag check and Git hardening, and Tailscale
 update policy. A later dependency-maintenance PR owns a Renovate regex manager
 with the deb datasource for these `.tftpl` pins; renovate is outside this change.
+
+Decision 13's **configurable source repository** follow-up is jointly owned by
+the agent, kit and receipt maintainers. It must introduce a receipt source field
+and keep both fetch paths aligned under the same reviewed provenance policy.
+Tracking: [issue 22](https://github.com/agenticcodingops/software-factory/issues/22).
+The source is set once per instance; a mismatch between the receipt and the
+configured source must refuse fetching. Until that change lands, both source
+constants remain fixed and identical.

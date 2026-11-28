@@ -1,13 +1,13 @@
 {
   "path": "/usr/local/sbin/sf-host-agent",
-  "agent_sha256": "a5430ba36617a0b400b67d1835a7128007eb5ae69158e3b90b54f4e63b57b30c",
+  "agent_sha256": "89f1196b7ad3b0ec6b6ef847a92a9c6e8b929e1a316f85ef33c7dc06debce9a0",
   "commands": {
     "recipient": {
       "argv": [
         "recipient"
       ],
       "lock": true,
-      "stdout": "^age1[0-9a-z]{58}$"
+      "stdout": "^age1[02-9ac-hj-np-z]{58}$"
     },
     "fetch": {
       "argv": [
@@ -16,7 +16,7 @@
         "[--prepare-only]"
       ],
       "lock": true,
-      "stdout": "JSON: fetched, path (verified); prepared: true also after prepare"
+      "stdout": "JSON: fetched, path (verified); prepared: true also after prepare; journal_error: true if activation succeeded but journaling failed"
     },
     "status": {
       "argv": [
@@ -44,5 +44,18 @@
     "fetch": 4200,
     "status": 60
   },
-  "status_max_bytes": 2048
+  "status_max_bytes": 2048,
+  "runtime_outcome": {
+    "0": "success",
+    "1": "agent-unavailable",
+    "2": "invalid-request",
+    "3": "agent-unavailable",
+    "4": "verification-failed",
+    "6": "recovery-required",
+    "7": "prepare-failed",
+    "8": "retry-later",
+    "10": "unsafe-host",
+    "127": "agent-unavailable",
+    "unknown": "agent-unavailable"
+  }
 }

@@ -8,6 +8,8 @@ import importlib.util
 import io
 import json
 import os
+import signal
+import time
 from pathlib import Path
 import re
 import shutil
@@ -135,6 +137,84 @@ if 'status' in args and MODE == 'dirty':
 os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
 '''.replace("args =", 'MODE = ' + repr(mode) + '\nargs =', 1))
 
+    @contextlib.contextmanager
+    def main_paths(self, lock=None):
+        paths = {'AGENT': self.agent_path, 'SBIN': self.root, 'PYTHON': Path(self.stub('python3', 'pass')),
+                 'GIT': self.stub('git', 'pass'), 'BASH': self.stub('bash', 'pass'), 'AGE': self.age,
+                 'CLOUD_INIT': self.cloud, 'INSTALL': self.install, 'STATE': self.state,
+                 'KEY': self.key, 'KEY_DIR': self.key_dir, 'DATA': self.data,
+                 'LOCK': lock or self.root / 'agent.lock'}
+        with contextlib.ExitStack() as stack:
+            for name, value in paths.items():
+                stack.enter_context(mock.patch.object(self.agent, name, value))
+            # Main always supplies uid 0 in production; use this user's uid for
+            # fixture ownership without sudo or chown.
+            runtime = self.agent.require_runtime
+            stack.enter_context(mock.patch.object(self.agent, 'require_runtime',
+                side_effect=lambda agent, sbin, interpreter, tools, expected, effective:
+                    runtime(agent, sbin, interpreter, tools, self.uid, self.uid)))
+            status, lock_fn = self.agent.status, self.agent.exclusive_lock
+            stack.enter_context(mock.patch.object(self.agent, 'status', side_effect=
+                lambda agent, install, state, key, parent, data, uid, cloud, *tools:
+                    status(agent, install, state, key, parent, data, self.uid, cloud, *tools)))
+            stack.enter_context(mock.patch.object(self.agent, 'exclusive_lock', side_effect=
+                lambda path, uid: lock_fn(path, self.uid)))
+            yield
+
+    def test_status_missing_tools_remains_diagnostic(self):
+        for missing in ('age-keygen', 'git', 'bash', 'cloud-init'):
+            for cloud_state in ('running', 'error'):
+                with self.subTest(missing=missing, cloud=cloud_state):
+                    self.cloud = self.stub('cloud-init', 'print(' + repr(json.dumps({'status': cloud_state})) + ')')
+                    with self.main_paths(), mock.patch.object(self.agent,
+                            {'age-keygen': 'AGE', 'git': 'GIT', 'bash': 'BASH', 'cloud-init': 'CLOUD_INIT'}[missing],
+                            str(self.root / 'absent' / missing)):
+                        code, out, _ = self.capture(self.agent.main, ['status'])
+                    self.assertEqual(code, 0)
+                    value = json.loads(out)
+                    self.assertEqual(value['tools'][missing], 'missing')
+                    self.assertEqual(value['cloud_init'], 'unknown' if missing == 'cloud-init' else cloud_state)
+                    self.assertEqual(value['delivery_key'], 'missing')
+
+    def test_commands_require_only_used_tools(self):
+        for command, tools in ((['recipient'], ('age-keygen',)),
+                               (['fetch', 'a' * 40], ('git',)),
+                               (['fetch', 'a' * 40, '--prepare-only'], ('git', 'bash'))):
+            with self.subTest(command=command), self.main_paths(), \
+                    mock.patch.object(self.agent, 'require_runtime') as runtime, \
+                    mock.patch.object(self.agent, 'recipient', return_value=0), \
+                    mock.patch.object(self.agent, 'fetch', return_value=0):
+                self.assertEqual(self.agent.main(command), 0)
+                self.assertEqual(tuple(Path(tool).name for tool in runtime.call_args.args[3]), tools)
+
+    def test_status_rejects_existing_unsafe_tools(self):
+        original = Path(self.age).read_text()
+        for variant in ('writable', 'owner', 'escape', 'dangling', 'directory'):
+            with self.subTest(variant=variant):
+                tool = Path(self.age)
+                tool.unlink()
+                if variant in ('escape', 'dangling'):
+                    tool.symlink_to('/usr/bin/bash' if variant == 'escape' else self.root / 'missing-target')
+                elif variant == 'directory':
+                    tool.mkdir()
+                else:
+                    tool.write_text(original)
+                    tool.chmod(0o775 if variant == 'writable' else 0o755)
+                with self.main_paths():
+                    if variant == 'owner':
+                        with mock.patch.object(self.agent, 'safe_path', side_effect=self.agent.Failure(10)):
+                            code, out, _ = self.capture(self.agent.main, ['status'])
+                    else:
+                        code, out, _ = self.capture(self.agent.main, ['status'])
+                self.assertEqual((code, out), (10, ''))
+                if tool.is_dir() and not tool.is_symlink():
+                    tool.rmdir()
+                    tool.write_text(original)
+                elif tool.is_symlink():
+                    tool.unlink()
+                    tool.write_text(original)
+                tool.chmod(0o755)
+
     def test_recipient_requires_private_key(self):
         for variant in ('missing', 'symlink', 'fifo', 'directory', 'mode', 'uid', 'empty', 'parent'):
             with self.subTest(variant=variant):
@@ -166,13 +246,15 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
     def test_recipient_prints_one_native_recipient(self):
         self.private_key()
         self.assertEqual(self.recipient(), (0, self.native + '\n', ''))
-        for body in ('print("plugin")', 'raise SystemExit(1)', 'import time; time.sleep(3)'):
+        for body in ('print("plugin")', *(f'print({value!r})' for value in (
+                'age1abc1' + 'a' * 54, *("age1" + c * 58 for c in '1bio'))),
+                     'raise SystemExit(1)', 'import time; time.sleep(3)'):
             with self.subTest(body=body):
                 self.age = self.stub('age-fault', body)
                 run = subprocess.run
                 def short_timeout(*args, **kwargs):
                     self.assertEqual(kwargs['timeout'], 30)
-                    kwargs['timeout'] = 0.05
+                    kwargs['timeout'] = 0.05 if 'time.sleep' in body else 30
                     return run(*args, **kwargs)
                 with mock.patch.object(self.agent.subprocess, 'run', side_effect=short_timeout):
                     self.assertEqual(self.recipient()[:2], (3, ''))
@@ -214,13 +296,23 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
         for sha in (self.untagged, self.tag_object):
             with self.subTest(sha=sha):
                 self.assertEqual(self.fetch(sha)[0], 4)
+                self.assertFalse((self.install / ('kit-' + sha)).exists())
+                self.assertEqual(list(self.install.glob('.kit-*')), [])
                 self.assertFalse(self.marker.exists())
-        for value in (self.sha + '\trefs/tags/v1.0.0\n' + self.sha + '\trefs/tags/v1.0.0\n',
-                      self.sha + '\trefs/tags/v1.0\n', self.sha + '\trefs/tags/candidate\n',
-                      self.tag_object + '\trefs/tags/v1.0.1\n' + self.annotated + '\trefs/tags/v1.0.1^{}\n'):
-            with self.subTest(value=value), self.assertRaises(self.agent.Failure) as failure:
-                self.agent.release_commit(value.encode(), self.tag_object if '^{}' in value else self.sha)
-            self.assertEqual(failure.exception.code, 4)
+        for name, value in (
+                ('duplicate', self.sha + '\trefs/tags/v1.0.0\n' + self.sha + '\trefs/tags/v1.0.0\n'),
+                ('short-version', self.sha + '\trefs/tags/v1.0\n'),
+                ('candidate', self.sha + '\trefs/tags/candidate\n')):
+            with self.subTest(refs=name):
+                wrapper = self.stub('git-refs', 'import os, sys\n'
+                    'if "ls-remote" in sys.argv:\n    print(' + repr(value) + ', end=""); sys.exit(0)\n'
+                    'os.execv("/usr/bin/git", ["/usr/bin/git"] + sys.argv[1:])\n')
+                self.private_key()
+                with mock.patch.object(self.agent.os.path, 'ismount', return_value=True):
+                    self.assertEqual(self.fetch(prepare=True, git_tool=wrapper)[0], 4)
+                self.assertFalse(self.destination.exists())
+                self.assertEqual(list(self.install.glob('.kit-*')), [])
+                self.assertFalse(self.marker.exists())
         # Both lightweight and peeled annotated release commits are accepted.
         for sha in (self.sha, self.annotated):
             with self.subTest(accepted=sha):
@@ -264,6 +356,151 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
                 self.assertEqual((code, out), (4, ''))
                 run.assert_not_called()
         self.state.chmod(0o700)
+
+    def test_prepare_timeout_releases_child_lock(self):
+        self.repository()
+        self.private_key()
+        child_lock, child_pid = self.root / 'child.lock', self.root / 'child.pid'
+        child = self.root / 'child.py'
+        child.write_text('import fcntl, os, signal, time\n'
+                         'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                         'lock = open(' + repr(str(child_lock)) + ', "w")\n'
+                         'fcntl.flock(lock, fcntl.LOCK_EX)\n'
+                         'open(' + repr(str(child_pid)) + ', "w").write(str(os.getpid()))\n'
+                         'time.sleep(60)\n')
+        bootstrap = self.source / self.agent.KIT / 'bootstrap.sh'
+        bootstrap.write_text('#!/usr/bin/bash\ntrap "" TERM\n/usr/bin/python3 ' + str(child) + ' &\nwait\n')
+        self.git('add', '.', cwd=self.source)
+        self.git('commit', '-m', 'fixture: child holds lock', cwd=self.source)
+        self.sha = self.git('rev-parse', 'HEAD', cwd=self.source)
+        self.git('tag', 'v2.0.0', cwd=self.source)
+        self.git('push', self.remote, 'HEAD', 'refs/tags/v2.0.0', cwd=self.source)
+        run, wait, killpg = subprocess.run, subprocess.Popen.wait, os.killpg
+        def short_run(*args, **kwargs):
+            if kwargs.get('timeout') == 3600:
+                kwargs['timeout'] = 0.5
+            return run(*args, **kwargs)
+        def short_wait(process, timeout=None):
+            return wait(process, timeout=0.5 if timeout == 3600 else 0.1 if timeout == 5 else timeout)
+        try:
+            with mock.patch.object(self.agent.os.path, 'ismount', return_value=True), \
+                    mock.patch.object(self.agent.subprocess, 'run', side_effect=short_run), \
+                    mock.patch.object(subprocess.Popen, 'wait', autospec=True, side_effect=short_wait), \
+                    mock.patch.object(self.agent.os, 'killpg', wraps=killpg) as signals:
+                self.assertEqual(self.fetch(prepare=True)[0], 7)
+            self.assertTrue(child_pid.exists(), 'fixture child never acquired its lock')
+            import fcntl
+            with child_lock.open('r') as lock:
+                deadline = time.monotonic() + 2
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            self.fail('bootstrap child kept the lock after timeout')
+                        time.sleep(0.01)
+            self.assertEqual([call.args[1] for call in signals.call_args_list], [signal.SIGTERM, signal.SIGKILL])
+            self.assertEqual(json.loads((self.state / 'last.json').read_text())['exit'], 7)
+            self.assertFalse((self.install / 'current').exists())
+        finally:
+            if child_pid.exists():
+                try:
+                    os.kill(int(child_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_fetch_journals_malformed_checkout_metadata(self):
+        self.repository()
+        self.assertEqual(self.fetch()[0], 0)
+        record = self.state / 'checkouts' / (self.sha + '.json')
+        original = record.read_text()
+        for value in ([], None, 1, 'text'):
+            with self.subTest(record=value):
+                (self.state / 'last.json').unlink(missing_ok=True)
+                record.write_text(json.dumps(value))
+                code, out, _ = self.fetch(prepare=True)
+                self.assertEqual((code, out), (4, ''))
+                self.assertEqual(json.loads((self.state / 'last.json').read_text())['exit'], 4)
+                self.assertFalse(self.marker.exists())
+        record.write_text(original)
+        # The tracked link remains unchanged; its ignored target loops. Force
+        # Python 3.12's RuntimeError as well on interpreters that use OSError.
+        link = self.destination / 'link'
+        original_resolve = Path.resolve
+        for variant in ('actual-loop', 'python312'):
+            with self.subTest(loop=variant):
+                (self.state / 'last.json').unlink(missing_ok=True)
+                def resolve(path, *args, **kwargs):
+                    if path == link:
+                        raise RuntimeError('symlink loop')
+                    return original_resolve(path, *args, **kwargs)
+                if variant == 'actual-loop':
+                    # Keep Git clean so resolution is the failing operation.
+                    target = self.destination / 'loop'
+                    target.symlink_to('loop')
+                    link.unlink()
+                    link.symlink_to('loop')
+                    original_git = self.agent.git_call
+                    def clean(tool, args, *rest, **kwargs):
+                        if args[0] == 'status':
+                            return b''
+                        return original_git(tool, args, *rest, **kwargs)
+                    patch = mock.patch.object(self.agent, 'git_call', side_effect=clean)
+                else:
+                    patch = mock.patch.object(Path, 'resolve', resolve)
+                try:
+                    with patch:
+                        self.assertEqual(self.fetch(prepare=True)[:2], (4, ''))
+                    self.assertEqual(json.loads((self.state / 'last.json').read_text())['exit'], 4)
+                    self.assertFalse(self.marker.exists())
+                finally:
+                    if variant == 'actual-loop':
+                        target.unlink()
+                        link.unlink()
+                        link.symlink_to('hosting/paperclip-hermes/kit/sfctl')
+
+    def test_successful_activation_reports_journal_failure_separately(self):
+        self.repository()
+        self.private_key()
+        atomic = self.agent.atomic_json
+        for failure in (OSError('journal unavailable'), self.agent.Failure(10)):
+            with self.subTest(failure=type(failure).__name__):
+                def fail_journal(path, *args):
+                    if path.name == 'last.json':
+                        raise failure
+                    return atomic(path, *args)
+                with mock.patch.object(self.agent, 'atomic_json', side_effect=fail_journal), \
+                        mock.patch.object(self.agent.os.path, 'ismount', return_value=True):
+                    code, out, _ = self.fetch(prepare=True)
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(out), {'fetched': self.sha,
+                    'path': str(self.destination / self.agent.KIT), 'prepared': True, 'journal_error': True})
+                self.assertEqual((self.install / 'current').resolve(), self.destination / self.agent.KIT)
+                self.assertTrue(self.marker.exists())
+
+    def test_tracked_link_checks_ignored_target_parents(self):
+        self.repository()
+        self.assertEqual(self.fetch()[0], 0)
+        kit = self.destination / self.agent.KIT
+        hidden = kit / '.secrets'
+        hidden.mkdir(mode=0o700)
+        target = hidden / 'nested'
+        target.mkdir(mode=0o700)
+        (target / 'file').write_text('fixture\n')
+        (target / 'file').chmod(0o600)
+        link = self.destination / 'link'
+        link.unlink()
+        link.symlink_to((target / 'file').relative_to(self.destination))
+        for parent in (hidden, target):
+            for mode in (0o770, 0o707):
+                with self.subTest(parent=parent.name, mode=mode):
+                    parent.chmod(mode)
+                    with self.assertRaises(self.agent.Failure) as failure:
+                        self.agent.ownership_walk(self.destination, b'link\0', self.uid)
+                    self.assertEqual(failure.exception.code, 4)
+                    parent.chmod(0o700)
+        self.agent.ownership_walk(self.destination, b'link\0', self.uid)
 
     def test_prepare_runs_after_verification(self):
         self.repository()
@@ -363,7 +600,16 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
         self.assertGreaterEqual(len(calls), 4)
         for call in calls:
             with self.subTest(call=ast.unparse(call)):
-                self.assertEqual(call.func.attr, 'run')
+                if call.func.attr == 'Popen':
+                    self.assertTrue(next(k.value.value for k in call.keywords if k.arg == 'start_new_session'))
+                else:
+                    self.assertEqual(call.func.attr, 'run')
+                    self.assertIn('timeout', [k.arg for k in call.keywords])
+        waits = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and isinstance(n.func.value, ast.Name) and n.func.value.id == 'process' and n.func.attr == 'wait']
+        self.assertTrue(waits)
+        for call in waits:
+            with self.subTest(wait=ast.unparse(call)):
                 self.assertIn('timeout', [k.arg for k in call.keywords])
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == 'tempfile':
@@ -371,7 +617,9 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
                     self.assertIn('dir', [kw.arg for kw in node.keywords])
         self.repository()
         self.private_key()
-        run = subprocess.run
+        run, wait = subprocess.run, subprocess.Popen.wait
+        def short_wait(process, timeout=None):
+            return wait(process, timeout=0.05 if timeout == 3600 else timeout)
         hang = self.stub('hanging-tool', 'import time; time.sleep(3)\n')
         def short_timeout(*args, **kwargs):
             kwargs['timeout'] = 0.05
@@ -381,7 +629,9 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
             self.assertEqual(self.recipient()[0], 3)
             self.assertEqual(self.fetch(git_tool=hang)[0], 4)
             self.assertEqual(self.agent.cloud_status(hang), 'unknown')
-            with mock.patch.object(self.agent.os.path, 'ismount', return_value=True), self.assertRaises(self.agent.Failure) as failure:
+            with mock.patch.object(self.agent.os.path, 'ismount', return_value=True), \
+                    mock.patch.object(subprocess.Popen, 'wait', autospec=True, side_effect=short_wait), \
+                    self.assertRaises(self.agent.Failure) as failure:
                 self.agent.prepare(self.source / self.agent.KIT, self.key, self.key_dir,
                                    self.data, self.uid, hang, self.agent.cleared_env(self.root))
             self.assertEqual(failure.exception.code, 7)
@@ -410,12 +660,12 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
                                    ('print("unparseable")', 'unknown'), ('print(\'{"status":"done"}\')', 'done')):
                 with self.subTest(cloud=expected):
                     self.cloud = self.stub('cloud-status', body)
-                    code, out, _ = self.capture(self.agent.status, self.agent_path, self.install, self.state, self.key,
-                                                self.key_dir, self.data, self.uid, self.cloud)
-                    value = json.loads(out)
+                    with self.main_paths(lock), mock.patch.object(self.agent, 'require_runtime'):
+                        code, out, _ = self.capture(self.agent.main, ['status'])
                     self.assertEqual(code, 0)
+                    value = json.loads(out)
                     self.assertLessEqual(len(out.encode()), 2048)
-                    self.assertEqual(set(value), {'agent', 'agent_sha256', 'cloud_init', 'delivery_key', 'data_mount', 'current', 'checkouts', 'last', 'truncated'})
+                    self.assertEqual(set(value), {'tools', 'agent', 'agent_sha256', 'cloud_init', 'delivery_key', 'data_mount', 'current', 'checkouts', 'last', 'truncated'})
                     self.assertEqual(value['cloud_init'], expected)
                     self.assertEqual(value['delivery_key'], 'ok')
                     self.assertEqual(value['current'], self.sha)
@@ -439,7 +689,13 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
         value = json.loads((BOOT / 'contract.json').read_text())
         self.assertEqual(value, {'path': str(self.agent.AGENT), 'agent_sha256': hashlib.sha256(AGENT.read_bytes()).hexdigest(),
                                 'commands': self.agent.COMMANDS, 'exit': self.agent.EXIT, 'absent_exit': 127, 'retry_exit': 8,
+                                'runtime_outcome': {**self.agent.RUNTIME_OUTCOME, '127': 'agent-unavailable', 'unknown': 'agent-unavailable'},
                                 'max_runtime_seconds': self.agent.MAX_RUNTIME_SECONDS, 'status_max_bytes': self.agent.STATUS_MAX_BYTES})
+        self.assertEqual(set(value['runtime_outcome']), {str(code) for code in self.agent.EXIT.values()} | {'127', 'unknown'})
+        readme = (BOOT / 'README.md').read_text()
+        rows = dict(re.findall(r'^\| ([0-9]+) \| [^|]+ \| ([a-z-]+) \|$', readme, re.M))
+        self.assertEqual(rows, self.agent.RUNTIME_OUTCOME)
+
 
     def test_requires_root_and_safe_paths(self):
         agent = self.root / 'agent'

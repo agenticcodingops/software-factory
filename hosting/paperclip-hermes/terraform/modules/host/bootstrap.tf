@@ -1,5 +1,5 @@
 locals {
-  forbidden_pattern = "(^|[^0-9a-fA-F])[0-9a-fA-F]{40}([^0-9a-fA-F]|$)|PRIVATE KEY|tskey-|sig=|kit_ref|kit_commit"
+  forbidden_pattern = "(^|[^0-9a-fA-F])[0-9a-fA-F]{40}([^0-9a-fA-F]|$)|PRIVATE KEY|tskey-|sig=|kit_ref|kit_commit|(?i:age-secret-key-)"
   rendered_template = templatefile("${path.module}/bootstrap/cloud-init.yaml.tftpl", {
     agent_gz_b64 = base64gzip(file("${path.module}/bootstrap/sf-host-agent"))
   })

@@ -97,7 +97,9 @@ runcmd:
       /usr/bin/age-keygen >"$tmp" 2>/dev/null
       chmod 0600 "$tmp"
       chown root:root "$tmp"
+      sync "$tmp"
       ln "$tmp" /etc/paperclip-hermes/delivery.key
+      sync /etc/paperclip-hermes
       rm -f "$tmp"
       trap - EXIT HUP INT TERM
     fi

@@ -127,3 +127,17 @@ run "reject_new_vm_flag_with_receipt_bytes" {
   variables { bootstrap_render_for_new_vm = true }
   expect_failures = [terraform_data.invariants]
 }
+
+run "reject_upper_age_identity_in_receipt" {
+  command = plan
+  module { source = "../../modules/host" }
+  variables { bootstrap_custom_data = base64encode("#cloud-config\n${join("-", ["AGE", "SECRET", "KEY"])}-1${join("", [for i in range(58) : "Q"])}\n") }
+  expect_failures = [terraform_data.invariants]
+}
+
+run "reject_lower_age_identity_in_receipt" {
+  command = plan
+  module { source = "../../modules/host" }
+  variables { bootstrap_custom_data = base64encode("#cloud-config\n${join("-", ["age", "secret", "key"])}-1${join("", [for i in range(58) : "Q"])}\n") }
+  expect_failures = [terraform_data.invariants]
+}

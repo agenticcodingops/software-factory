@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -35,13 +36,17 @@ KIT = Path('hosting/paperclip-hermes/kit')
 EXIT = {'ok': 0, 'internal': 1, 'usage': 2, 'recipient': 3, 'verification': 4,
         'data_mount': 6, 'prepare': 7, 'busy': 8, 'unsafe': 10}
 COMMANDS = {
-    'recipient': {'argv': ['recipient'], 'lock': True, 'stdout': '^age1[0-9a-z]{58}$'},
+    'recipient': {'argv': ['recipient'], 'lock': True, 'stdout': '^age1[02-9ac-hj-np-z]{58}$'},
     'fetch': {'argv': ['fetch', SHA_PATTERN, '[--prepare-only]'], 'lock': True,
-              'stdout': 'JSON: fetched, path (verified); prepared: true also after prepare'},
+              'stdout': 'JSON: fetched, path (verified); prepared: true also after prepare; journal_error: true if activation succeeded but journaling failed'},
     'status': {'argv': ['status'], 'lock': False, 'stdout': 'JSON status object'},
 }
 MAX_RUNTIME_SECONDS = {'recipient': 60, 'fetch': 4200, 'status': 60}
 STATUS_MAX_BYTES = 2048
+RUNTIME_OUTCOME = {'0': 'success', '1': 'agent-unavailable', '2': 'invalid-request',
+                   '3': 'agent-unavailable', '4': 'verification-failed',
+                   '6': 'recovery-required', '7': 'prepare-failed', '8': 'retry-later',
+                   '10': 'unsafe-host'}
 
 
 class Failure(Exception):
@@ -77,6 +82,7 @@ def require_runtime(agent, sbin, interpreter, tools, expected_uid, effective_uid
             # owner and the resolved executable; Linux ignores link mode bits.
             require(path.lstat().st_uid == expected_uid, 'unsafe')
             resolved = path.resolve(strict=True)
+            require(resolved.is_relative_to(path.parent.resolve(strict=True)), 'unsafe')
             safe_path(resolved.parent, expected_uid, directory=True)
             safe_path(resolved, expected_uid)
     except (OSError, RuntimeError):
@@ -119,7 +125,7 @@ def recipient(path, parent, expected_uid, age_tool):
                                 stderr=subprocess.PIPE, env=cleared_env('/'), timeout=30)
         require(result.returncode == 0, 'recipient')
         line = result.stdout.decode('ascii')
-        require(re.fullmatch(r'age1[0-9a-z]{58}\n?', line) is not None, 'recipient')
+        require(re.fullmatch(r'age1[02-9ac-hj-np-z]{58}\n?', line) is not None, 'recipient')
         print(line.rstrip('\n'))
         return EXIT['ok']
     except (OSError, UnicodeError, subprocess.TimeoutExpired, Failure):
@@ -180,6 +186,10 @@ def owned_entry(path, root, expected_uid, allow_link=False):
         require(allow_link, 'verification')
         target = path.resolve(strict=True)
         require(target.is_relative_to(root), 'verification')
+        for parent in target.parents if target != root else ():
+            owned_entry(parent, root, expected_uid)
+            if parent == root:
+                break
         info = target.stat()
         require(info.st_uid == expected_uid, 'verification')
     require(not info.st_mode & 0o022 and
@@ -309,13 +319,31 @@ def prepare(kit, key, key_parent, data, expected_uid, bash_tool, env):
     try:
         # Spool output, retaining at most the tail in memory; never publish it.
         with tempfile.TemporaryFile(dir=env['HOME']) as out, tempfile.TemporaryFile(dir=env['HOME']) as err:
-            result = subprocess.run([bash_tool, str(kit / 'bootstrap.sh'), '--non-interactive',
-                                     '--prepare-only', str(data)], cwd=kit, env=env,
-                                    stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=3600)
+            with subprocess.Popen([bash_tool, str(kit / 'bootstrap.sh'), '--non-interactive',
+                                   '--prepare-only', str(data)], cwd=kit, env=env,
+                                  stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                  start_new_session=True) as process:
+                try:
+                    code = process.wait(timeout=3600)
+                except subprocess.TimeoutExpired:
+                    # Children inherit the kit's lock. Signal the whole session's
+                    # process group, even if Bash exits before its children do.
+                    for sig in (signal.SIGTERM, signal.SIGKILL):
+                        try:
+                            os.killpg(process.pid, sig)
+                        except ProcessLookupError:
+                            pass
+                        if sig == signal.SIGTERM:
+                            try:
+                                process.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                pass
+                    process.wait(timeout=5)
+                    raise
             for stream in (out, err):
                 stream.seek(max(0, stream.tell() - 2048))
                 stream.read(2048)
-            require(result.returncode == 0, 'prepare')
+            require(code == 0, 'prepare')
     except (OSError, subprocess.TimeoutExpired):
         raise Failure(EXIT['prepare']) from None
 
@@ -354,7 +382,7 @@ def fetch(sha, prepare_only, install, state, key, key_parent, data,
                 result['prepared'] = True
     except Failure as exc:
         code = exc.code if exc.code in (EXIT['recipient'], EXIT['data_mount'], EXIT['prepare']) else EXIT['verification']
-    except (OSError, ValueError, UnicodeError, KeyError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, UnicodeError, KeyError, TypeError, RuntimeError, subprocess.TimeoutExpired):
         code = EXIT['verification']
     finally:
         os.umask(previous_umask)
@@ -362,7 +390,11 @@ def fetch(sha, prepare_only, install, state, key, key_parent, data,
         atomic_json(state / 'last.json', {'command': 'fetch', 'sha': sha, 'phase': phase,
                     'exit': code, 'started': started, 'finished': utc_now()}, expected_uid)
     except (OSError, Failure):
-        return EXIT['verification']
+        if code != EXIT['ok'] or not prepare_only:
+            return EXIT['verification']
+        # Preparation and activation already succeeded. Preserve their result
+        # so callers do not retry a completed host mutation as verification.
+        result['journal_error'] = True
     if code == EXIT['ok']:
         print(json.dumps(result, sort_keys=True))
     return code
@@ -399,7 +431,7 @@ def last_status(state, expected_uid):
         return None
 
 
-def status(agent, install, state, key, key_parent, data, expected_uid, cloud_tool):
+def status(agent, install, state, key, key_parent, data, expected_uid, cloud_tool, tools=None):
     key_state = 'unsafe'
     try:
         fd = private_descriptor(key, key_parent, expected_uid)
@@ -424,7 +456,7 @@ def status(agent, install, state, key, key_parent, data, expected_uid, cloud_too
              'cloud_init': cloud_status(cloud_tool), 'delivery_key': key_state,
              'data_mount': os.path.ismount(data), 'current': current,
              'checkouts': shas[:8], 'last': last_status(state, expected_uid),
-             'truncated': len(shas) > 8}
+             'truncated': len(shas) > 8, 'tools': tools or {}}
     output = json.dumps(value, sort_keys=True, separators=(',', ':'))
     require(len(output.encode()) + 1 <= STATUS_MAX_BYTES, 'internal')
     print(output)
@@ -434,15 +466,24 @@ def status(agent, install, state, key, key_parent, data, expected_uid, cloud_too
 def main(argv=None):
     try:
         args = sys.argv[1:] if argv is None else argv
-        require_runtime(AGENT, SBIN, PYTHON, (GIT, AGE, CLOUD_INIT, BASH), 0, os.geteuid())
+        require_runtime(AGENT, SBIN, PYTHON, (), 0, os.geteuid())
         if args == ['status']:
-            return status(AGENT, INSTALL, STATE, KEY, KEY_DIR, DATA, 0, CLOUD_INIT)
+            tools = {}
+            for tool in (GIT, AGE, CLOUD_INIT, BASH):
+                if not os.path.lexists(tool):
+                    tools[Path(tool).name] = 'missing'
+                else:
+                    require_runtime(AGENT, SBIN, PYTHON, (tool,), 0, os.geteuid())
+                    tools[Path(tool).name] = 'ok'
+            return status(AGENT, INSTALL, STATE, KEY, KEY_DIR, DATA, 0, CLOUD_INIT, tools)
         if args == ['recipient']:
+            require_runtime(AGENT, SBIN, PYTHON, (AGE,), 0, os.geteuid())
             with exclusive_lock(LOCK, 0):
                 return recipient(KEY, KEY_DIR, 0, AGE)
         if len(args) in (2, 3) and args[0] == 'fetch' and (len(args) == 2 or args[2] == '--prepare-only'):
             if re.fullmatch(SHA_PATTERN, args[1]) is None:
                 return EXIT['usage']
+            require_runtime(AGENT, SBIN, PYTHON, (GIT, BASH) if len(args) == 3 else (GIT,), 0, os.geteuid())
             with exclusive_lock(LOCK, 0):
                 return fetch(args[1], len(args) == 3, INSTALL, STATE, KEY, KEY_DIR, DATA,
                              0, GIT, BASH, SOURCE_REMOTE, 'https')
