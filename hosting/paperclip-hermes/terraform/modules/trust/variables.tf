@@ -66,8 +66,17 @@ variable "workflow_refs" {
       ]])) && alltrue([for identity, refs in var.workflow_refs :
       sum(concat([0], [for ref in values(refs) : length(lookup(lookup(jsondecode(file("${path.module}/federation-allowlist.json")).identities, identity, {}), basename(split("@", ref)[0]), []))])) <= 20
     ]) && alltrue([for refs in values(var.workflow_refs) : length(values(refs)) == length(distinct(values(refs)))])
-    error_message = "Identity/file must be allowlisted and unique per identity; expanded credentials must not exceed 20; prune obsolete SHAs after handoff. Requested: ${join(", ", flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) : "${identity}/${basename(split("@", ref)[0])}"]]))}."
+    error_message = "Identity/file must be allowlisted and unique per identity; expanded credentials must not exceed 20; prune obsolete SHAs after handoff. Rejected identity/file: ${join(", ", flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) : "${identity}/${basename(split("@", ref)[0])}" if !contains(keys(lookup(jsondecode(file("${path.module}/federation-allowlist.json")).identities, identity, {})), basename(split("@", ref)[0]))]]))}."
   }
+  validation {
+    condition = alltrue([for refs in values(var.workflow_refs) :
+      length(distinct([for ref in values(refs) : split("/.github/", ref)[0]])) <= 1
+      ]) && length(distinct(flatten([for identity, refs in var.workflow_refs :
+        [for ref in values(refs) : split("/.github/", ref)[0]] if contains(["ops", "mint", "deploy"], identity)
+    ]))) <= 1
+    error_message = "Each identity's refs must share one owner/repo; ops, mint and deploy must share the same source repository."
+  }
+
 
 
 }

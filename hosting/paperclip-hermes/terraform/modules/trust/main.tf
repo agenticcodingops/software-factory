@@ -45,7 +45,7 @@ locals {
   CONDITION
   target_grants = { for identity in keys(local.environments) : identity => merge([
     for key, target in var.targets : {
-      for role in lookup(local.target_roles, identity, []) :
+      for role in local.target_roles[identity] :
       ((startswith(role, "Cost Management") || contains(["SF Authorization Reader", "SF Prerequisite Reader"], role)) ? "${target.subscription_resource_id}-${role}" : "${key}-${role}") => {
         role_definition_id_or_name = role == "SF Prerequisite Reader" ? azurerm_role_definition.target["prerequisite_reader"].role_definition_resource_id : role == "SF Authorization Reader" ? azurerm_role_definition.target["authorization_reader"].role_definition_resource_id : role == "SF Host Operator" ? azurerm_role_definition.target["host_operator"].role_definition_resource_id : role
         scope                      = (startswith(role, "Cost Management") || contains(["SF Authorization Reader", "SF Prerequisite Reader"], role)) ? target.subscription_resource_id : "${target.subscription_resource_id}/resourceGroups/${target.resource_group_name}"
@@ -201,8 +201,8 @@ resource "azurerm_role_definition" "migration_writer" {
 resource "terraform_data" "federation_contract" {
   lifecycle {
     precondition {
-      condition     = alltrue([for identity in setunion(toset(keys(local.environments)), toset(keys(var.workflow_refs))) : contains(keys(local.target_roles), identity)])
-      error_message = "Every identity requires an explicit target role table entry; unknown identities have no default role."
+      condition     = toset(keys(local.allowlist.identities)) == toset(keys(local.target_roles))
+      error_message = "Identity allowlist and target role table differ: ${join(", ", setunion(setsubtract(toset(keys(local.allowlist.identities)), toset(keys(local.target_roles))), setsubtract(toset(keys(local.target_roles)), toset(keys(local.allowlist.identities)))))}. Every identity requires an explicit role entry."
     }
     precondition {
       condition = alltrue([for identity, refs in var.workflow_refs :

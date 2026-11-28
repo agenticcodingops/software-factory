@@ -167,13 +167,36 @@ class MintBoundaryTests(unittest.TestCase):
                                   "change": {"after": {"subject": case["subject"], "issuer": fixture["issuer"], "audience": [fixture["audience"]]}}}
                     self.assertTrue(inspector.inspect_plan({"resource_changes": [credential]}))
 
+    def test_mint_plan_fragments_enforce_grant_keys(self):
+        fragments = json.loads((BASE.parent / "tools/tests/fixtures/mint-boundary.json").read_text())["plan_fragments"]
+        for name, rejected in (("forbidden", True), ("allowed", False)):
+            with self.subTest(fragment=name):
+                self.assertEqual(bool(inspector.inspect_plan(fragments[name])), rejected)
+
+    def test_mint_grants_reject_other_keys_and_nonbackup_scopes(self):
+        fragments = json.loads((BASE.parent / "tools/tests/fixtures/mint-boundary.json").read_text())["plan_fragments"]
+        for key in ("state_read", "authorization_read", "backup_read", "backup_write", "delegation"):
+            with self.subTest(key=key):
+                plan = json.loads(json.dumps(fragments["allowed"]))
+                resource = plan["resource_changes"][2]
+                resource["address"] = 'module.trust.module.identities["mint"].azurerm_role_assignment.this["' + key + '"]'
+                resource["change"]["after"]["scope"] = resource["change"]["after"]["scope"].replace("/containers/backups", "/containers/tfstate")
+                self.assertTrue(inspector.inspect_plan(plan))
+
+    def test_mint_twin_resources_are_rejected_without_assignments(self):
+        for typ in ("azurerm_user_assigned_identity", "azurerm_federated_identity_credential", "terraform_data"):
+            with self.subTest(resource_type=typ):
+                resource = {"address": 'module.trust.module.target_identities["mint"].' + typ + '.this',
+                            "type": typ, "change": {"after": {}}}
+                self.assertIn("mint must have no tenant twin", inspector.inspect_plan({"resource_changes": [resource]}))
+
     def test_mint_compute_action_is_rejected_at_every_scope(self):
         for scope in ("/mock/subscription", "/mock/rg", "/mock/storage"):
             for action in ("Microsoft.Compute/virtualMachines/read", "Microsoft.Compute/virtualMachines/runCommands/*", "*"):
                 with self.subTest(scope=scope, action=action):
                     plan = {"resource_changes": [
                         {"type": "azurerm_role_definition", "change": {"after": {"role_definition_resource_id": "/mock/role", "permissions": [{"actions": [action]}]}}},
-                        {"address": 'module.trust.module.identities["mint"].azurerm_role_assignment.this["bad"]', "type": "azurerm_role_assignment",
+                        {"address": 'module.trust.module.identities["mint"].azurerm_role_assignment.this["delegation"]', "type": "azurerm_role_assignment",
                          "change": {"after": {"role_definition_id": "/mock/role", "scope": scope}}}
                     ]}
                     self.assertTrue(inspector.inspect_plan(plan))
@@ -182,13 +205,15 @@ class MintBoundaryTests(unittest.TestCase):
                     plan["resource_changes"][1]["change"]["after"]["role_definition_name"] = "computed-custom-role"
                     self.assertTrue(inspector.inspect_plan(plan))
                     plan["resource_changes"][0]["change"]["after"]["permissions"] = [{"actions": ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"]}]
+                    plan["resource_changes"][1]["change"]["after"]["scope"] = "/mock/providers/Microsoft.Storage/storageAccounts/sffixturebackups"
                     self.assertFalse(inspector.inspect_plan(plan))
 
     def test_mint_builtin_compute_roles_are_rejected(self):
         for role in ("Contributor", "Reader", "Virtual Machine Contributor"):
-            resource = {"address": 'module.trust.module.identities["mint"].azurerm_role_assignment.this["bad"]',
-                        "type": "azurerm_role_assignment", "change": {"after": {"role_definition_name": role, "scope": "/mock/rg"}}}
-            self.assertTrue(inspector.inspect_plan({"resource_changes": [resource]}))
+            with self.subTest(role=role):
+                resource = {"address": 'module.trust.module.identities["mint"].azurerm_role_assignment.this["bad"]',
+                            "type": "azurerm_role_assignment", "change": {"after": {"role_definition_name": role, "scope": "/mock/rg"}}}
+                self.assertTrue(inspector.inspect_plan({"resource_changes": [resource]}))
 
 
 if __name__ == "__main__":

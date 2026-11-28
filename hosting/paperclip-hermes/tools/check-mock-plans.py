@@ -37,7 +37,7 @@ def credential_findings(resource, values):
 def mint_boundary_findings(plan):
     resources = plan.get("resource_changes", [])
     if not any(r.get("type") == "azurerm_federated_identity_credential" or
-               r.get("type") == "azurerm_role_assignment" and '["mint"]' in r.get("address", "") for r in resources):
+               '["mint"]' in r.get("address", "") for r in resources):
         return []
     fixture = json.loads((Path(__file__).parent / "tests/fixtures/mint-boundary.json").read_text())
     errors = []
@@ -50,21 +50,31 @@ def mint_boundary_findings(plan):
     for resource in resources:
         after = resource.get("change", {}).get("after") or {}
         address = resource.get("address", "")
+        if address.startswith('module.trust.module.target_identities["mint"].'):
+            errors.append("mint must have no tenant twin")
         if resource.get("type") == "azurerm_federated_identity_credential":
             for case in fixture["cases"]:
                 if (any(f'["{identity}"]' in address for identity in case["identities"]) and
                         after.get("issuer") == fixture["issuer"] and fixture["audience"] in after.get("audience", []) and
                         after.get("subject") == case["subject"]):
                     errors.append("mint boundary: forbidden subject can exchange " + address)
-        if resource.get("type") == "azurerm_role_assignment" and '["mint"]' in address:
+        if (resource.get("type") == "azurerm_role_assignment" and
+                address.startswith('module.trust.module.identities["mint"].')):
+            key = re.search(r'\.azurerm_role_assignment\.this\["([^\"]+)"\]$', address)
+            grant = key[1] if key else None
+            if grant not in {"backup_write", "backup_read", "delegation"}:
+                errors.append("mint has forbidden grant key at " + address)
+            scope = after.get("scope", "")
+            if ((grant in {"backup_write", "backup_read"} and
+                 not re.search(r'/providers/Microsoft.Storage/storageAccounts/[^/]+backups/blobServices/default/containers/backups$', scope)) or
+                    (grant == "delegation" and not re.search(r'/providers/Microsoft.Storage/storageAccounts/[^/]+backups$', scope))):
+                errors.append("mint grant must use the backups container/account at " + address)
             # Built-in reader/contributor roles have Compute rights even if mocked IDs collide.
             name = after.get("role_definition_name")
             role_id = after.get("role_definition_id")
             if ((role_id not in definitions and name != "Storage Blob Data Reader") or
                     any(a.lower().startswith("microsoft.compute/") or a == "*" for a in definitions.get(role_id, []))):
                 errors.append("mint has Microsoft.Compute or non-backup rights at " + str(after.get("scope")))
-            if 'module.target_identities["mint"]' in address:
-                errors.append("mint must have no tenant twin")
     return errors
 
 
