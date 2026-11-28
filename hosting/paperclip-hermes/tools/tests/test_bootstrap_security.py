@@ -216,20 +216,31 @@ class BootstrapSecurityTests(unittest.TestCase):
         self.assertEqual(request['caller_sha'], 'merged-sha')
 
     def test_federation_filters_withdrawn_claims_for_all_consumers(self):
-        claims = {'one': {'job_workflow_ref': REF, 'sub': 'prefix:environment:plan:job_workflow_ref:' + REF}, 'removed': {'job_workflow_ref': REF, 'sub': 'stale'}}
+        ref = 'example-org/example-instance/.github/workflows/ph-plan.yml@' + 'a' * 40
+        claims = {'one': {'job_workflow_ref': ref, 'sub': 'prefix:environment:plan:job_workflow_ref:' + ref}, 'removed': {'job_workflow_ref': ref, 'sub': 'stale'}}
         self.app.save('config/receipts/oidc.json', {'sub_claim_prefix': 'prefix', 'claims': {'plan': claims}})
-        self.app.save('config/instance.tfvars.json', {'workflow_refs': {'plan': {'one': REF}}})
+        self.app.save('config/instance.tfvars.json', {'workflow_refs': {'plan': {'one': ref}}})
         with patch.object(self.app, 'gate_check'):
             receipt, _ = self.app.federation()
         self.assertEqual(set(receipt['claims']['plan']), {'one'})
 
     def test_new_static_callers_parse_with_jobs_after_mapping_key(self):
         import yaml
-        refs = {w: 'sample/source/.github/workflows/' + w + '.yml@' + 'a' * 40 for w in ('ph-ops', 'ph-power', 'ph-cost-guard', 'ph-backup-verify')}
+        refs = {w: 'example-org/example-instance/.github/workflows/' + w + '.yml@' + 'a' * 40 for w in ('ph-ops', 'ph-power', 'ph-cost-guard', 'ph-backup-verify')}
+        self.app.save('config/instance.tfvars.json', {'targets': {'primary': {
+            'subscription_resource_id': '/subscriptions/00000000-0000-0000-0000-000000000000',
+            'resource_group_name': 'rg-example'}}})
         def gh(path):
-            return {'tree': [], 'truncated': False} if '/git/trees/' in path else [{'name': 'v1.0.0', 'commit': {'sha': 'a' * 40}}]
-        with patch.object(self.app, 'gh', side_effect=gh):
+            self.assertIn('/git/trees/', path)
+            return {'tree': [], 'truncated': False}
+        def az(*args):
+            if args[:2] == ('vm', 'list'):
+                return [{'id': '/mock/vm'}]
+            self.assertEqual(args[:2], ('vm', 'show'))
+            return {'tags': {'sf-approved-sha': 'a' * 40}}
+        with patch.object(self.app, 'gh', side_effect=gh), patch.object(self.app, 'az', side_effect=az), patch.object(self.app, 'release_for_sha', return_value='v1.0.0') as release:
             self.app.ops_callers('primary', refs, False)
+        self.assertEqual(release.call_count, 4)
         for workflow, ref in refs.items():
             caller = yaml.safe_load((self.home / '.github/workflows' / (workflow + '.yml')).read_text())
             self.assertEqual(caller['jobs']['target-primary']['uses'], ref)
