@@ -55,8 +55,10 @@ The commands require standalone `jq`, `gh` and `diff` on PATH. Each JSON project
 is rendered to a temporary file with a checked exit status before comparison.
 Run each Bash subshell below as a standalone command. Do not chain it with `&&`, `||` or `if`, which can disable errexit
 ([Bash conditional command rules](https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html)).
-The first command shows the active account; use `gh auth switch` to the
-organization-admin account if it shows a different login.
+Export `OPERATOR_LOGIN=<organization-admin login>` before running a block. Each block
+stops before any API write if `gh api user` returns a different login or OPERATOR_LOGIN
+is unset. Use `gh auth switch` to select the configured organization-admin account
+([GitHub CLI account switching](https://cli.github.com/manual/gh_auth_switch)).
 
 Apply `software-factory-main` first. It takes effect at once: squash only, CODEOWNER
 approval of the latest push, and the `checks` status. Open PRs need that status on their
@@ -65,7 +67,9 @@ head. The later bootstrap `rulesets` run finds this ruleset by name and updates 
 ```bash
 (
 set -euo pipefail
-gh api user --jq .login
+login=$(gh api user --jq .login) || exit 1
+[ "$login" = "${OPERATOR_LOGIN:?set OPERATOR_LOGIN to the organization-admin login}" ] || { echo "active gh login '$login' is not OPERATOR_LOGIN; run gh auth switch" >&2; exit 1; }
+echo "$login"
 command -v jq >/dev/null
 command -v gh >/dev/null
 f=hosting/paperclip-hermes/rulesets/public-repo.json
@@ -88,7 +92,9 @@ diff "$scratch/expected" "$scratch/actual"
 ```bash
 (
 set -euo pipefail
-gh api user --jq .login
+login=$(gh api user --jq .login) || exit 1
+[ "$login" = "${OPERATOR_LOGIN:?set OPERATOR_LOGIN to the organization-admin login}" ] || { echo "active gh login '$login' is not OPERATOR_LOGIN; run gh auth switch" >&2; exit 1; }
+echo "$login"
 command -v jq >/dev/null
 command -v gh >/dev/null
 d=hosting/paperclip-hermes/rulesets; f=$d/org-release-notes-gate.json; p=$d/org-release-notes-gate.pin.json
@@ -127,7 +133,9 @@ team ID into a temporary body and never commit it:
 ```bash
 (
 set -euo pipefail
-gh api user --jq .login
+login=$(gh api user --jq .login) || exit 1
+[ "$login" = "${OPERATOR_LOGIN:?set OPERATOR_LOGIN to the organization-admin login}" ] || { echo "active gh login '$login' is not OPERATOR_LOGIN; run gh auth switch" >&2; exit 1; }
+echo "$login"
 command -v jq >/dev/null
 command -v gh >/dev/null
 f=hosting/paperclip-hermes/rulesets/public-release-tags.json

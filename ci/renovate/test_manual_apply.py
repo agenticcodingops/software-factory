@@ -139,7 +139,8 @@ class ManualApplyTests(unittest.TestCase):
             temp.mkdir()
             env = {**os.environ, "PATH":directory if missing_jq else directory + os.pathsep + os.environ["PATH"],
                    "APPLY_STATE":directory, "APPLY_ROOT":str(cwd), "RELEASE_TEAM_SLUG":"release-fixture",
-                   "TMPDIR":str(temp), **scenario}
+                   "TMPDIR":str(temp), "OPERATOR_LOGIN":"operator-fixture", **scenario}
+            env = {key: value for key, value in env.items() if value is not None}
             result = subprocess.run(["bash", "-c", block], cwd=cwd, env=env, capture_output=True, text=True)
             calls = [json.loads(line) for line in (state / "calls").read_text().splitlines()]
             leftovers = list(temp.iterdir())
@@ -250,11 +251,22 @@ class ManualApplyTests(unittest.TestCase):
                     self.assertNotEqual(result.stdout, "operator-fixture\n")
                     self.assertEqual(leftovers, [])
 
+    def test_wrong_or_missing_operator_login_stops_before_any_write(self):
+        for number, block in enumerate(self.blocks()):
+            for login in ("someone-else", None):
+                with self.subTest(block=number, login=login):
+                    result, calls, leftovers, _ = self.run_block(block, OPERATOR_LOGIN=login)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(any("--method" in call for call in calls))
+                    self.assertEqual(calls, [["api", "user", "--jq", ".login"]])
+                    self.assertEqual(leftovers, [])
+
     def test_each_apply_is_a_standalone_subshell(self):
         for block in self.blocks():
             self.assertTrue(block.startswith("(\nset -euo pipefail\n"))
             self.assertTrue(block.endswith("\n)"))
-            self.assertIn("gh api user --jq .login", block)
+            comparison = '[ "$login" = "${OPERATOR_LOGIN:?set OPERATOR_LOGIN to the organization-admin login}" ]'
+            self.assertLess(block.index(comparison), block.index("--method"))
 
     def test_only_organization_admin_null_actor_id_is_normalized(self):
         for number, block in enumerate(self.blocks()):
