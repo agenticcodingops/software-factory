@@ -253,6 +253,17 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
         self.assertEqual(self.fetch()[0], 0)
         (self.destination / '.gitignore').chmod(0o664)
         self.assertEqual(self.fetch()[0], 4)
+        # Unsafe state cannot be journaled; still fail verification before Git.
+        for uid, mode in ((self.uid + 1, 0o700), (self.uid, 0o770)):
+            with self.subTest(state_uid=uid, state_mode=mode):
+                self.state.chmod(mode)
+                with mock.patch.object(self.agent.subprocess, 'run') as run:
+                    code, out, _ = self.capture(self.agent.fetch, self.sha, False, self.install,
+                                               self.state, self.key, self.key_dir, self.data, uid,
+                                               '/usr/bin/git', '/usr/bin/bash', self.remote, 'file')
+                self.assertEqual((code, out), (4, ''))
+                run.assert_not_called()
+        self.state.chmod(0o700)
 
     def test_prepare_runs_after_verification(self):
         self.repository()

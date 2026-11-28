@@ -358,8 +358,11 @@ def fetch(sha, prepare_only, install, state, key, key_parent, data,
         code = EXIT['verification']
     finally:
         os.umask(previous_umask)
-    atomic_json(state / 'last.json', {'command': 'fetch', 'sha': sha, 'phase': phase,
-                'exit': code, 'started': started, 'finished': utc_now()}, expected_uid)
+    try:
+        atomic_json(state / 'last.json', {'command': 'fetch', 'sha': sha, 'phase': phase,
+                    'exit': code, 'started': started, 'finished': utc_now()}, expected_uid)
+    except (OSError, Failure):
+        return EXIT['verification']
     if code == EXIT['ok']:
         print(json.dumps(result, sort_keys=True))
     return code
