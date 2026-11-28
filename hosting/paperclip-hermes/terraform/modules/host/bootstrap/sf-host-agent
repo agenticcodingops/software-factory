@@ -1,0 +1,499 @@
+#!/usr/bin/python3 -I
+"""Fixed host bootstrap boundary. No configuration or kit imports."""
+
+import contextlib
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import heapq
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+
+AGENT = Path('/usr/local/sbin/sf-host-agent')
+SBIN = Path('/usr/local/sbin')
+PYTHON = Path('/usr/bin/python3')
+GIT = '/usr/bin/git'
+AGE = '/usr/bin/age-keygen'
+CLOUD_INIT = '/usr/bin/cloud-init'
+BASH = '/usr/bin/bash'
+KEY_DIR = Path('/etc/paperclip-hermes')
+KEY = KEY_DIR / 'delivery.key'
+INSTALL = Path('/opt/software-factory')
+DATA = Path('/data')
+STATE = Path('/var/lib/sf-host-agent')
+LOCK = Path('/run/sf-host-agent.lock')
+SOURCE_REMOTE = 'https://github.com/agenticcodingops/software-factory.git'
+SHA_PATTERN = r'^[0-9a-f]{40}$'
+KIT = Path('hosting/paperclip-hermes/kit')
+EXIT = {'ok': 0, 'internal': 1, 'usage': 2, 'recipient': 3, 'verification': 4,
+        'data_mount': 6, 'prepare': 7, 'busy': 8, 'unsafe': 10}
+COMMANDS = {
+    'recipient': {'argv': ['recipient'], 'lock': True, 'stdout': '^age1[02-9ac-hj-np-z]{58}$'},
+    'fetch': {'argv': ['fetch', SHA_PATTERN, '[--prepare-only]'], 'lock': True,
+              'stdout': 'JSON: fetched, path (verified); prepared: true also after prepare; journal_error: true if activation succeeded but journaling failed'},
+    'status': {'argv': ['status'], 'lock': False, 'stdout': 'JSON status object'},
+}
+MAX_RUNTIME_SECONDS = {'recipient': 60, 'fetch': 4200, 'status': 60}
+STATUS_MAX_BYTES = 2048
+RUNTIME_OUTCOME = {'0': 'success', '1': 'agent-unavailable', '2': 'invalid-request',
+                   '3': 'agent-unavailable', '4': 'verification-failed',
+                   '6': 'recovery-required', '7': 'prepare-failed', '8': 'retry-later',
+                   '10': 'unsafe-host'}
+
+
+class Failure(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+def require(condition, code):
+    if not condition:
+        raise Failure(EXIT[code])
+
+
+def safe_path(path, expected_uid, directory=False, mode=None):
+    """Inspect the inode, refusing links except for trusted tool resolution."""
+    info = Path(path).lstat()
+    require(info.st_uid == expected_uid and not info.st_mode & 0o022, 'unsafe')
+    require(stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode), 'unsafe')
+    if mode is not None:
+        require(stat.S_IMODE(info.st_mode) == mode, 'unsafe')
+    return info
+
+
+def require_runtime(agent, sbin, interpreter, tools, expected_uid, effective_uid):
+    try:
+        require(effective_uid == expected_uid, 'unsafe')
+        safe_path(agent, expected_uid)
+        safe_path(sbin, expected_uid, directory=True)
+        for tool in (interpreter, *tools):
+            path = Path(tool)
+            require(path.is_absolute(), 'unsafe')
+            safe_path(path.parent, expected_uid, directory=True)
+            # /usr/bin/python3 is a distribution-managed link. Check both its
+            # owner and the resolved executable; Linux ignores link mode bits.
+            require(path.lstat().st_uid == expected_uid, 'unsafe')
+            resolved = path.resolve(strict=True)
+            require(resolved.is_relative_to(path.parent.resolve(strict=True)), 'unsafe')
+            safe_path(resolved.parent, expected_uid, directory=True)
+            safe_path(resolved, expected_uid)
+    except (OSError, RuntimeError):
+        raise Failure(EXIT['unsafe']) from None
+
+
+def private_descriptor(path, parent, expected_uid):
+    try:
+        safe_path(parent, expected_uid, directory=True, mode=0o700)
+        require(Path(path).parent == Path(parent), 'recipient')
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            info = os.fstat(fd)
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == expected_uid
+                    and info.st_mode & 0o077 == 0 and info.st_size > 0, 'recipient')
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+    except (OSError, Failure):
+        raise Failure(EXIT['recipient']) from None
+
+
+def read_private(path, parent, expected_uid):
+    with os.fdopen(private_descriptor(path, parent, expected_uid), 'rb') as source:
+        return source.read()
+
+
+def cleared_env(home):
+    return {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8',
+            'HOME': str(home), 'GIT_CONFIG_NOSYSTEM': '1',
+            'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0',
+            'GIT_HTTP_LOW_SPEED_LIMIT': '1000', 'GIT_HTTP_LOW_SPEED_TIME': '30'}
+
+
+def recipient(path, parent, expected_uid, age_tool):
+    try:
+        secret = read_private(path, parent, expected_uid)
+        result = subprocess.run([age_tool, '-y'], input=secret, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=cleared_env('/'), timeout=30)
+        require(result.returncode == 0, 'recipient')
+        line = result.stdout.decode('ascii')
+        require(re.fullmatch(r'age1[02-9ac-hj-np-z]{58}\n?', line) is not None, 'recipient')
+        print(line.rstrip('\n'))
+        return EXIT['ok']
+    except (OSError, UnicodeError, subprocess.TimeoutExpired, Failure):
+        return EXIT['recipient']
+
+
+@contextlib.contextmanager
+def exclusive_lock(path, expected_uid):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == expected_uid
+                and not info.st_mode & 0o077, 'unsafe')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Failure(EXIT['busy']) from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def git_call(tool, args, cwd, env, allowed_protocol, network=False):
+    flags = ['protocol.allow=never', 'protocol.' + allowed_protocol + '.allow=always',
+             'core.hooksPath=/dev/null', 'core.fsmonitor=false',
+             'transfer.fsckObjects=true', 'submodule.recurse=false']
+    argv = [tool]
+    for flag in flags:
+        argv.extend(['-c', flag])
+    result = subprocess.run(argv + args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=120 if network else 30)
+    require(result.returncode == 0, 'verification')
+    return result.stdout
+
+
+def release_commit(output, sha):
+    refs = {}
+    for line in output.decode('ascii').splitlines():
+        fields = line.split('\t')
+        require(len(fields) == 2, 'verification')
+        value, name = fields
+        require(name not in refs, 'verification')
+        refs[name] = value
+    accepted = set()
+    for name, value in refs.items():
+        if re.fullmatch(r'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+', name):
+            accepted.add(refs.get(name + '^{}', value))
+        elif re.fullmatch(r'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+\^\{\}', name):
+            accepted.add(value)
+    require(sha in accepted, 'verification')
+
+
+def owned_entry(path, root, expected_uid, allow_link=False):
+    info = path.lstat()
+    require(info.st_uid == expected_uid, 'verification')
+    if stat.S_ISLNK(info.st_mode):
+        require(allow_link, 'verification')
+        target = path.resolve(strict=True)
+        require(target.is_relative_to(root), 'verification')
+        for parent in target.parents if target != root else ():
+            owned_entry(parent, root, expected_uid)
+            if parent == root:
+                break
+        info = target.stat()
+        require(info.st_uid == expected_uid, 'verification')
+    require(not info.st_mode & 0o022 and
+            (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)), 'verification')
+
+
+def ownership_walk(root, tracked, expected_uid):
+    owned_entry(root, root, expected_uid)
+    for raw in tracked.split(b'\0'):
+        if not raw:
+            continue
+        relative = Path(os.fsdecode(raw))
+        require(not relative.is_absolute() and '..' not in relative.parts, 'verification')
+        path = root / relative
+        owned_entry(path, root, expected_uid, allow_link=True)
+        for parent in path.parents:
+            if parent == root:
+                break
+            owned_entry(parent, root, expected_uid)
+    metadata = root / '.git'
+    owned_entry(metadata, root, expected_uid)
+    require(metadata.is_dir(), 'verification')
+    for parent, dirs, files in os.walk(metadata, followlinks=False):
+        for name in dirs + files:
+            owned_entry(Path(parent) / name, root, expected_uid)
+
+
+def file_digest(path, expected_uid):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, 'rb') as source:
+        info = os.fstat(source.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == expected_uid
+                and not info.st_mode & 0o022, 'verification')
+        return hashlib.file_digest(source, 'sha256').hexdigest() if hasattr(hashlib, 'file_digest') else hashlib.sha256(source.read()).hexdigest()
+
+
+def private_directory(path, expected_uid):
+    path.mkdir(mode=0o700, exist_ok=True)
+    safe_path(path, expected_uid, directory=True, mode=0o700)
+
+
+def atomic_json(path, value, expected_uid):
+    safe_path(path.parent, expected_uid, directory=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix='.record-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(value, stream, sort_keys=True)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def read_json(path, expected_uid):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, 'r') as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == expected_uid
+                and not info.st_mode & 0o077 and info.st_size <= 2048, 'verification')
+        return json.load(stream)
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def verify_checkout(root, sha, expected_uid, git_tool, env, allowed_protocol, fresh):
+    def git(args):
+        return git_call(git_tool, args, root, env, allowed_protocol).decode('ascii').strip()
+    require(git(['rev-parse', '--show-object-format']) == 'sha1', 'verification')
+    if fresh:
+        require(git(['rev-parse', '--verify', 'FETCH_HEAD^{commit}']) == sha, 'verification')
+    require(git(['rev-parse', 'HEAD']) == sha, 'verification')
+    require(not git(['status', '--porcelain', '--untracked-files=all']), 'verification')
+    for name in ('bootstrap.sh', 'sfctl'):
+        path = root / KIT / name
+        require(stat.S_ISREG(path.lstat().st_mode) and path.resolve().is_relative_to(root), 'verification')
+    ownership_walk(root, git_call(git_tool, ['ls-files', '-z'], root, env, allowed_protocol), expected_uid)
+
+
+def checkout(install, state, sha, expected_uid, git_tool, remote, allowed_protocol, env):
+    install.mkdir(mode=0o755, exist_ok=True)
+    safe_path(install, expected_uid, directory=True)
+    private_directory(state / 'checkouts', expected_uid)
+    destination = install / ('kit-' + sha)
+    record = state / 'checkouts' / (sha + '.json')
+    if os.path.lexists(destination):
+        safe_path(destination, expected_uid, directory=True, mode=0o755)
+        # Never let Git interpret modified configuration, even for verification.
+        safe_path(destination / '.git', expected_uid, directory=True)
+        require(file_digest(destination / '.git/config', expected_uid) ==
+                read_json(record, expected_uid)['config_sha256'], 'verification')
+        verify_checkout(destination, sha, expected_uid, git_tool, env, allowed_protocol, False)
+        return destination / KIT
+    release_commit(git_call(git_tool, ['ls-remote', '--tags', remote, 'refs/tags/v*'],
+                            install, env, allowed_protocol, network=True), sha)
+    temporary = Path(tempfile.mkdtemp(prefix='.kit-', dir=install))
+    try:
+        git_call(git_tool, ['init', str(temporary)], install, env, allowed_protocol)
+        git_call(git_tool, ['fetch', '--depth=1', '--no-tags', '--no-recurse-submodules', remote, sha],
+                 temporary, env, allowed_protocol, network=True)
+        git_call(git_tool, ['checkout', '--detach', 'FETCH_HEAD'], temporary, env, allowed_protocol)
+        verify_checkout(temporary, sha, expected_uid, git_tool, env, allowed_protocol, True)
+        digest = file_digest(temporary / '.git/config', expected_uid)
+        atomic_json(record, {'config_sha256': digest}, expected_uid)
+        os.chmod(temporary, 0o755)
+        os.rename(temporary, destination)
+        return destination / KIT
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+
+
+def prepare(kit, key, key_parent, data, expected_uid, bash_tool, env):
+    # Recheck immediately before the kit's create-if-absent branch can run.
+    fd = private_descriptor(key, key_parent, expected_uid)
+    os.close(fd)
+    require(os.path.ismount(data), 'data_mount')
+    try:
+        # Spool output, retaining at most the tail in memory; never publish it.
+        with tempfile.TemporaryFile(dir=env['HOME']) as out, tempfile.TemporaryFile(dir=env['HOME']) as err:
+            with subprocess.Popen([bash_tool, str(kit / 'bootstrap.sh'), '--non-interactive',
+                                   '--prepare-only', str(data)], cwd=kit, env=env,
+                                  stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                  start_new_session=True) as process:
+                try:
+                    code = process.wait(timeout=3600)
+                except subprocess.TimeoutExpired:
+                    # Children inherit the kit's lock. Signal the whole session's
+                    # process group, even if Bash exits before its children do.
+                    for sig in (signal.SIGTERM, signal.SIGKILL):
+                        try:
+                            os.killpg(process.pid, sig)
+                        except ProcessLookupError:
+                            pass
+                        if sig == signal.SIGTERM:
+                            try:
+                                process.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                pass
+                    process.wait(timeout=5)
+                    raise
+            for stream in (out, err):
+                stream.seek(max(0, stream.tell() - 2048))
+                stream.read(2048)
+            require(code == 0, 'prepare')
+    except (OSError, subprocess.TimeoutExpired):
+        raise Failure(EXIT['prepare']) from None
+
+
+def activate(install, kit):
+    temporary = install / '.current'
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(kit)
+    os.replace(temporary, install / 'current')
+    sync_directory(install)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def fetch(sha, prepare_only, install, state, key, key_parent, data,
+          expected_uid, git_tool, bash_tool, remote, allowed_protocol):
+    if re.fullmatch(SHA_PATTERN, sha) is None:
+        return EXIT['usage']
+    started = utc_now()
+    code, phase = EXIT['verification'], 'failed'
+    previous_umask = os.umask(0o022)
+    try:
+        private_directory(state, expected_uid)
+        with tempfile.TemporaryDirectory(prefix='sf-agent-home-', dir=state) as home:
+            env = cleared_env(home)
+            kit = checkout(install, state, sha, expected_uid, git_tool, remote, allowed_protocol, env)
+            if prepare_only:
+                prepare(kit, key, key_parent, data, expected_uid, bash_tool, env)
+                activate(install, kit)
+            phase = 'prepared' if prepare_only else 'verified'
+            code = EXIT['ok']
+            result = {'fetched': sha, 'path': str(kit)}
+            if prepare_only:
+                result['prepared'] = True
+    except Failure as exc:
+        code = exc.code if exc.code in (EXIT['recipient'], EXIT['data_mount'], EXIT['prepare']) else EXIT['verification']
+    except (OSError, ValueError, UnicodeError, KeyError, TypeError, RuntimeError, subprocess.TimeoutExpired):
+        code = EXIT['verification']
+    finally:
+        os.umask(previous_umask)
+    try:
+        atomic_json(state / 'last.json', {'command': 'fetch', 'sha': sha, 'phase': phase,
+                    'exit': code, 'started': started, 'finished': utc_now()}, expected_uid)
+    except (OSError, Failure):
+        if code != EXIT['ok'] or not prepare_only:
+            return EXIT['verification']
+        # Preparation and activation already succeeded. Preserve their result
+        # so callers do not retry a completed host mutation as verification.
+        result['journal_error'] = True
+    if code == EXIT['ok']:
+        print(json.dumps(result, sort_keys=True))
+    return code
+
+
+def cloud_status(cloud_tool):
+    try:
+        result = subprocess.run([cloud_tool, 'status', '--format', 'json'],
+                                env=cleared_env('/'), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        value = json.loads(result.stdout)
+        markers = [str(value.get(name, '')).lower() for name in ('status', 'extended_status')]
+        if any('degraded' in s or 'error' in s or 'disabled' in s for s in markers):
+            return 'error'
+        if any(s in ('running', 'not started', 'not run') for s in markers):
+            return 'running'
+        if 'done' in markers:
+            return 'done'
+    except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired):
+        pass
+    return 'unknown'
+
+
+def last_status(state, expected_uid):
+    try:
+        safe_path(state, expected_uid, directory=True, mode=0o700)
+        value = read_json(state / 'last.json', expected_uid)
+        require(value['command'] == 'fetch' and re.fullmatch(SHA_PATTERN, value['sha'])
+                and value['phase'] in ('verified', 'prepared', 'failed')
+                and type(value['exit']) is int and value['exit'] in EXIT.values()
+                and re.fullmatch(r'[0-9T:.Z+\-]{20,40}', value['finished']), 'verification')
+        return {key: value[key] for key in ('command', 'sha', 'phase', 'exit', 'finished')}
+    except (OSError, ValueError, KeyError, TypeError, Failure):
+        return None
+
+
+def status(agent, install, state, key, key_parent, data, expected_uid, cloud_tool, tools=None):
+    key_state = 'unsafe'
+    try:
+        fd = private_descriptor(key, key_parent, expected_uid)
+        os.close(fd)
+        key_state = 'ok'
+    except Failure:
+        if not os.path.lexists(key):
+            key_state = 'missing'
+    shas = []
+    current = None
+    try:
+        safe_path(install, expected_uid, directory=True)
+        shas = heapq.nsmallest(9, (p.name[4:] for p in install.iterdir()
+                               if re.fullmatch('kit-[0-9a-f]{40}', p.name) and p.is_dir()))
+        target = (install / 'current').resolve(strict=True)
+        for sha in (target.parents[2].name[4:],):
+            if re.fullmatch(SHA_PATTERN, sha) and target == install / ('kit-' + sha) / KIT:
+                current = sha
+    except (OSError, RuntimeError, IndexError, Failure):
+        pass
+    value = {'agent': 1, 'agent_sha256': file_digest(agent, expected_uid),
+             'cloud_init': cloud_status(cloud_tool), 'delivery_key': key_state,
+             'data_mount': os.path.ismount(data), 'current': current,
+             'checkouts': shas[:8], 'last': last_status(state, expected_uid),
+             'truncated': len(shas) > 8, 'tools': tools or {}}
+    output = json.dumps(value, sort_keys=True, separators=(',', ':'))
+    require(len(output.encode()) + 1 <= STATUS_MAX_BYTES, 'internal')
+    print(output)
+    return EXIT['ok']
+
+
+def main(argv=None):
+    try:
+        args = sys.argv[1:] if argv is None else argv
+        require_runtime(AGENT, SBIN, PYTHON, (), 0, os.geteuid())
+        if args == ['status']:
+            tools = {}
+            for tool in (GIT, AGE, CLOUD_INIT, BASH):
+                if not os.path.lexists(tool):
+                    tools[Path(tool).name] = 'missing'
+                else:
+                    require_runtime(AGENT, SBIN, PYTHON, (tool,), 0, os.geteuid())
+                    tools[Path(tool).name] = 'ok'
+            return status(AGENT, INSTALL, STATE, KEY, KEY_DIR, DATA, 0, CLOUD_INIT, tools)
+        if args == ['recipient']:
+            require_runtime(AGENT, SBIN, PYTHON, (AGE,), 0, os.geteuid())
+            with exclusive_lock(LOCK, 0):
+                return recipient(KEY, KEY_DIR, 0, AGE)
+        if len(args) in (2, 3) and args[0] == 'fetch' and (len(args) == 2 or args[2] == '--prepare-only'):
+            if re.fullmatch(SHA_PATTERN, args[1]) is None:
+                return EXIT['usage']
+            require_runtime(AGENT, SBIN, PYTHON, (GIT, BASH) if len(args) == 3 else (GIT,), 0, os.geteuid())
+            with exclusive_lock(LOCK, 0):
+                return fetch(args[1], len(args) == 3, INSTALL, STATE, KEY, KEY_DIR, DATA,
+                             0, GIT, BASH, SOURCE_REMOTE, 'https')
+        return EXIT['usage']
+    except Failure as exc:
+        return exc.code
+    except Exception:
+        print('sf-host-agent: internal error', file=sys.stderr)
+        return EXIT['internal']
+
+
+if __name__ == '__main__':
+    sys.exit(main())

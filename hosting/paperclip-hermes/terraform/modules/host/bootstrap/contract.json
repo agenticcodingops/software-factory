@@ -1,0 +1,61 @@
+{
+  "path": "/usr/local/sbin/sf-host-agent",
+  "agent_sha256": "89f1196b7ad3b0ec6b6ef847a92a9c6e8b929e1a316f85ef33c7dc06debce9a0",
+  "commands": {
+    "recipient": {
+      "argv": [
+        "recipient"
+      ],
+      "lock": true,
+      "stdout": "^age1[02-9ac-hj-np-z]{58}$"
+    },
+    "fetch": {
+      "argv": [
+        "fetch",
+        "^[0-9a-f]{40}$",
+        "[--prepare-only]"
+      ],
+      "lock": true,
+      "stdout": "JSON: fetched, path (verified); prepared: true also after prepare; journal_error: true if activation succeeded but journaling failed"
+    },
+    "status": {
+      "argv": [
+        "status"
+      ],
+      "lock": false,
+      "stdout": "JSON status object"
+    }
+  },
+  "exit": {
+    "ok": 0,
+    "internal": 1,
+    "usage": 2,
+    "recipient": 3,
+    "verification": 4,
+    "data_mount": 6,
+    "prepare": 7,
+    "busy": 8,
+    "unsafe": 10
+  },
+  "absent_exit": 127,
+  "retry_exit": 8,
+  "max_runtime_seconds": {
+    "recipient": 60,
+    "fetch": 4200,
+    "status": 60
+  },
+  "status_max_bytes": 2048,
+  "runtime_outcome": {
+    "0": "success",
+    "1": "agent-unavailable",
+    "2": "invalid-request",
+    "3": "agent-unavailable",
+    "4": "verification-failed",
+    "6": "recovery-required",
+    "7": "prepare-failed",
+    "8": "retry-later",
+    "10": "unsafe-host",
+    "127": "agent-unavailable",
+    "unknown": "agent-unavailable"
+  }
+}

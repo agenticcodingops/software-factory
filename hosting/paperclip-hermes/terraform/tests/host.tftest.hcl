@@ -164,3 +164,43 @@ run "actual100_subscription_email_only_fallback" {
     error_message = "Unverified billing months must keep actual100 email-only for the subscription; RG actual100 deallocates."
   }
 }
+
+run "rendered_bootstrap_for_new_vm" {
+  command = plan
+  module { source = "../../modules/host" }
+  override_resource {
+    target          = module.network[0].azapi_resource.vnet
+    values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.Network/virtualNetworks/fixture-vnet" }
+    override_during = plan
+  }
+  override_resource {
+    target          = module.public_ip[0].azapi_resource.this
+    values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.Network/publicIPAddresses/fixture-egress" }
+    override_during = plan
+  }
+  override_resource {
+    target          = module.nsg[0].azapi_resource.this
+    values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.Network/networkSecurityGroups/fixture-nsg" }
+    override_during = plan
+  }
+  variables {
+    bootstrap_custom_data       = null
+    bootstrap_render_for_new_vm = true
+  }
+  assert {
+    condition     = !strcontains(base64decode(output.invariants.custom_data), "disk_setup:") && !strcontains(base64decode(output.invariants.custom_data), "fs_setup:") && !strcontains(base64decode(output.invariants.custom_data), "partition: any") && !strcontains(base64decode(output.invariants.custom_data), "partition: none") && strcontains(base64decode(output.invariants.custom_data), "/var/lib/cloud/scripts/per-boot/10-sf-data") && strcontains(base64decode(output.invariants.custom_data), "LABEL=sf-data, /data, ext4")
+    error_message = "Data disk initialization must fail closed and run on every boot before preparation."
+  }
+  assert {
+    condition     = startswith(base64decode(output.invariants.custom_data), "#cloud-config\n") && strcontains(base64decode(output.invariants.custom_data), base64gzip(file("../../modules/host/bootstrap/sf-host-agent")))
+    error_message = "New VM creation data installs the fixed compressed agent."
+  }
+  assert {
+    condition     = base64decode(output.invariants.custom_data) == file("../../../tools/tests/fixtures/host-cloud-init.yaml")
+    error_message = "Review and record the Terraform-rendered creation payload fixture when bootstrap changes."
+  }
+  assert {
+    condition     = output.invariants.agent_sha256 == filesha256("../../modules/host/bootstrap/sf-host-agent")
+    error_message = "The receipt must record the shipped agent digest."
+  }
+}

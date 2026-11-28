@@ -31,7 +31,15 @@ variable "ssh_public_key" {
 
 variable "bootstrap_custom_data" {
   type        = string
-  description = "Original base64 creation-time cloud-init from the VM receipt; reuse byte-for-byte."
+  description = "Receipt base64 cloud-init, reused byte for byte. Null renders the template and is allowed only for a new VM."
+  default     = null
+  nullable    = true
+}
+
+variable "bootstrap_render_for_new_vm" {
+  type        = bool
+  description = "True only after ARM confirms no VM exists; existing VMs must reuse receipt bytes."
+  default     = false
 }
 
 variable "protocol_tags" {

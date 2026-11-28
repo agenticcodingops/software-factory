@@ -1,0 +1,164 @@
+#cloud-config
+package_update: true
+packages:
+  - [age, 1.1.1-1ubuntu0.24.04.3]
+  - [tailscale, 1.104.7]
+apt:
+  sources:
+    tailscale.list:
+      source: 'deb [signed-by=$KEY_FILE] https://pkgs.tailscale.com/stable/ubuntu noble main'
+      # Signing fingerprint: 2596 A99E AAB3 3821 893C 0A79 458C A832 957F 5868
+      key: |
+        -----BEGIN PGP PUBLIC KEY BLOCK-----
+
+        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
+        =AIVM
+        -----END PGP PUBLIC KEY BLOCK-----
+write_files:
+  - path: /usr/local/sbin/sf-host-agent
+    encoding: gz+b64
+    content: ${agent_gz_b64}
+    owner: root:root
+    permissions: '0755'
+  # P19: verify the LUN-0 link and retained-disk safety on the Azure image.
+  # Cloud-init scripts-per-boot runs this before user runcmd and on reboots.
+  - path: /var/lib/cloud/scripts/per-boot/10-sf-data
+    owner: root:root
+    permissions: '0700'
+    content: |
+      #!/usr/bin/python3 -I
+      """Initialize only a demonstrably blank LUN-0 disk; retain everything else."""
+      from pathlib import Path
+      import subprocess
+
+      DEVICE = '/dev/disk/azure/scsi1/lun0'
+      MIB = 1024 * 1024
+
+
+      def run(*args, codes=(0,), allow_stderr=False):
+          result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+          if result.returncode not in codes or (result.stderr.strip() and not allow_stderr):
+              raise ValueError('probe failed')
+          return result.stdout.strip()
+
+
+      def initialize():
+          # A retained filesystem needs no initialization, even on a rebuilt OS disk.
+          if run('blkid', '-L', 'sf-data', codes=(0, 2)):
+              run('mount', '-a')
+              return
+          disk = str(Path(DEVICE).resolve(strict=True))
+          run('udevadm', 'settle')
+          if run('lsblk', '-dn', '-o', 'TYPE', disk) != 'disk':
+              raise ValueError('not a whole disk')
+          if run('blkid', '-p', disk, codes=(2,)):
+              raise ValueError('signature')
+          if run('wipefs', '-n', '--noheadings', '--output', 'TYPE,OFFSET', disk):
+              raise ValueError('signature')
+          if run('lsblk', '-nr', '-o', 'TYPE', disk) != 'disk':
+              raise ValueError('existing children')
+          size = int(run('lsblk', '-bdn', '-o', 'SIZE', disk))
+          if size < 2 * MIB:
+              raise ValueError('too small')
+          with open(disk, 'rb', buffering=0) as stream:
+              for offset in (0, size - MIB):
+                  stream.seek(offset)
+                  data = stream.read(MIB)
+                  if len(data) != MIB or any(data):
+                      raise ValueError('nonzero or unreadable disk')
+              # Also refuse interior data, even if both boundary windows are zero.
+              stream.seek(MIB)
+              remaining = size - 2 * MIB
+              while remaining:
+                  data = stream.read(min(4 * MIB, remaining))
+                  if not data or data.count(0) != len(data):
+                      raise ValueError('nonzero or unreadable disk')
+                  remaining -= len(data)
+          # No disk-writing command is reachable until every independent probe passed.
+          run('parted', '--script', disk, 'mklabel', 'gpt', 'mkpart', 'primary',
+              'ext4', '1MiB', '100%')
+          run('udevadm', 'settle')
+          entries = [line.split() for line in run('lsblk', '-nrp', '-o', 'NAME,TYPE', disk).splitlines()]
+          if len(entries) != 2 or entries[0] != [disk, 'disk'] or entries[1][1:] != ['part']:
+              raise ValueError('partition not ready')
+          run('mkfs.ext4', '-L', 'sf-data', entries[1][0], allow_stderr=True)
+          run('mount', '-a')
+
+
+      try:
+          initialize()
+      except (OSError, ValueError, subprocess.SubprocessError):
+          subprocess.run(['logger', '-t', 'sf-data',
+                          'Data disk left uninitialized; inspect retained data before recovery.'],
+                         timeout=30, check=False)
+mounts:
+  - [LABEL=sf-data, /data, ext4, 'defaults,nofail', '0', '2']
+runcmd:
+  - |
+    set -eu
+    install -d -m 0700 -o root -g root /etc/paperclip-hermes
+    chown root:root /etc/paperclip-hermes
+    chmod 0700 /etc/paperclip-hermes
+    if [ -e /etc/paperclip-hermes/delivery.key ] || [ -L /etc/paperclip-hermes/delivery.key ]; then
+      :
+    else
+      umask 077
+      tmp=$(mktemp /etc/paperclip-hermes/.delivery.XXXXXX)
+      trap 'rm -f "$tmp"' EXIT
+      trap 'exit 1' HUP INT TERM
+      /usr/bin/age-keygen >"$tmp" 2>/dev/null
+      chmod 0600 "$tmp"
+      chown root:root "$tmp"
+      sync "$tmp"
+      ln "$tmp" /etc/paperclip-hermes/delivery.key
+      sync /etc/paperclip-hermes
+      rm -f "$tmp"
+      trap - EXIT HUP INT TERM
+    fi

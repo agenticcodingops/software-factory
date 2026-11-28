@@ -36,7 +36,15 @@ variable "ssh_public_key" {
 
 variable "bootstrap_custom_data" {
   type        = string
-  description = "Original base64 creation-time cloud-init from the VM receipt; reuse byte-for-byte."
+  description = "Receipt base64 cloud-init, reused byte for byte. Null renders the template and is allowed only for a new VM."
+  default     = null
+  nullable    = true
+}
+
+variable "bootstrap_render_for_new_vm" {
+  type        = bool
+  description = "True only after ARM confirms no VM exists; existing VMs must reuse receipt bytes."
+  default     = false
 }
 
 variable "protocol_tags" {
@@ -94,8 +102,24 @@ variable "tags" {
 }
 
 resource "terraform_data" "invariants" {
-  input = var.bootstrap_custom_data
+  input = local.bootstrap_custom_data
   lifecycle {
+    precondition {
+      condition     = var.bootstrap_custom_data != null || var.bootstrap_render_for_new_vm
+      error_message = "Null bootstrap requires ARM-confirmed new VM rendering."
+    }
+    precondition {
+      condition     = !var.bootstrap_render_for_new_vm || (var.bootstrap_custom_data == null && length(var.protocol_tags) == 0)
+      error_message = "Existing VMs reuse the receipt bootstrap byte for byte"
+    }
+    precondition {
+      condition     = length(regexall(local.forbidden_pattern, file("${path.module}/bootstrap/sf-host-agent"))) == 0 && length(regexall(local.forbidden_pattern, local.rendered_template)) == 0
+      error_message = "Bootstrap source and rendered template must contain no secrets or release SHA."
+    }
+    precondition {
+      condition     = length(local.rendered_custom_data) <= 65536
+      error_message = "Rendered base64 custom_data exceeds Azure's 64 KiB limit."
+    }
     precondition {
       condition     = contains(["trust", "host"], var.rg_managed_by)
       error_message = "rg_managed_by must be trust or host."
@@ -113,7 +137,7 @@ resource "terraform_data" "invariants" {
       error_message = "Select paperclip, hermes or both."
     }
     precondition {
-      condition     = can(base64decode(var.bootstrap_custom_data)) && length(regexall("(^|[^0-9a-fA-F])[0-9a-fA-F]{40}([^0-9a-fA-F]|$)|PRIVATE KEY|tskey-|sig=|kit_ref|kit_commit", try(base64decode(var.bootstrap_custom_data), ""))) == 0
+      condition     = can(base64decode(local.bootstrap_custom_data)) && length(regexall(local.forbidden_pattern, try(base64decode(local.bootstrap_custom_data), ""))) == 0
       error_message = "Creation-time cloud-init must contain neither secrets nor a release SHA."
     }
   }

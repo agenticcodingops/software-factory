@@ -14,7 +14,8 @@ output "invariants" {
     nic                   = var.parked ? {} : module.vm[0].network_interfaces_azapi
     nsg                   = var.parked ? null : module.nsg[0].security_rules
     public_ip             = var.parked ? null : module.public_ip[0].resource_id
-    custom_data           = var.bootstrap_custom_data
+    custom_data           = local.bootstrap_custom_data
+    agent_sha256          = local.agent_sha256
     tags                  = local.vm_tags
     expires_offset_days   = time_offset.expires.offset_days
     expires_base          = time_static.created.rfc3339
