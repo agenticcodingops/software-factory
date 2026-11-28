@@ -199,11 +199,11 @@ class MintBoundaryTests(unittest.TestCase):
                         {"address": 'module.trust.module.identities["mint"].azurerm_role_assignment.this["delegation"]', "type": "azurerm_role_assignment",
                          "change": {"after": {"role_definition_id": "/mock/role", "scope": scope}}}
                     ]}
-                    self.assertTrue(inspector.inspect_plan(plan))
+                    self.assertTrue(any("mint has Microsoft.Compute" in finding for finding in inspector.inspect_plan(plan)))
                     # AzureRM computes a name when a custom role ID is supplied;
                     # after an apply the mock name is arbitrary. Audit the resolved ID's actions.
                     plan["resource_changes"][1]["change"]["after"]["role_definition_name"] = "computed-custom-role"
-                    self.assertTrue(inspector.inspect_plan(plan))
+                    self.assertTrue(any("mint has Microsoft.Compute" in finding for finding in inspector.inspect_plan(plan)))
                     plan["resource_changes"][0]["change"]["after"]["permissions"] = [{"actions": ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"]}]
                     plan["resource_changes"][1]["change"]["after"]["scope"] = "/mock/providers/Microsoft.Storage/storageAccounts/sffixturebackups"
                     self.assertFalse(inspector.inspect_plan(plan))
