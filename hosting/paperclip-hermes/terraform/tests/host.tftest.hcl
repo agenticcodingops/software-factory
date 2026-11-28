@@ -168,6 +168,21 @@ run "actual100_subscription_email_only_fallback" {
 run "rendered_bootstrap_for_new_vm" {
   command = plan
   module { source = "../../modules/host" }
+  override_resource {
+    target          = module.network[0].azapi_resource.vnet
+    values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.Network/virtualNetworks/fixture-vnet" }
+    override_during = plan
+  }
+  override_resource {
+    target          = module.public_ip[0].azapi_resource.this
+    values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.Network/publicIPAddresses/fixture-egress" }
+    override_during = plan
+  }
+  override_resource {
+    target          = module.nsg[0].azapi_resource.this
+    values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-fixture/providers/Microsoft.Network/networkSecurityGroups/fixture-nsg" }
+    override_during = plan
+  }
   variables {
     bootstrap_custom_data       = null
     bootstrap_render_for_new_vm = true
