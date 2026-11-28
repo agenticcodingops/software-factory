@@ -365,6 +365,10 @@ os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
             with self.subTest(call=ast.unparse(call)):
                 self.assertEqual(call.func.attr, 'run')
                 self.assertIn('timeout', [k.arg for k in call.keywords])
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == 'tempfile':
+                with self.subTest(temporary=ast.unparse(node)):
+                    self.assertIn('dir', [kw.arg for kw in node.keywords])
         self.repository()
         self.private_key()
         run = subprocess.run

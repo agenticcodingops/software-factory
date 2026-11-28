@@ -1,6 +1,6 @@
 {
   "path": "/usr/local/sbin/sf-host-agent",
-  "agent_sha256": "343938bef196967ef6ecfb8ada1131cb2ce274ce737f660a64a85f43504e728b",
+  "agent_sha256": "a5430ba36617a0b400b67d1835a7128007eb5ae69158e3b90b54f4e63b57b30c",
   "commands": {
     "recipient": {
       "argv": [

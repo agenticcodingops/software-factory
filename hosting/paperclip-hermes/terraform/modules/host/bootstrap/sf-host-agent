@@ -308,7 +308,7 @@ def prepare(kit, key, key_parent, data, expected_uid, bash_tool, env):
     require(os.path.ismount(data), 'data_mount')
     try:
         # Spool output, retaining at most the tail in memory; never publish it.
-        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        with tempfile.TemporaryFile(dir=env['HOME']) as out, tempfile.TemporaryFile(dir=env['HOME']) as err:
             result = subprocess.run([bash_tool, str(kit / 'bootstrap.sh'), '--non-interactive',
                                      '--prepare-only', str(data)], cwd=kit, env=env,
                                     stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=3600)
