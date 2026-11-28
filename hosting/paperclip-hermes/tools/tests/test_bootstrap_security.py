@@ -266,8 +266,9 @@ class BootstrapSecurityTests(unittest.TestCase):
             self.app.ops_callers('primary', refs, False)
         self.assertEqual(release.call_count, 4)
         for workflow, ref in refs.items():
-            caller = yaml.safe_load((self.home / '.github/workflows' / (workflow + '.yml')).read_text())
-            self.assertEqual(caller['jobs']['target-primary']['uses'], ref)
+            with self.subTest(workflow=workflow):
+                caller = yaml.safe_load((self.home / '.github/workflows' / (workflow + '.yml')).read_text())
+                self.assertEqual(caller['jobs']['target-primary']['uses'], ref)
 
     def test_revoke_grants_backend_data_access_before_init(self):
         backend = {'subscription_id': 'sub', 'storage_account_name': 'state', 'resource_group_name': 'vault', 'tenant_id': 'tenant', 'key': 'trust.tfstate'}
