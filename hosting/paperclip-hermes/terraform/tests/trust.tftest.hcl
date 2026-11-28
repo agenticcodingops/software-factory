@@ -73,8 +73,8 @@ run "mint_has_only_vault_data_grants_same_tenant" {
       output.authorization.vault.mint.backup_read.role_definition_id_or_name == "Storage Blob Data Reader" &&
       output.authorization.role_names.vault_backup_writer == "sffixture SF Backup Writer" &&
       output.authorization.role_names.vault_delegation == "sffixture SF Delegation Key" &&
-      endswith(output.authorization.vault.mint.backup_write.role_definition_id_or_name, "/roleDefinitions/00000000-0000-0000-0000-000000000000") &&
-      endswith(output.authorization.vault.mint.delegation.role_definition_id_or_name, "/roleDefinitions/00000000-0000-0000-0000-000000000000") &&
+      endswith(output.authorization.vault.mint.backup_write.role_definition_id_or_name, "/roleDefinitions/${uuidv5("dns", "backup-writer.example.test")}") &&
+      endswith(output.authorization.vault.mint.delegation.role_definition_id_or_name, "/roleDefinitions/${uuidv5("dns", "delegation.example.test")}") &&
       endswith(output.authorization.vault.mint.backup_write.scope, "/storageAccounts/sffixturebackups/blobServices/default/containers/backups") &&
       endswith(output.authorization.vault.mint.backup_read.scope, "/storageAccounts/sffixturebackups/blobServices/default/containers/backups") &&
       endswith(output.authorization.vault.mint.delegation.scope, "/storageAccounts/sffixturebackups") &&
@@ -82,7 +82,7 @@ run "mint_has_only_vault_data_grants_same_tenant" {
       toset(keys(output.authorization.target.restore)) == toset(["alpha-SF Host Operator", "beta-SF Host Operator"]) &&
       alltrue([for key, target in var.targets :
         output.authorization.target.restore["${key}-SF Host Operator"].scope == "${target.subscription_resource_id}/resourceGroups/${target.resource_group_name}" &&
-        endswith(output.authorization.target.restore["${key}-SF Host Operator"].role_definition_id_or_name, "/roleDefinitions/00000000-0000-0000-0000-000000000000")
+        endswith(output.authorization.target.restore["${key}-SF Host Operator"].role_definition_id_or_name, "/roleDefinitions/${uuidv5("dns", "host-operator.example.test")}")
       ]) &&
       !contains(output.authorization.twins, "mint") &&
       length(output.authorization.federations.mint) == 6 &&
@@ -116,8 +116,8 @@ run "mint_has_only_vault_data_grants_cross_tenant" {
       output.authorization.vault.mint.backup_read.role_definition_id_or_name == "Storage Blob Data Reader" &&
       output.authorization.role_names.vault_backup_writer == "sffixture SF Backup Writer" &&
       output.authorization.role_names.vault_delegation == "sffixture SF Delegation Key" &&
-      endswith(output.authorization.vault.mint.backup_write.role_definition_id_or_name, "/roleDefinitions/00000000-0000-0000-0000-000000000000") &&
-      endswith(output.authorization.vault.mint.delegation.role_definition_id_or_name, "/roleDefinitions/00000000-0000-0000-0000-000000000000") &&
+      endswith(output.authorization.vault.mint.backup_write.role_definition_id_or_name, "/roleDefinitions/${uuidv5("dns", "backup-writer.example.test")}") &&
+      endswith(output.authorization.vault.mint.delegation.role_definition_id_or_name, "/roleDefinitions/${uuidv5("dns", "delegation.example.test")}") &&
       endswith(output.authorization.vault.mint.backup_write.scope, "/storageAccounts/sffixturebackups/blobServices/default/containers/backups") &&
       endswith(output.authorization.vault.mint.backup_read.scope, "/storageAccounts/sffixturebackups/blobServices/default/containers/backups") &&
       endswith(output.authorization.vault.mint.delegation.scope, "/storageAccounts/sffixturebackups") &&
@@ -125,7 +125,7 @@ run "mint_has_only_vault_data_grants_cross_tenant" {
       toset(keys(output.authorization.target.restore)) == toset(["alpha-SF Host Operator", "beta-SF Host Operator"]) &&
       alltrue([for key, target in var.targets :
         output.authorization.target.restore["${key}-SF Host Operator"].scope == "${target.subscription_resource_id}/resourceGroups/${target.resource_group_name}" &&
-        endswith(output.authorization.target.restore["${key}-SF Host Operator"].role_definition_id_or_name, "/roleDefinitions/00000000-0000-0000-0000-000000000000")
+        endswith(output.authorization.target.restore["${key}-SF Host Operator"].role_definition_id_or_name, "/roleDefinitions/${uuidv5("dns", "host-operator.example.test")}")
       ]) &&
       !contains(output.authorization.twins, "mint") &&
       length(output.authorization.federations.mint) == 6 &&
