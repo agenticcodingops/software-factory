@@ -30,11 +30,10 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[3]
 HERE = Path(__file__).resolve().parent
-ENV = {"plan": "plan", "deploy": "production", "ops": "ops", "restore": "restore"}
 ISSUER = "https://token.actions.githubusercontent.com"
 AUD = "api://AzureADTokenExchange"
 CLAIMS = ["repo", "context", "job_workflow_ref"]
-REF = re.compile(r"[\w.-]+/[\w.-]+/\.github/workflows/[\w-]+\.ya?ml@[a-f0-9]{40}")
+REF = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/[A-Za-z0-9_-]+\.ya?ml@[a-f0-9]{40}")
 TRUST_VARIABLES = {"prefix", "location", "vault_subscription_id", "vault_tenant_id", "target_tenant_id", "targets", "role_home_target", "target_client_id", "operator_object_id", "state_account_name", "sub_claim_prefix", "workflow_refs", "custody", "pilot_end_date", "container_retention_fallback"}
 HOST_VARIABLES = {"name", "resource_group_name", "subscription_resource_id", "location", "rg_managed_by", "ssh_public_key", "bootstrap_custom_data", "protocol_tags", "apps", "vm_size", "shutdown_time", "backup_time", "timezone", "allow_disk_destroy", "parked", "tags", "deallocator_role_id", "operator_email", "tenant_id", "alert_application", "pilot_monthly_cap", "headroom", "override_cost", "monthly_credit", "billing_month_verified"}
 PROVIDERS = ("Microsoft.Compute", "Microsoft.Network", "Microsoft.Logic", "Microsoft.Insights", "Microsoft.Consumption", "Microsoft.DevTestLab", "Microsoft.ManagedIdentity", "Microsoft.Storage", "Microsoft.KeyVault")
@@ -74,6 +73,47 @@ class Refusal(Exception):
 def require(test, message):
     if not test:
         raise Refusal(message)
+
+
+def workflow_file(ref):
+    require(isinstance(ref, str) and REF.fullmatch(ref), "Workflow ref requires owner/repo/.github/workflows/file@40hex")
+    return ref.rsplit("/", 1)[1].split("@", 1)[0]
+
+
+def allowlist():
+    return json.loads((HERE.parent / "terraform/modules/trust/federation-allowlist.json").read_text())
+
+
+# Primary environments also drive the harmless initial reviewer probe.
+ENV = {identity: next(iter(files.values()))[0] for identity, files in allowlist()["identities"].items()}
+
+def envs_for(identity, ref):
+    file = workflow_file(ref)
+    envs = allowlist()["identities"].get(identity, {}).get(file, [])
+    require(envs, f"Identity {identity} file {file} is not allowlisted")
+    return envs
+
+
+def credential_entries(refs, probe=False):
+    for identity, entries in refs.items():
+        require(identity in ENV, f"Unknown identity {identity}")
+        for key, ref in entries.items():
+            require(re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", key), "Invalid workflow entry name")
+            file = workflow_file(ref)
+            if probe and file == "sf-merge-gate.yml":
+                continue
+            envs = [ENV[identity]] if probe and file == "sf-oidc-probe.yml" else envs_for(identity, ref)
+            for index, env in enumerate(envs):
+                yield identity, key if index == 0 else key + "-" + env, ref, env
+
+
+def tailscale_claims(receipt):
+    for identity, entries in receipt["claims"].items():
+        for key, claim in entries.items():
+            env = claim["environment"]
+            if (workflow_file(claim["job_workflow_ref"]) in allowlist()["tailscale"].get(identity, []) and
+                    env == {"plan": "plan", "deploy": "production"}.get(identity)):
+                yield identity, key, claim
 
 
 def pack(value):
@@ -151,7 +191,7 @@ class Bootstrap:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def run(self, *args, data=None, change=False, raw=False, pass_fds=(), env=None):
+    def run(self, *args, data=None, change=False, raw=False, pass_fds=(), env=None, not_found=False):
         progress(("APPLY " if change else "READ ") + shlex.join(map(str, args)) +
               (" < [in-memory stdin]" if data is not None else ""), flush=True)
         if change and not self.a.apply:
@@ -161,7 +201,8 @@ class Bootstrap:
             environment.update(AZURE_LOGGING_ENABLE_LOG_FILE="false", AZURE_CORE_COLLECT_TELEMETRY="false")
         proc = subprocess.run(list(map(str, args)), input=data, stdin=subprocess.DEVNULL if data is None else None, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, check=False, pass_fds=pass_fds, env=environment)
-        require(proc.returncode == 0, f"{args[0]} operation failed (diagnostics withheld; may contain secrets)")
+        require(proc.returncode == 0 or (not_found and re.match(rb"HTTP/\S+ 404[ \r\n]", proc.stdout)),
+                f"{args[0]} operation failed (diagnostics withheld; may contain secrets)")
         if raw:
             return proc.stdout
         return json.loads(proc.stdout) if proc.stdout.strip() else {}
@@ -169,7 +210,9 @@ class Bootstrap:
     def az(self, *args, **kwargs):
         return self.run("az", *args, "--only-show-errors", "--output", "json", **kwargs)
 
-    def gh(self, path, method="GET", body=None, raw=False):
+    def gh(self, path, method="GET", body=None, raw=False, missing_ok=False):
+        require(not missing_ok or (method == "GET" and "/releases/tags/" in path and not raw),
+                "Optional GitHub response is restricted to release-by-tag reads")
         if method != "GET" and not self.gh_verified:
             expected = self.cfg("operator_login")
             user = self.run("gh", "api", "--hostname", "github.com", "user")
@@ -180,6 +223,13 @@ class Bootstrap:
         args += ["--hostname", "github.com"]
         if body is not None:
             args += ["--input", "/dev/stdin"]
+        if missing_ok:
+            # https://cli.github.com/manual/gh_api (--include exposes HTTP status).
+            response = self.run(*args, "--include", raw=True, not_found=True)
+            header, payload = re.split(rb"\r?\n\r?\n", response, maxsplit=1)
+            status = re.match(rb"HTTP/\S+ ([0-9]{3})[ \r\n]", header)
+            require(status and status[1] in (b"200", b"404"), "Unexpected release HTTP status")
+            return None if status[1] == b"404" else json.loads(payload)
         return self.run(*args, data=pack(body) if body is not None else None,
                         change=method != "GET", raw=raw)
 
@@ -348,7 +398,7 @@ class Bootstrap:
                 "OIDC template/immutable subject readback mismatch")
 
     def check_environments(self, reviewers):
-        for env in ENV.values():
+        for env in sorted(set(ENV.values())):
             result = self.gh(f"repos/{self.repo()}/environments/{env}")
             policy = result.get("deployment_branch_policy")
             if env == "plan":
@@ -417,7 +467,7 @@ class Bootstrap:
             self.publish_files()
         self.setting(f"repos/{self.repo()}/actions/oidc/customization/sub",
                      {"use_default": False, "include_claim_keys": CLAIMS, "use_immutable_subject": True})
-        for env in ENV.values():
+        for env in sorted(set(ENV.values())):
             body = {"deployment_branch_policy": None if env == "plan" else {"protected_branches": False, "custom_branch_policies": True}}
             if env != "plan":
                 body["can_admins_bypass"] = False
@@ -516,13 +566,16 @@ class Bootstrap:
         nonce = pending["nonce"] if pending.get("refs") == refs else str(uuid.uuid4())
         if self.a.apply:
             self.save("probe-pending.json", {"nonce": nonce, "refs": refs})
-        jobs = []
-        for identity, entries in refs.items():
-            require(identity in ENV and len(entries) <= 20, "Unknown identity or too many federations")
-            for key, ref in entries.items():
-                require(REF.fullmatch(ref), "Probe requires full SHA reusable workflow refs")
-                require(re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", key), "Invalid workflow entry name")
-                jobs.append(f"  {identity}-{key}:\n    permissions:\n      contents: read\n      id-token: write\n    uses: {ref} # v1.0.0\n    with:\n      environment: {ENV[identity]}\n      probe_only: true\n      nonce: {nonce}\n")
+        jobs, seen, job_ids = [], set(), set()
+        for identity, key, ref, env in credential_entries(refs, probe=True):
+            if (env, ref) in seen:
+                continue
+            seen.add((env, ref))
+            job_id = f"{identity}-{key}"
+            require(job_id not in job_ids, "Credential keys collide after environment expansion; use distinct workflow_refs keys")
+            job_ids.add(job_id)
+            jobs.append(f"  {identity}-{key}:\n    permissions:\n      contents: read\n      id-token: write\n    uses: {ref} # v1.0.0\n    with:\n      environment: {env}\n      probe_only: true\n      nonce: {nonce}\n")
+        require(jobs, "No reusable refs to probe; collect sf-merge-gate with oidc-probe --gate-run")
         text = "name: Bootstrap OIDC probe\non: workflow_dispatch\npermissions: {}\njobs:\n" + "".join(jobs)
         self.put_file(".github/workflows/sf-bootstrap-probe.yml", text)
         self.publish_files()
@@ -544,7 +597,7 @@ class Bootstrap:
                 "Untrusted probe run metadata")
         request = self.load("probe-request.json", {})
         require(request.get("caller_sha") == run.get("head_sha"), "Probe caller commit differs from dispatched request")
-        expected = {r for entries in request["refs"].values() for r in entries.values()}
+        expected = {ref for _, _, ref, _ in credential_entries(request["refs"], probe=True)}
         actual = {r["path"] for r in run.get("referenced_workflows", [])}
         require(expected == actual, "Run does not reference exactly the Owner-authorized probe workflows")
         return run
@@ -566,33 +619,86 @@ class Bootstrap:
                         if value not in records:
                             records.append(value)
         require(records, "No OIDC claim records in probe logs")
-        expected = [(i, key, ref) for i, entries in request["refs"].items() for key, ref in entries.items()]
-        require(len(records) == len(expected), "Unexpected or missing probe claim records")
+        expected = list(credential_entries(request["refs"], probe=True))
+        require(len(records) == len({(env, ref) for _, _, ref, env in expected}), "Unexpected or missing probe claim records")
         repo = self.gh(f"repos/{self.repo()}")
         # The prefix is TAKEN FROM THE TOKEN; numeric IDs are checked against repo API.
         prefixes, resolved = set(), {}
-        for identity, key, ref in expected:
-            found = [c for c in records if c.get("environment") == ENV[identity] and c.get("job_workflow_ref") == ref]
+        for identity, key, ref, env in expected:
+            found = [c for c in records if c.get("environment") == env and c.get("job_workflow_ref") == ref]
             require(len(found) == 1, "Probe workflow/environment mismatch")
             claim = found[0]
             require(claim.get("nonce") == request["nonce"] and claim.get("iss") == ISSUER and claim.get("aud") == AUD,
                     "Probe nonce/issuer/audience mismatch")
-            suffix = f":environment:{ENV[identity]}:job_workflow_ref:{ref}"
+            suffix = f":environment:{env}:job_workflow_ref:{ref}"
             require(claim.get("sub", "").endswith(suffix), "Probe sub does not bind exact workflow ref")
             prefix = claim["sub"][:-len(suffix)]
             require(prefix == f"repo:{repo['owner']['login']}@{repo['owner']['id']}/{repo['name']}@{repo['id']}",
                     "Probe must resolve immutable repository IDs")
             prefixes.add(prefix)
-            resolved.setdefault(identity, {})[key] = {"sub": claim["sub"], "job_workflow_ref": ref}
+            resolved.setdefault(identity, {})[key] = {"sub": claim["sub"], "job_workflow_ref": ref, "environment": env}
         require(len(prefixes) == 1, "Inconsistent repository subjects")
         result = {"run_id": run["id"], "sub_claim_prefix": prefixes.pop(), "claims": resolved}
+        # Keep real required-workflow gate evidence across reusable probe collections.
+        previous = self.load("config/receipts/oidc.json", {})
+        current = self.load("config/instance.tfvars.json", {}).get("workflow_refs", {}).get("plan", {})
+        if previous.get("sub_claim_prefix") == result["sub_claim_prefix"]:
+            for key, ref in current.items():
+                if workflow_file(ref) != "sf-merge-gate.yml":
+                    continue
+                for claim in previous.get("claims", {}).get("plan", {}).values():
+                    if (claim.get("job_workflow_ref") == ref and
+                            claim.get("sub") == f"{result['sub_claim_prefix']}:environment:plan:job_workflow_ref:{ref}"):
+                        result["claims"].setdefault("plan", {})[key] = dict(claim, environment="plan")
+        if self.a.apply:
+            self.save("config/receipts/oidc.json", result)
+        return result
+
+    def collect_gate_claims(self):
+        # Required workflows run on PRs; they do not implement workflow_call.
+        run = self.gh(f"repos/{self.repo()}/actions/runs/{self.a.gate_run}")
+        require(str(run.get("id")) == str(self.a.gate_run) and run.get("event") == "pull_request" and
+                run.get("conclusion") == "success", "Untrusted gate run metadata")
+        refs = self.load("config/instance.tfvars.json", {}).get("workflow_refs", {}).get("plan", {})
+        gate_refs = {ref for ref in refs.values() if workflow_file(ref) == "sf-merge-gate.yml"}
+        actual = {entry["path"] for entry in run.get("referenced_workflows", [])}
+        require(gate_refs and gate_refs <= actual, "Gate run does not reference Owner-authorized gate refs")
+        archive = self.gh(f"repos/{self.repo()}/actions/runs/{run['id']}/logs", raw=True)
+        records = []
+        with zipfile.ZipFile(io.BytesIO(archive)) as logs:
+            for name in logs.namelist():
+                for line in logs.read(name).decode().splitlines():
+                    marker = "SF_OIDC_CLAIMS="
+                    if marker in line and line.split(marker, 1)[1].startswith("{"):
+                        claim = json.loads(line.split(marker, 1)[1])
+                        if claim not in records:
+                            records.append(claim)
+        repo = self.gh(f"repos/{self.repo()}")
+        prefix = f"repo:{repo['owner']['login']}@{repo['owner']['id']}/{repo['name']}@{repo['id']}"
+        receipt = self.load("config/receipts/oidc.json", {})
+        require(not receipt or receipt.get("sub_claim_prefix") == prefix, "Gate immutable subject prefix differs")
+        result = receipt or {"sub_claim_prefix": prefix, "claims": {}}
+        for key, ref in refs.items():
+            if ref not in gate_refs:
+                continue
+            envs_for("plan", ref)
+            found = [c for c in records if c.get("job_workflow_ref") == ref and c.get("environment") == "plan"]
+            require(len(found) == 1, "Missing or ambiguous real gate claim; gate must emit public claims")
+            claim = found[0]
+            require(claim.get("iss") == ISSUER and claim.get("aud") == AUD and
+                    claim.get("sub") == f"{prefix}:environment:plan:job_workflow_ref:{ref}", "Gate claim mismatch")
+            result["claims"].setdefault("plan", {})[key] = {k: claim[k] for k in ("sub", "job_workflow_ref", "environment")}
+        result["gate_run_id"] = run["id"]
         if self.a.apply:
             self.save("config/receipts/oidc.json", result)
         return result
 
     def oidc_probe(self):
         self.gate_check()
-        if self.a.probe_run:
+        require(not (self.a.probe_run and self.a.gate_run), "Choose probe-run or gate-run")
+        if self.a.gate_run:
+            self.collect_gate_claims()
+        elif self.a.probe_run:
             self.collect_claims()
         else:
             self.dispatch_probe()
@@ -600,26 +706,41 @@ class Bootstrap:
     def federation(self):
         self.gate_check()
         receipt = self.load("config/receipts/oidc.json", {})
-        require(receipt, "Run and collect environment-scoped oidc-probe first")
+        require(receipt, "Run and collect environment-scoped oidc-probe first; collect sf-merge-gate with oidc-probe --gate-run RUN")
         variables = self.load("config/instance.tfvars.json", {})
         refs = variables.get("workflow_refs", {})
         require(refs, "Owner-authorized workflow_refs required")
-        for identity, entries in refs.items():
-            require(identity in ENV, "Unknown identity")
-            for key, ref in entries.items():
-                claim = receipt.get("claims", {}).get(identity, {}).get(key, {})
-                require(REF.fullmatch(ref) and claim.get("job_workflow_ref") == ref and
-                        claim.get("sub") == f"{receipt['sub_claim_prefix']}:environment:{ENV[identity]}:job_workflow_ref:{ref}",
-                        "Owner allowlist differs from real probe claims; re-probe before federation")
-        receipt["claims"] = {i: {k: receipt["claims"][i][k] for k in entries} for i, entries in refs.items()}
+        expanded = list(credential_entries(refs))
+        counts = {identity: sum(i == identity for i, _, _, _ in expanded) for identity in ENV}
+        for identity, count in counts.items():
+            progress(f"{identity}: {count} credential(s)")
+        require(all(count <= 20 for count in counts.values()),
+                "Above 20 credentials per identity; prune obsolete workflow_refs SHAs after handoff before adding releases")
+        resolved, names, subjects = {}, set(), set()
+        for identity, key, ref, env in expanded:
+            require((identity, key) not in names, "Credential keys collide after environment expansion")
+            names.add((identity, key))
+            require((identity, ref, env) not in subjects, "Duplicate identity/ref/environment; prune duplicate workflow_refs entries")
+            subjects.add((identity, ref, env))
+            claim = receipt.get("claims", {}).get(identity, {}).get(key, {})
+            # Gate evidence may have been recorded with another local entry key.
+            if workflow_file(ref) == "sf-merge-gate.yml":
+                claim = next((c for c in receipt.get("claims", {}).get("plan", {}).values()
+                              if c.get("job_workflow_ref") == ref and
+                              c.get("sub") == f"{receipt['sub_claim_prefix']}:environment:{env}:job_workflow_ref:{ref}"), {})
+                require(claim, f"Gate ref {ref} has no recorded claim; run oidc-probe --gate-run RUN")
+            require(claim.get("job_workflow_ref") == ref and
+                    claim.get("sub") == f"{receipt['sub_claim_prefix']}:environment:{env}:job_workflow_ref:{ref}",
+                    "Owner allowlist differs from real probe claims; re-probe before federation")
+            resolved.setdefault(identity, {})[key] = dict(claim, environment=env)
+        receipt["claims"] = resolved
         return receipt, variables
 
     def print_subject(self):
         receipt, _ = self.federation()
-        for identity in ("plan", "deploy"):
-            for claim in receipt["claims"].get(identity, {}).values():
-                progress(json.dumps(dict(claim, environment=ENV[identity], scopes=self.ts_scopes(identity),
-                                      tags=[] if identity == "plan" else ["tag:pc-deployer"])))
+        for identity, _, claim in tailscale_claims(receipt):
+            progress(json.dumps(dict(claim, scopes=self.ts_scopes(identity),
+                                    tags=[] if identity == "plan" else ["tag:pc-deployer"])))
 
     @staticmethod
     def ts_scopes(identity):
@@ -746,6 +867,11 @@ class Bootstrap:
             owner = ("host" if self.a.scope == "subscription" else "trust") if self.a.scope else previous.get(target, {}).get("rg_managed_by", "trust")
             targets[target] = {"subscription_resource_id": f"/subscriptions/{sub}", "resource_group_name": self.cfg("resource_group"),
                                "location": self.cfg("location"), "rg_managed_by": owner}
+        if self.a.apply:
+            self.validate_ops_refs(variables)
+            ops_refs = variables.get("workflow_refs", {}).get("ops", {})
+            caller_refs = (self.ops_caller_refs(target, ops_refs, variables)
+                           if ops_refs and not self.a.remove_target else None)
         require(variables.get("target_tenant_id", target_tenant) == target_tenant, "Multiple foreign target tenants require an Owner-reviewed root composition")
         require(variables["role_home_target"] in targets, "Trust home must be a registered target")
         if home in previous:
@@ -853,14 +979,16 @@ class Bootstrap:
             # A no-diff refresh plan reads all settings back through the providers.
             self.tf("trust", "plan", "-input=false", "-detailed-exitcode", variables=tfvars)
             auth = json.loads(self.tf("trust", "output", "-json", "authorization"))
-            for identity, entries in variables["workflow_refs"].items():
-                for key in entries:
-                    credential = auth["federations"][identity][key]
-                    require(credential["subject"] == oidc["claims"][identity][key]["sub"] and
-                            credential["issuer"] == ISSUER and credential["audience"] == [AUD], "Azure federation differs from probe")
+            for identity, key, _, _ in credential_entries(variables["workflow_refs"]):
+                credential = auth["federations"][identity][key]
+                require(credential["subject"] == oidc["claims"][identity][key]["sub"] and
+                        credential["issuer"] == ISSUER and credential["audience"] == [AUD], "Azure federation differs from probe")
             clients = {"vault": {}, "target": {}}
             for identity in ENV:
                 vault_identity = self.az("identity", "show", "--name", "id-sf-" + identity, "--resource-group", rg, "--subscription", vault)
+                clients["vault"][identity] = vault_identity["clientId"]
+                if identity == "mint":
+                    continue
                 target_provider_subscription = targets[variables["role_home_target"]]["subscription_resource_id"].split("/")[2]
                 target_identity = (vault_identity if vault_tenant == target_tenant else
                                    self.az("identity", "show", "--name", "id-sf-" + identity, "--resource-group", f"rg-{prefix}-trust", "--subscription", target_provider_subscription))
@@ -872,18 +1000,13 @@ class Bootstrap:
                                key_vault_id=f"/subscriptions/{vault}/resourceGroups/{rg}/providers/Microsoft.KeyVault/vaults/kv-{prefix}")
             self.save("bootstrap.json", self.config)
             self.save("config/instance.tfvars.json", variables)
-            ops_refs = {}
-            for ref in variables.get("workflow_refs", {}).get("ops", {}).values():
-                for workflow in ("ph-ops", "ph-power", "ph-cost-guard", "ph-backup-verify"):
-                    if "/" + workflow + ".yml@" in ref:
-                        ops_refs[workflow] = ref
-            require(not ops_refs or len(ops_refs) == 4, "Register all four exact ops-plane caller refs together")
+            ops_refs = variables.get("workflow_refs", {}).get("ops", {})
             self.save(f"config/targets/{target}.json", dict(targets.get(target, {}), status="removed" if self.a.remove_target else "active",
                                                          tenant=target_tenant, client_ids=clients, role_home_target=variables["role_home_target"],
                                                          plan_inputs={"vault": {"client_id": clients["vault"]["plan"]}, "target": {"target_client_id": clients["target"]["plan"]}}, authorization=auth,
                                                          ops_workflow_refs=ops_refs))
-            if ops_refs or self.a.remove_target:
-                self.ops_callers(target, ops_refs, self.a.remove_target)
+            if caller_refs is not None or self.a.remove_target:
+                self.ops_callers(target, caller_refs or {}, self.a.remove_target, prepared=True)
         if self.a.close_pilot:
             self.close_pilot(variables, vault)
         usage = self.az("vm", "list-usage", "--location", self.cfg("location"), "--subscription", sub)
@@ -936,13 +1059,123 @@ class Bootstrap:
                   "versions_locked": count, "inventory_verified": True, "temporary_roles_removed": True,
                   "lock_id": self.pilot_config(variables)["lock_id"]})
 
-    def ops_callers(self, target, refs, removing):
+    def live_target_tags(self, target):
+        subscription = target["subscription_resource_id"].split("/")[2]
+        # Protocol tags belong to the VM, never to alert text or local receipts.
+        # https://learn.microsoft.com/en-us/cli/azure/group#az-group-exists
+        exists = self.az("group", "exists", "--name", target["resource_group_name"], "--subscription", subscription)
+        require(isinstance(exists, bool), "Resource group existence could not be read uniquely")
+        if not exists:
+            return None
+        vms = self.az("vm", "list", "--resource-group", target["resource_group_name"], "--subscription", subscription)
+        require(isinstance(vms, list), "Target VM inventory could not be read uniquely")
+        if not vms:
+            return None
+        require(len(vms) == 1, "Expected exactly one live target VM for approval tags")
+        return self.az("vm", "show", "--ids", vms[0]["id"], "--subscription", subscription).get("tags", {})
+
+    def release_for_sha(self, source, sha):
+        # https://docs.github.com/en/rest/releases/releases#get-a-release-by-tag-name
+        tags = self.gh(f"repos/{source}/tags?per_page=100")
+        require(len(tags) < 100, f"Ops SHA {sha}: tag inventory needs pagination")
+        for tag in tags:
+            name = tag["name"]
+            if not re.fullmatch(r"v[0-9]+[.][0-9]+[.][0-9]+", name) or tag["commit"]["sha"] != sha:
+                continue
+            obj = self.gh(f"repos/{source}/git/ref/tags/{name}")["object"]
+            seen = set()
+            while obj.get("type") == "tag":
+                require(obj["sha"] not in seen and len(seen) < 10, f"Ops SHA {sha}: invalid tag chain")
+                seen.add(obj["sha"])
+                obj = self.gh(f"repos/{source}/git/tags/{obj['sha']}")["object"]
+            require(obj.get("type") == "commit" and obj.get("sha") == sha, f"Ops SHA {sha}: release tag differs")
+            release = self.gh(f"repos/{source}/releases/tags/{name}", missing_ok=True)
+            if release is None:
+                continue
+            if (release.get("tag_name") == name and release.get("draft") is False and
+                    release.get("prerelease") is False and release.get("published_at")):
+                comparison = self.gh(f"repos/{source}/compare/{sha}...main")
+                require(comparison.get("status") in ("ahead", "identical"), f"Ops SHA {sha}: release is not on main")
+                return name
+        raise Refusal(f"Ops SHA {sha}: no published non-prerelease vX.Y.Z release")
+
+    def validate_source_refs(self, refs):
+        for identity in ("ops", "mint", "deploy"):
+            for ref in refs.get(identity, {}).values():
+                workflow_file(ref)
+                require(ref.split("/.github/", 1)[0] == self.cfg("source_repo"),
+                        f"Identity {identity} ref {ref} must name configured source_repo {self.cfg('source_repo')}")
+
+    def validate_ops_refs(self, variables):
+        from datetime import datetime, timedelta, timezone
+        self.validate_source_refs(variables.get("workflow_refs", {}))
+        groups = {}
+        for key, ref in variables.get("workflow_refs", {}).get("ops", {}).items():
+            envs_for("ops", ref)
+            groups.setdefault(ref.rsplit("@", 1)[1], []).append((key, ref))
+        if not groups:
+            return
+        expected = set(allowlist()["identities"]["ops"])
+        for sha, entries in groups.items():
+            require({workflow_file(ref) for _, ref in entries} == expected,
+                    f"Ops SHA {sha}: register all four ops-plane files together")
+        approved, now = set(), datetime.now(timezone.utc)
+        for key, target in variables.get("targets", {}).items():
+            status = self.load(f"config/targets/{key}.json", {}).get("status", "active")
+            if status != "active":
+                continue
+            tags = self.live_target_tags(target) or {}
+            if re.fullmatch(r"[a-f0-9]{40}", tags.get("sf-approved-sha", "")):
+                approved.add(tags["sf-approved-sha"])
+            try:
+                deadline = datetime.fromisoformat(tags.get("sf-recovery-until", "").replace("Z", "+00:00"))
+                if (now < deadline <= now + timedelta(hours=24) and
+                        re.fullmatch(r"[a-f0-9]{40}", tags.get("sf-recovery-sha", ""))):
+                    approved.add(tags["sf-recovery-sha"])
+            except (ValueError, TypeError):
+                pass
+        stale = []
+        for sha, entries in groups.items():
+            if sha not in approved:
+                remove = "; ".join(f"workflow_refs.ops.{key} = {json.dumps(ref)}" for key, ref in entries)
+                stale.append(f"{sha}: remove {remove}")
+        require(not stale, "Stale ops SHAs (no active approved tag or unexpired <=24 h recovery): " + " | ".join(stale))
+        for sha, entries in groups.items():
+            for source in {ref.split("/.github/", 1)[0] for _, ref in entries}:
+                try:
+                    self.release_for_sha(source, sha)
+                except Refusal as exc:
+                    if str(exc).startswith(f"Ops SHA {sha}:"):
+                        raise
+                    raise Refusal(f"Ops SHA {sha}: release metadata read failed") from exc
+
+    def ops_caller_refs(self, target, refs, variables):
+        # Run live-tag refusals before trust mutates Azure or saves state.
+        self.validate_source_refs({**variables.get("workflow_refs", {}), "ops": refs})
+        tags = self.live_target_tags(variables["targets"][target])
+        if tags is None:
+            progress(f"Target {target} has no live sf-approved-sha; callers cannot be staged")
+            return None
+        sha = tags.get("sf-approved-sha", "")
+        require(re.fullmatch(r"[a-f0-9]{40}", sha), f"Target {target} has no live sf-approved-sha; callers cannot be staged")
+        selected = {workflow_file(ref).removesuffix(".yml"): ref for ref in refs.values() if ref.endswith("@" + sha)}
+        require(set(selected) == {f.removesuffix(".yml") for f in allowlist()["identities"]["ops"]},
+                f"Target {target} live approved SHA {sha} needs all four authorized ops refs")
+        return selected
+
+    def ops_callers(self, target, refs, removing, *, prepared=False):
         # Stage a reviewable local change. Never overwrite other targets' current
         # approved refs with stale local copies, and never push callers to main.
+        variables = self.load("config/instance.tfvars.json", {})
+        self.validate_source_refs({**variables.get("workflow_refs", {}), "ops": refs})
         try:
             import yaml
         except ImportError as exc:
             raise Refusal("PyYAML is required to preserve existing static caller entries") from exc
+        if not removing and not prepared:
+            refs = self.ops_caller_refs(target, refs, variables)
+            if refs is None:
+                return
         tree = self.gh(f"repos/{self.repo()}/git/trees/main?recursive=1")
         require(not tree.get("truncated"), "Caller inventory is truncated")
         paths = {entry["path"] for entry in tree["tree"]}
@@ -963,7 +1196,7 @@ class Bootstrap:
             current = next(((k, v) for k, v in entries if k.value == key), None)
             if current and not removing:
                 existing_ref = next((v.value for k, v in current[1].value if k.value == "uses"), None)
-                require(existing_ref == refs[workflow], "Existing target caller differs from Owner-authorized ref; use reviewed deployment handoff")
+                progress(f"Preserving existing {target}/{workflow} caller {existing_ref} for reviewed deployment handoff")
                 continue
             if removing:
                 if not current:
@@ -975,10 +1208,8 @@ class Bootstrap:
             else:
                 ref = refs[workflow]
                 source, sha = ref.split("/.github/", 1)[0], ref.rsplit("@", 1)[1]
-                tags = self.gh(f"repos/{source}/tags?per_page=100")
-                releases = [t["name"] for t in tags if t["commit"]["sha"] == sha and re.fullmatch(r"v\d+\.\d+\.\d+", t["name"])]
-                require(releases, "Static ops caller must reference a tagged Owner-authorized release")
-                stanza = (f"  {key}:\n    if: inputs.target == '{target}'\n    permissions:\n      contents: read\n      id-token: write\n    uses: {ref} # {releases[0]}\n    with:\n      target: {target}\n")
+                release = self.release_for_sha(source, sha)
+                stanza = (f"  {key}:\n    if: inputs.target == '{target}'\n    permissions:\n      contents: read\n      id-token: write\n    uses: {ref} # {release}\n    with:\n      target: {target}\n")
                 # Insert before the mapping ends, preserving every other byte,
                 # including comments and each other target's literal workflow SHA.
                 line = jobs.end_mark.line if isinstance(jobs, yaml.MappingNode) else jobs.start_mark.line + 1
@@ -1176,7 +1407,7 @@ class Bootstrap:
         require(self.ts("tailnet/-/settings").get("httpsEnabled") is True, "HTTPS certificates must be enabled")
         require(self.ts("tailnet/-/dns/preferences").get("magicDNS") is True, "MagicDNS must be enabled")
         existing = [self.ts(f"tailnet/-/keys/{entry['id']}") for entry in self.ts("tailnet/-/keys").get("keys", [])]
-        authorized = {"sf-" + ENV[i] + "-" + key for i in ("plan", "deploy") for key in receipt["claims"].get(i, {})}
+        authorized = {"sf-" + claim["environment"] + "-" + key for _, key, claim in tailscale_claims(receipt)}
         for key in existing:
             description = key.get("description", "")
             if description.startswith(("sf-plan-", "sf-production-")) and description not in authorized:
@@ -1190,27 +1421,26 @@ class Bootstrap:
                     self.gh(f"{variables_path}/{variable}", "DELETE")
                 require(not any(v["name"] == variable for v in self.gh(variables_path + "?per_page=100").get("variables", [])), "Withdrawn federation variable deletion readback mismatch")
         result = {}
-        for identity in ("plan", "deploy"):
-            for key, claim in receipt["claims"].get(identity, {}).items():
-                description = "sf-" + ENV[identity] + "-" + key
-                body = {"keyType": "federated", "description": description, "issuer": ISSUER, "subject": claim["sub"],
-                        "scopes": self.ts_scopes(identity), "tags": [] if identity == "plan" else ["tag:pc-deployer"],
-                        "customClaimRules": {"job_workflow_ref": claim["job_workflow_ref"]}}
-                matches = [k for k in existing if k.get("description") == description]
-                require(len(matches) <= 1, "Ambiguous federated identity")
-                if matches and not subset(body, matches[0]):
-                    self.ts(f"tailnet/-/keys/{matches[0]['id']}", "DELETE")
-                    require(not any(k["id"] == matches[0]["id"] for k in self.ts("tailnet/-/keys").get("keys", [])), "Obsolete federation deletion readback mismatch")
-                    matches = []
-                if not matches:
-                    # No policy write or tag ownership changes, even on API rejection.
-                    created = self.ts("tailnet/-/keys", "POST", body)
-                    key_id = created["id"]
-                else:
-                    key_id = matches[0]["id"]
-                readback = self.ts(f"tailnet/-/keys/{key_id}")
-                require(subset(body, readback) and readback.get("audience"), "Tailscale federation readback mismatch; use --print-subject fallback")
-                result[description] = {"client_id": key_id, "audience": readback["audience"], **claim}
+        for identity, key, claim in tailscale_claims(receipt):
+            description = "sf-" + claim["environment"] + "-" + key
+            body = {"keyType": "federated", "description": description, "issuer": ISSUER, "subject": claim["sub"],
+                    "scopes": self.ts_scopes(identity), "tags": [] if identity == "plan" else ["tag:pc-deployer"],
+                    "customClaimRules": {"job_workflow_ref": claim["job_workflow_ref"]}}
+            matches = [k for k in existing if k.get("description") == description]
+            require(len(matches) <= 1, "Ambiguous federated identity")
+            if matches and not subset(body, matches[0]):
+                self.ts(f"tailnet/-/keys/{matches[0]['id']}", "DELETE")
+                require(not any(k["id"] == matches[0]["id"] for k in self.ts("tailnet/-/keys").get("keys", [])), "Obsolete federation deletion readback mismatch")
+                matches = []
+            if not matches:
+                # No policy write or tag ownership changes, even on API rejection.
+                created = self.ts("tailnet/-/keys", "POST", body)
+                key_id = created["id"]
+            else:
+                key_id = matches[0]["id"]
+            readback = self.ts(f"tailnet/-/keys/{key_id}")
+            require(subset(body, readback) and readback.get("audience"), "Tailscale federation readback mismatch; use --print-subject fallback")
+            result[description] = {"client_id": key_id, "audience": readback["audience"], **claim}
         remaining = [self.ts(f"tailnet/-/keys/{entry['id']}") for entry in self.ts("tailnet/-/keys").get("keys", [])]
         managed = [k for k in remaining if k.get("description", "").startswith(("sf-plan-", "sf-production-"))]
         require({k["id"] for k in managed} == {v["client_id"] for v in result.values()}, "Managed Tailscale federation inventory readback mismatch")
@@ -1546,7 +1776,7 @@ def parser():
     action.add_argument("--apply", action="store_true")
     action.add_argument("--dry-run", action="store_true")
     p.add_argument("--instance-dir", default=os.environ.get("SF_INSTANCE_DIR", "../sf-instance-private"))
-    for name in ("org", "operator-login", "instance-repo", "reviewer", "source-repo", "release-sha", "vault-subscription", "subscription", "target", "role-home-target", "resource-group", "location", "escrow-cmd", "probe-run", "key-cmd", "blob", "version", "backup-account", "staging-account", "staging-blob", "ephemeral-recipient"):
+    for name in ("org", "operator-login", "instance-repo", "reviewer", "source-repo", "release-sha", "vault-subscription", "subscription", "target", "role-home-target", "resource-group", "location", "escrow-cmd", "probe-run", "gate-run", "key-cmd", "blob", "version", "backup-account", "staging-account", "staging-blob", "ephemeral-recipient"):
         p.add_argument("--" + name)
     p.add_argument("--vault-mode", choices=["separate-subscription", "same-subscription"])
     p.add_argument("--scope", choices=["resource-group", "subscription"], help="resource-group by default; preserve existing target ownership when omitted")

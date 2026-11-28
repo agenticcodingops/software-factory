@@ -1,0 +1,103 @@
+{
+  "identities": {
+    "plan": {
+      "ph-plan.yml": [
+        "plan"
+      ],
+      "ph-tailnet-import.yml": [
+        "plan"
+      ],
+      "sf-merge-gate.yml": [
+        "plan"
+      ],
+      "ph-selftest.yml": [
+        "plan"
+      ]
+    },
+    "ops": {
+      "ph-ops.yml": [
+        "ops"
+      ],
+      "ph-power.yml": [
+        "ops"
+      ],
+      "ph-cost-guard.yml": [
+        "ops"
+      ],
+      "ph-backup-verify.yml": [
+        "ops"
+      ]
+    },
+    "mint": {
+      "ph-deploy.yml": [
+        "production"
+      ],
+      "ph-vault-move.yml": [
+        "production"
+      ],
+      "ph-move.yml": [
+        "production"
+      ],
+      "ph-teardown.yml": [
+        "production"
+      ],
+      "ph-rotate-age.yml": [
+        "production"
+      ],
+      "ph-selftest.yml": [
+        "production"
+      ]
+    },
+    "deploy": {
+      "ph-deploy.yml": [
+        "production"
+      ],
+      "ph-teardown.yml": [
+        "production"
+      ],
+      "ph-rotate-age.yml": [
+        "production"
+      ],
+      "ph-selftest.yml": [
+        "production"
+      ],
+      "ph-move.yml": [
+        "production",
+        "restore"
+      ],
+      "ph-restore.yml": [
+        "production",
+        "restore"
+      ],
+      "ph-vault-move.yml": [
+        "production",
+        "restore"
+      ]
+    },
+    "restore": {
+      "ph-restore.yml": [
+        "restore"
+      ],
+      "ph-move.yml": [
+        "restore"
+      ],
+      "ph-vault-move.yml": [
+        "restore"
+      ]
+    }
+  },
+  "tailscale": {
+    "plan": [
+      "ph-plan.yml",
+      "ph-tailnet-import.yml",
+      "ph-selftest.yml"
+    ],
+    "deploy": [
+      "ph-deploy.yml",
+      "ph-teardown.yml",
+      "ph-move.yml",
+      "ph-restore.yml",
+      "ph-selftest.yml"
+    ]
+  }
+}

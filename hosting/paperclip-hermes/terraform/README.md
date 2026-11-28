@@ -131,17 +131,13 @@ Each Azure credential matches the entire issuer, audience and subject, including
 A release adding its own `ops` job in `ph-deploy`, or a candidate `ph-ops` SHA, cannot match an
 owner-authorized ops credential. There is no environment-only fallback and no preview Azure feature.
 
-This narrows the environment-only subjects in ADR revision 3 to meet issue #5's review requirement.
-See [GitHub's custom subject contract](https://docs.github.com/en/actions/reference/security/oidc#customizing-the-subject-claims-for-an-organization-or-repository)
-and [OIDC with reusable workflows](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-with-reusable-workflows).
-The trust mock plan and `check-mock-plans.py` exercise adversarial candidate subjects against the
-actual generated credentials. This is offline authorization evidence, not a live Azure token exchange.
+The [single federation allowlist](modules/trust/federation-allowlist.json) maps identity to file to environments, with a separate Tailscale section. Identities are plan, deploy, ops, restore and mint. `id-sf-mint` has only SF Backup Writer and Storage Blob Data Reader on backups plus SF Delegation Key at the backup account, with no target rights or tenant twin. Production workflows mint and write receipts inside their approved production job; they have no ops job. Deploy also trusts restore for `ph-restore`, `ph-move` and `ph-vault-move` so approved restore jobs can set maintenance and start/rebuild drill VMs. Rebuild enrolment uses only production Tailscale federation; restore claims never receive Tailscale keys. Plan includes selftest for tests 5 and 6.
 
-Until a separately trusted controller implements approval, target-tag/recovery checks and mint-only
-job dependencies, the Owner must authorize each workflow SHA through trust. A release cannot widen
-its own allowlist. Automatic ops handoff and candidate-release mint jobs remain unavailable.
-WP4 cannot run the live adversarial-release acceptance without an instance, GitHub environments and
-Azure credentials. That live test remains release-blocking; a passing local mock does not waive it.
+Primary credential map keys and `github-${key}` names stay stable; only additional environments use `-${env}`. The 20-credential limit counts expanded environments. A full SHA set consumes 4 plan, 4 ops, 6 mint, 10 deploy and 3 restore credentials. Prune obsolete release refs after handoff. Mint's client ID is exported as `mint_client_id`.
+
+Decision 4 requires the Owner to run `sf-bootstrap.sh trust --apply` for each release's four ops refs, after `ph-deploy` publishes approval tags and its manifest, within the maximum 24 h recovery window. Bootstrap checks all four files at every SHA against live active target VM tags, published non-prerelease `vX.Y.Z` releases, peeled tag commits and comparison with main (ahead or identical). It lists stale SHAs and exact entries to remove after finalization/expiry. Alerts never supply authorization SHAs. Per-target ops isolation remains enforced in approved code, not Azure.
+
+See [GitHub custom subjects](https://docs.github.com/en/actions/reference/security/oidc), [Entra matching and limits](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-considerations), [published releases](https://docs.github.com/en/rest/releases/releases#get-a-release-by-tag-name), [tag peeling](https://docs.github.com/en/rest/git/tags#get-a-tag) and [commit comparison](https://docs.github.com/en/rest/commits/commits#compare-two-commits). The trust mock plans and `check-mock-plans.py` test adversarial subjects against generated credentials, including mint's absence of Compute rights. P1 remains the operator's release-blocking live token/run-command denial test.
 
 ## Policy baseline and hardening
 

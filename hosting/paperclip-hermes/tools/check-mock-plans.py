@@ -34,8 +34,98 @@ def credential_findings(resource, values):
     return errors
 
 
-def inspect_plan(plan):
+def mint_boundary_findings(plan):
+    resources = plan.get("resource_changes", [])
+    if not any(r.get("type") == "azurerm_federated_identity_credential" or
+               '["mint"]' in r.get("address", "") for r in resources):
+        return []
+    fixture = json.loads((Path(__file__).parent / "tests/fixtures/mint-boundary.json").read_text())
     errors = []
+    definitions = {}
+    role_names = {}
+    variables = plan.get("variables", fixture["plan_variables"])
+    prefix = variables["prefix"]["value"]
+    vault_subscription = variables["vault_subscription_id"]["value"]
+    if "variables" not in plan:
+        # Verbose test_plan events omit input variables. Read the independent
+        # vault declarations, never a mint assignment's role or scope.
+        for resource in resources:
+            after = resource.get("change", {}).get("after") or {}
+            if resource.get("address") == "module.trust.azurerm_resource_group.vault":
+                name = re.fullmatch(r"rg-([a-z0-9]{1,17})-vault", after.get("name", ""))
+                if name:
+                    prefix = name[1]
+                else:
+                    errors.append("mint vault resource group name unresolved")
+            if resource.get("address") == 'module.trust.azurerm_role_definition.vault["backup_writer"]':
+                scope = re.fullmatch(r"/subscriptions/([^/]+)", after.get("scope", ""))
+                if scope:
+                    vault_subscription = scope[1]
+                else:
+                    errors.append("mint vault subscription unresolved")
+    backup_account = (f"/subscriptions/{vault_subscription}/resourceGroups/rg-{prefix}-vault"
+                      f"/providers/Microsoft.Storage/storageAccounts/{prefix}backups")
+    expected_roles = {"backup_write": prefix + " SF Backup Writer", "backup_read": "Storage Blob Data Reader",
+                      "delegation": prefix + " SF Delegation Key"}
+    for resource in resources:
+        after = resource.get("change", {}).get("after") or {}
+        if resource.get("type") == "azurerm_role_definition":
+            actions = [a for p in after.get("permissions", []) for field in ("actions", "data_actions") for a in p.get(field, [])]
+            role_id = after.get("role_definition_resource_id")
+            definitions.setdefault(role_id, []).extend(actions)
+            role_names.setdefault(role_id, set()).add(after.get("name"))
+    for resource in resources:
+        after = resource.get("change", {}).get("after") or {}
+        address = resource.get("address", "")
+        if address.startswith('module.trust.module.target_identities["mint"].'):
+            errors.append("mint must have no tenant twin")
+        if resource.get("type") == "azurerm_federated_identity_credential":
+            for case in fixture["cases"]:
+                if (any(f'["{identity}"]' in address for identity in case["identities"]) and
+                        after.get("issuer") == fixture["issuer"] and fixture["audience"] in after.get("audience", []) and
+                        after.get("subject") == case["subject"]):
+                    errors.append("mint boundary: forbidden subject can exchange " + address)
+        if (resource.get("type") == "azurerm_role_assignment" and
+                address.startswith('module.trust.module.identities["mint"].')):
+            key = re.search(r'\.azurerm_role_assignment\.this\["([^\"]+)"\]$', address)
+            grant = key[1] if key else None
+            if grant not in {"backup_write", "backup_read", "delegation"}:
+                errors.append("mint has forbidden grant key at " + address)
+            scope = after.get("scope", "")
+            expected_scope = backup_account if grant == "delegation" else backup_account + "/blobServices/default/containers/backups"
+            if grant in expected_roles:
+                if scope != expected_scope:
+                    errors.append("mint grant must use the backups container/account at " + address)
+                role_id = after.get("role_definition_id")
+                # Custom assignments resolve by ID; AzureRM can also compute an arbitrary name.
+                # An ambiguous mocked ID cannot prove that a grant has exactly its required role.
+                resolved = role_names.get(role_id, {after.get("role_definition_name")})
+                if resolved != {expected_roles[grant]}:
+                    errors.append(f"mint grant {grant} must use {expected_roles[grant]} at " + address)
+            # Built-in reader/contributor roles have Compute rights even if mocked IDs collide.
+            name = after.get("role_definition_name")
+            role_id = after.get("role_definition_id")
+            if ((role_id not in definitions and name != "Storage Blob Data Reader") or
+                    any(a.lower().startswith("microsoft.compute/") or a == "*" for a in definitions.get(role_id, []))):
+                errors.append("mint has Microsoft.Compute or non-backup rights at " + str(after.get("scope")))
+    return errors
+
+
+def credential_address_findings(plan):
+    fixture = json.loads((Path(__file__).resolve().parents[1] / "terraform/modules/trust/federation-allowlist.json").read_text())
+    resources = {r["address"]: r for r in plan["resource_changes"]}
+    errors = []
+    for identity in ("plan", "deploy", "ops", "restore"):
+        for file in fixture["identities"][identity]:
+            key = file.removesuffix(".yml").replace("-", "_")
+            address = f'module.trust.module.identities["{identity}"].azurerm_federated_identity_credential.this["{key}"]'
+            if resources.get(address, {}).get("change", {}).get("after", {}).get("name") != "github-" + key:
+                errors.append("existing credential address/name changed: " + address)
+    return errors
+
+
+def inspect_plan(plan):
+    errors = mint_boundary_findings(plan)
     ops_credentials = []
     kinds = []
     for resource in state_resources(plan.get("prior_state", {}).get("values", {}).get("root_module", {})):
@@ -163,6 +253,8 @@ def main():
             event = json.loads(line)
             if event.get("type") == "test_plan":
                 plans += 1
+                if event.get("@testrun") == "existing_credential_addresses_and_names":
+                    errors.extend(credential_address_findings(event["test_plan"]))
                 errors.extend(inspect_plan(event["test_plan"]))
                 if event.get("@testrun") in {"trust_storage_and_authorization", "target_tenant_twins"}:
                     errors.extend(trust_read_findings(event["test_plan"]))

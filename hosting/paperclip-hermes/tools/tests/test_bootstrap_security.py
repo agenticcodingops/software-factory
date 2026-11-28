@@ -26,6 +26,28 @@ class BootstrapSecurityTests(unittest.TestCase):
         self.home = Path(self.temporary.name)
         self.app = b.Bootstrap(b.parser().parse_args(['init', '--apply', '--instance-dir', str(self.home), '--org', 'sample', '--instance-repo', 'instance']))
         self.app.config['operator_login'] = 'operator'
+        self.app.config['source_repo'] = 'example-org/example-instance'
+
+    def test_ops_refs_and_callers_require_configured_source_before_lookup(self):
+        source = "agenticcodingops/software-factory"
+        self.app.config["source_repo"] = source
+        files = {"ops": ["ph-ops", "ph-power", "ph-cost-guard", "ph-backup-verify"],
+                 "mint": ["ph-deploy"], "deploy": ["ph-deploy"]}
+        for identity in files:
+            for operation in ("validate_ops_refs", "ops_callers"):
+                with self.subTest(identity=identity, operation=operation):
+                    refs = {i: {f: f"{source}/.github/workflows/{f}.yml@" + "a" * 40 for f in names}
+                            for i, names in files.items()}
+                    refs[identity][files[identity][0]] = "example-org/example-instance/.github/workflows/" + files[identity][0] + ".yml@" + "a" * 40
+                    variables = {"workflow_refs": refs, "targets": {"primary": {}}}
+                    with patch.object(self.app, "load", return_value=variables), patch.object(self.app, "live_target_tags", return_value={"sf-approved-sha": "a" * 40}), patch.object(self.app, "release_for_sha") as release, patch.object(self.app, "gh") as gh:
+                        with self.assertRaisesRegex(b.Refusal, identity + ".*configured source_repo"):
+                            if operation == "validate_ops_refs":
+                                self.app.validate_ops_refs(variables)
+                            else:
+                                self.app.ops_callers("primary", refs["ops"], False)
+                        release.assert_not_called()
+                        gh.assert_not_called()
 
     def test_closed_output_cannot_skip_role_or_token_cleanup(self):
         class Closed(io.StringIO):
@@ -216,23 +238,37 @@ class BootstrapSecurityTests(unittest.TestCase):
         self.assertEqual(request['caller_sha'], 'merged-sha')
 
     def test_federation_filters_withdrawn_claims_for_all_consumers(self):
-        claims = {'one': {'job_workflow_ref': REF, 'sub': 'prefix:environment:plan:job_workflow_ref:' + REF}, 'removed': {'job_workflow_ref': REF, 'sub': 'stale'}}
+        ref = 'example-org/example-instance/.github/workflows/ph-plan.yml@' + 'a' * 40
+        claims = {'one': {'job_workflow_ref': ref, 'sub': 'prefix:environment:plan:job_workflow_ref:' + ref}, 'removed': {'job_workflow_ref': ref, 'sub': 'stale'}}
         self.app.save('config/receipts/oidc.json', {'sub_claim_prefix': 'prefix', 'claims': {'plan': claims}})
-        self.app.save('config/instance.tfvars.json', {'workflow_refs': {'plan': {'one': REF}}})
+        self.app.save('config/instance.tfvars.json', {'workflow_refs': {'plan': {'one': ref}}})
         with patch.object(self.app, 'gate_check'):
             receipt, _ = self.app.federation()
         self.assertEqual(set(receipt['claims']['plan']), {'one'})
 
     def test_new_static_callers_parse_with_jobs_after_mapping_key(self):
         import yaml
-        refs = {w: 'sample/source/.github/workflows/' + w + '.yml@' + 'a' * 40 for w in ('ph-ops', 'ph-power', 'ph-cost-guard', 'ph-backup-verify')}
+        refs = {w: 'example-org/example-instance/.github/workflows/' + w + '.yml@' + 'a' * 40 for w in ('ph-ops', 'ph-power', 'ph-cost-guard', 'ph-backup-verify')}
+        self.app.save('config/instance.tfvars.json', {'targets': {'primary': {
+            'subscription_resource_id': '/subscriptions/00000000-0000-0000-0000-000000000000',
+            'resource_group_name': 'rg-example'}}})
         def gh(path):
-            return {'tree': [], 'truncated': False} if '/git/trees/' in path else [{'name': 'v1.0.0', 'commit': {'sha': 'a' * 40}}]
-        with patch.object(self.app, 'gh', side_effect=gh):
+            self.assertIn('/git/trees/', path)
+            return {'tree': [], 'truncated': False}
+        def az(*args):
+            if args[:2] == ('group', 'exists'):
+                return True
+            if args[:2] == ('vm', 'list'):
+                return [{'id': '/mock/vm'}]
+            self.assertEqual(args[:2], ('vm', 'show'))
+            return {'tags': {'sf-approved-sha': 'a' * 40}}
+        with patch.object(self.app, 'gh', side_effect=gh), patch.object(self.app, 'az', side_effect=az), patch.object(self.app, 'release_for_sha', return_value='v1.0.0') as release:
             self.app.ops_callers('primary', refs, False)
+        self.assertEqual(release.call_count, 4)
         for workflow, ref in refs.items():
-            caller = yaml.safe_load((self.home / '.github/workflows' / (workflow + '.yml')).read_text())
-            self.assertEqual(caller['jobs']['target-primary']['uses'], ref)
+            with self.subTest(workflow=workflow):
+                caller = yaml.safe_load((self.home / '.github/workflows' / (workflow + '.yml')).read_text())
+                self.assertEqual(caller['jobs']['target-primary']['uses'], ref)
 
     def test_revoke_grants_backend_data_access_before_init(self):
         backend = {'subscription_id': 'sub', 'storage_account_name': 'state', 'resource_group_name': 'vault', 'tenant_id': 'tenant', 'key': 'trust.tfstate'}

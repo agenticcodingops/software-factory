@@ -1,0 +1,354 @@
+{
+  "issuer": "https://token.actions.githubusercontent.com",
+  "audience": "api://AzureADTokenExchange",
+  "cases": [
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-deploy.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-deploy.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-move.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-move.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-restore.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-restore.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-rotate-age.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-rotate-age.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-selftest.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-selftest.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-teardown.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-teardown.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-vault-move.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-vault-move.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-ops.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-ops.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ]
+    },
+    {
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-ops.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ]
+    },
+    {
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-power.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ]
+    },
+    {
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-power.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ]
+    },
+    {
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-cost-guard.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ]
+    },
+    {
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-cost-guard.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ]
+    },
+    {
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-backup-verify.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ]
+    },
+    {
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-backup-verify.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ]
+    }
+  ],
+  "plan_fragments": {
+    "forbidden": {
+      "resource_changes": [
+        {
+          "address": "module.trust.module.identities[\"mint\"].azurerm_role_assignment.this[\"rg-fixture-SF Host Operator\"]",
+          "type": "azurerm_role_assignment",
+          "change": {
+            "after": {
+              "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups",
+              "role_definition_name": "Storage Blob Data Reader"
+            }
+          }
+        }
+      ]
+    },
+    "allowed": {
+      "resource_changes": [
+        {
+          "type": "azurerm_role_definition",
+          "change": {
+            "after": {
+              "role_definition_resource_id": "/mock/role/backup-writer",
+              "permissions": [
+                {
+                  "actions": [],
+                  "data_actions": [
+                    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action",
+                    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
+                  ]
+                }
+              ],
+              "name": "sffixture SF Backup Writer"
+            }
+          }
+        },
+        {
+          "type": "azurerm_role_definition",
+          "change": {
+            "after": {
+              "name": "sffixture SF Delegation Key",
+              "role_definition_resource_id": "/mock/role/delegation",
+              "permissions": [
+                {
+                  "actions": [
+                    "Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "address": "module.trust.module.identities[\"mint\"].azurerm_role_assignment.this[\"backup_write\"]",
+          "type": "azurerm_role_assignment",
+          "change": {
+            "after": {
+              "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups/blobServices/default/containers/backups",
+              "role_definition_id": "/mock/role/backup-writer"
+            }
+          }
+        },
+        {
+          "address": "module.trust.module.identities[\"mint\"].azurerm_role_assignment.this[\"backup_read\"]",
+          "type": "azurerm_role_assignment",
+          "change": {
+            "after": {
+              "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups/blobServices/default/containers/backups",
+              "role_definition_name": "Storage Blob Data Reader"
+            }
+          }
+        },
+        {
+          "address": "module.trust.module.identities[\"mint\"].azurerm_role_assignment.this[\"delegation\"]",
+          "type": "azurerm_role_assignment",
+          "change": {
+            "after": {
+              "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups",
+              "role_definition_id": "/mock/role/delegation"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "plan_variables": {
+    "prefix": {
+      "value": "sffixture"
+    },
+    "vault_subscription_id": {
+      "value": "00000000-0000-0000-0000-000000000000"
+    }
+  }
+}

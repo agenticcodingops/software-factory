@@ -156,7 +156,7 @@ assert_no_secrets() {
 import json,os
 from pathlib import Path
 p=Path(os.environ['SF_INSTANCE_DIR'])/'config/instance.tfvars.json'
-x=json.loads(p.read_text());x['workflow_refs']['ops']['bootstrap']+='bad';p.write_text(json.dumps(x))
+x=json.loads(p.read_text());x['workflow_refs']['deploy']['bootstrap']+='bad';p.write_text(json.dumps(x))
 PY
   run trust --apply
   [ "$status" -eq 1 ]
@@ -562,10 +562,10 @@ home=Path(os.environ['SF_INSTANCE_DIR']);db=Path(os.environ['FAKE_DB'])
 v=json.loads((home/'config/instance.tfvars.json').read_text());c=json.loads((home/'config/receipts/oidc.json').read_text())
 x=json.loads(db.read_text())
 for w in ('ph-ops','ph-power','ph-cost-guard','ph-backup-verify'):
- ref='sample/source/.github/workflows/'+w+'.yml@'+'a'*40
+ ref='example-org/example-instance/.github/workflows/'+w+'.yml@'+'a'*40
  v['workflow_refs']['ops'][w]=ref
  c['claims']['ops'][w]={'job_workflow_ref':ref,'sub':'repo:sample@7/instance@8:environment:ops:job_workflow_ref:'+ref}
- text='name: '+w+'\non: workflow_dispatch\npermissions: {}\njobs:\n  target-other:\n    uses: sample/source/.github/workflows/'+w+'.yml@'+'b'*40+' # v0.9.0\n    with:\n      target: other\n'
+ text='name: '+w+'\non: workflow_dispatch\npermissions: {}\njobs:\n  target-other:\n    uses: example-org/example-instance/.github/workflows/'+w+'.yml@'+'b'*40+' # v0.9.0\n    with:\n      target: other\n'
  x['files']['.github/workflows/'+w+'.yml']=base64.b64encode(text.encode()).decode()
 (home/'config/instance.tfvars.json').write_text(json.dumps(v));(home/'config/receipts/oidc.json').write_text(json.dumps(c));db.write_text(json.dumps(x))
 PY
@@ -1190,4 +1190,479 @@ PY
   refute_match ' destroy ' "$CALLS"
   assert_locks_restored
   assert_clean
+}
+
+wp6_config() {
+  python3 - "$@" <<'PYWP6'
+import json, os, sys
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR']); db=Path(os.environ['FAKE_DB'])
+v=json.loads((home/'config/instance.tfvars.json').read_text()); c=json.loads((home/'config/receipts/oidc.json').read_text()); cloud=json.loads(db.read_text())
+mode=sys.argv[1]
+source='example-org/example-instance/.github/workflows/'
+def set_refs(identity, files, sha='a'*40, suffix=''):
+ for file in files:
+  key=file.removesuffix('.yml')+suffix
+  ref=source+file+'@'+sha
+  for previous, value in list(v['workflow_refs'].get(identity,{}).items()):
+   if value==ref:
+    v['workflow_refs'][identity].pop(previous)
+    c['claims'].get(identity,{}).pop(previous,None)
+  v['workflow_refs'].setdefault(identity,{})[key]=ref
+  envs=['production','restore'] if identity=='deploy' and file in ('ph-move.yml','ph-restore.yml','ph-vault-move.yml') else [{'plan':'plan','deploy':'production','mint':'production','ops':'ops','restore':'restore'}[identity]]
+  for n,env in enumerate(envs):
+   c['claims'].setdefault(identity,{})[key if n==0 else key+'-'+env]={'job_workflow_ref':ref,'sub':c['sub_claim_prefix']+':environment:'+env+':job_workflow_ref:'+ref,'environment':env}
+ops=['ph-ops.yml','ph-power.yml','ph-cost-guard.yml','ph-backup-verify.yml']
+if mode in ('probe','tailscale','gate','prefix','missing-gate','gate-run','gate-empty'):
+ set_refs('deploy',['ph-restore.yml','ph-vault-move.yml'])
+ set_refs('restore',['ph-restore.yml'])
+ set_refs('mint',['ph-vault-move.yml'])
+ set_refs('plan',['sf-merge-gate.yml','ph-selftest.yml'])
+ if mode=='prefix': c['sub_claim_prefix']='repo:foreign@3/foreign@4'
+ if mode in ('missing-gate','gate-run','gate-empty'): c['claims']['plan'].pop('sf-merge-gate')
+ if mode in ('gate-run','gate-empty'): cloud['gate_producer']=True
+ if mode=='gate-empty': cloud['missing_gate_claim']=True
+if mode=='probe-only':
+ v['workflow_refs']['plan']['probe']=source+'sf-oidc-probe.yml@'+'a'*40
+ c['claims']['plan']['probe']={'job_workflow_ref':v['workflow_refs']['plan']['probe'],'sub':c['sub_claim_prefix']+':environment:plan:job_workflow_ref:'+v['workflow_refs']['plan']['probe']}
+if mode=='budget':
+ v['workflow_refs']={'deploy':{}}; c['claims']={'deploy':{}}
+ for n in range(11): set_refs('deploy',['ph-restore.yml'],sha=format(n+1,'040x'),suffix=str(n))
+if mode in ('ops','recovery','finalized','expired','future','incomplete','unpublished','diverged','no-approved','handoff','annotated'):
+ set_refs('ops',ops)
+ if mode in ('recovery','finalized','expired','future'):
+  from datetime import datetime, timezone, timedelta
+  set_refs('ops',ops,'b'*40,'-old')
+  hours={'recovery':12,'finalized':12,'expired':-1,'future':25}[mode]
+  cloud['target_tags']={'sf-approved-sha':'a'*40,'sf-recovery-sha':'b'*40,'sf-recovery-until':(datetime.now(timezone.utc)+timedelta(hours=hours)).isoformat()}
+  cloud['release_shas']=['a'*40,'b'*40]
+  if mode=='finalized': cloud['target_tags']={'sf-approved-sha':'a'*40}
+ if mode=='incomplete':
+  v['workflow_refs']['ops'].pop('ph-power'); c['claims']['ops'].pop('ph-power')
+ if mode=='unpublished': cloud['release_overrides']={'draft':True}
+ if mode=='diverged': cloud['compare_status']='diverged'
+ if mode=='no-approved': cloud['target_tags']={}
+ if mode=='annotated': cloud['annotated']=True
+ if mode=='handoff':
+  import base64
+  for file in ops:
+   workflow=file.removesuffix('.yml')
+   text='name: '+workflow+'\non: workflow_dispatch\npermissions: {}\njobs:\n  target-primary:\n    permissions:\n      contents: read\n      id-token: write\n    uses: '+source+file+'@'+'b'*40+' # v0.9.0\n    with:\n      target: primary\n'
+   cloud['files']['.github/workflows/'+file]=base64.b64encode(text.encode()).decode()
+(home/'config/instance.tfvars.json').write_text(json.dumps(v)); (home/'config/receipts/oidc.json').write_text(json.dumps(c))
+(home/'probe-request.json').write_text(json.dumps({'nonce':'fixture-nonce','refs':v['workflow_refs'],'caller_sha':'a'*40}))
+db.write_text(json.dumps(cloud))
+PYWP6
+}
+
+@test 'WP6 probe expands environments deduplicates pairs and never calls merge gate' {
+  wp6_config probe
+  run reviewed_boot oidc-probe --apply
+  [ "$status" -eq 0 ]
+  python3 - <<'PY'
+import base64, json, os, yaml
+from pathlib import Path
+cloud=json.loads(Path(os.environ['FAKE_DB']).read_text())
+text=base64.b64decode(cloud['files']['.github/workflows/sf-bootstrap-probe.yml']).decode()
+assert 'sf-merge-gate.yml@' not in text
+jobs=yaml.safe_load(text)['jobs']; pairs=[(j['with']['environment'],j['uses']) for j in jobs.values()]
+assert len(pairs)==len(set(pairs))
+for env in ('production','restore'):
+ assert any(e==env and '/ph-restore.yml@' in r for e,r in pairs)
+PY
+}
+
+@test 'WP6 probe retains real gate claim and federates expanded restore claim' {
+  wp6_config gate
+  run boot oidc-probe --probe-run 1 --apply
+  [ "$status" -eq 0 ]
+  python3 - <<'PY'
+import json,os
+from pathlib import Path
+c=json.loads((Path(os.environ['SF_INSTANCE_DIR'])/'config/receipts/oidc.json').read_text())
+assert c['claims']['plan']['sf-merge-gate']['job_workflow_ref'].endswith('a'*40)
+assert c['claims']['deploy']['ph-restore-restore']['environment']=='restore'
+assert c['claims']['mint']['bootstrap']['environment']=='production'
+PY
+  run boot --print-subject
+  [ "$status" -eq 0 ]
+}
+
+@test 'WP6 probe discards gate claims from a different immutable prefix' {
+  wp6_config prefix
+  run boot oidc-probe --probe-run 1 --apply
+  [ "$status" -eq 0 ]
+  run boot --print-subject
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'oidc-probe --gate-run'* ]]
+}
+
+@test 'WP6 federation refuses gate with no real gate-run claim' {
+  wp6_config missing-gate
+  run boot --print-subject
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'oidc-probe --gate-run'* ]]
+  rm "$SF_INSTANCE_DIR/config/receipts/oidc.json"
+  run boot --print-subject
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'oidc-probe --gate-run'* ]]
+}
+
+@test 'WP6 probe workflow is never federated' {
+  wp6_config probe-only
+  run trust --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'plan file sf-oidc-probe.yml is not allowlisted'* ]]
+  refute_match 'assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 Tailscale only receives approved file and environment pairs' {
+  wp6_config tailscale
+  run bash -c 'printf "%s" tskey-api-fixture-secret | bash "$1" tailscale --token-stdin --apply' _ "$bootstrap"
+  [ "$status" -eq 0 ]
+  python3 - <<'PY'
+import json,os
+from pathlib import Path
+cloud=json.loads(Path(os.environ['FAKE_DB']).read_text())
+assert {v['description'] for v in cloud['federations'].values()} == {'sf-plan-bootstrap','sf-plan-ph-selftest','sf-production-bootstrap','sf-production-ph-restore'}
+assert all(':environment:restore:' not in v['subject'] for v in cloud['federations'].values())
+PY
+}
+
+@test 'WP6 budget counts expanded credentials prints totals and advises pruning' {
+  wp6_config budget
+  run trust --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'deploy: 22 credential(s)'* ]]
+  [[ "$output" == *'prune obsolete workflow_refs SHAs after handoff'* ]]
+  refute_match 'assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 trust reads approved SHAs live and never looks up a mint twin' {
+  wp6_config ops
+  export CROSS_TENANT=1
+  run trust --apply
+  [ "$status" -eq 0 ]
+  grep -E '^az vm show ' "$CALLS"
+  grep -E '/releases/tags/v1.0.0|/compare/a{40}...main' "$CALLS"
+  refute_match 'id-sf-mint --resource-group rg-example-trust' "$CALLS"
+  python3 - <<'PY'
+import json,os
+from pathlib import Path
+c=json.loads((Path(os.environ['SF_INSTANCE_DIR'])/'config/targets/primary.json').read_text())
+assert 'mint' in c['client_ids']['vault'] and 'mint' not in c['client_ids']['target']
+PY
+}
+
+@test 'WP6 trust allows approved and bounded recovery release groups with annotated tags' {
+  wp6_config recovery
+  wp6_config annotated
+  run trust --apply
+  [ "$status" -eq 0 ]
+  grep -E '/git/tags/' "$CALLS"
+  python3 - <<'PY'
+import os
+from pathlib import Path
+for file in ('ph-ops','ph-power','ph-cost-guard','ph-backup-verify'):
+ text=(Path(os.environ['SF_INSTANCE_DIR'])/'.github/workflows'/ (file+'.yml')).read_text()
+ assert '@'+'a'*40 in text and '@'+'b'*40 not in text
+PY
+}
+
+@test 'WP6 trust after finalize lists each stale SHA and exact entries to remove' {
+  wp6_config finalized
+  run trust --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Stale ops SHAs'* ]]
+  for workflow in ph-ops ph-power ph-cost-guard ph-backup-verify; do
+    [[ "$output" == *"workflow_refs.ops.$workflow-old = \"example-org/example-instance/.github/workflows/$workflow.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\""* ]]
+  done
+  refute_match 'assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 trust refuses expired or over-24-hour recovery SHAs with pruning entries' {
+  for mode in expired future; do
+    wp6_config "$mode"
+    run trust --apply
+    [ "$status" -eq 1 ]
+    [[ "$output" == *'Stale ops SHAs'* ]]
+    [[ "$output" == *'workflow_refs.ops.ph-ops-old'* ]]
+  done
+  refute_match 'assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 trust requires all four ops files at every SHA' {
+  wp6_config incomplete
+  run trust --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'register all four ops-plane files together'* ]]
+  refute_match 'assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 trust refuses unpublished release and off-main SHA' {
+  wp6_config unpublished
+  run trust --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'no published non-prerelease vX.Y.Z release'* ]]
+  python3 - <<'PY'
+import json,os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']);x=json.loads(p.read_text());x.pop('release_overrides');p.write_text(json.dumps(x))
+PY
+  wp6_config diverged
+  run trust --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'release is not on main'* ]]
+  refute_match 'assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 caller staging preserves existing target entries during handoff' {
+  wp6_config handoff
+  run trust --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'Preserving existing primary/ph-ops caller'* ]]
+  refute_match 'PUT repos/sample/instance/contents/.github/workflows/ph-' "$CALLS"
+}
+
+@test 'WP6 ops authorization refuses a target without an approved tag' {
+  wp6_config no-approved
+  run trust --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Stale ops SHAs'* ]]
+  refute_match 'assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 gate-run collects real PR gate evidence without a reusable caller' {
+  wp6_config gate-run
+  run boot oidc-probe --gate-run 1 --apply
+  [ "$status" -eq 0 ]
+  run boot --print-subject
+  [ "$status" -eq 0 ]
+  python3 - <<'PY'
+import json,os
+from pathlib import Path
+c=json.loads((Path(os.environ['SF_INSTANCE_DIR'])/'config/receipts/oidc.json').read_text())
+assert c['gate_run_id']==1 and c['claims']['plan']['sf-merge-gate']['environment']=='plan'
+PY
+  refute_match 'GH_BODY|/dispatches' "$CALLS"
+}
+
+@test 'WP6 gate-run refuses missing producer claims without changing receipt' {
+  wp6_config gate-empty
+  cp "$SF_INSTANCE_DIR/config/receipts/oidc.json" "$BATS_TEST_TMPDIR/oidc-before"
+  run boot oidc-probe --gate-run 1 --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Missing or ambiguous real gate claim'* ]]
+  cmp "$SF_INSTANCE_DIR/config/receipts/oidc.json" "$BATS_TEST_TMPDIR/oidc-before"
+}
+
+
+wp6_second_target() {
+  python3 - "$1" <<'PYSECOND'
+import json, os, sys
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR']); db=Path(os.environ['FAKE_DB'])
+p=home/'config/instance.tfvars.json'; v=json.loads(p.read_text())
+v['targets']['beta']=dict(v['targets']['primary'], resource_group_name='rg-second')
+p.write_text(json.dumps(v))
+mode=sys.argv[1]
+(home/'config/targets').mkdir(exist_ok=True)
+(home/'config/targets/beta.json').write_text(json.dumps({'status': mode if mode in ('parked','decommissioned') else 'active'}))
+cloud=json.loads(db.read_text()); cloud['empty_vm_rgs']=['rg-second']; db.write_text(json.dumps(cloud))
+if mode=='removed':
+ (home/'config/receipts/destroy-beta.json').write_text(json.dumps({'target':'beta','destroyed':True}))
+PYSECOND
+}
+
+
+@test 'WP6 fix2 parked target and active target without VM do not block trust' {
+  wp6_config ops
+  wp6_second_target parked
+  python3 - <<'PYCASE'
+import json, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR'])
+p=home/'config/instance.tfvars.json'; v=json.loads(p.read_text())
+v['targets']['gamma']=dict(v['targets']['primary'], resource_group_name='rg-unbuilt'); p.write_text(json.dumps(v))
+(home/'config/targets/gamma.json').write_text(json.dumps({'status':'active'}))
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['empty_vm_rgs'].append('rg-unbuilt'); p.write_text(json.dumps(v))
+PYCASE
+  run trust --apply
+  [ "$status" -eq 0 ]
+  refute_match 'vm list --resource-group rg-second' "$CALLS"
+  grep -F 'vm list --resource-group rg-unbuilt' "$CALLS"
+  assert_clean
+}
+
+@test 'WP6 fix1 registered target with no VM does not block trust' {
+  wp6_config ops
+  wp6_second_target active
+  run trust --apply
+  [ "$status" -eq 0 ]
+  grep -F 'vm list --resource-group rg-second' "$CALLS"
+  assert_clean
+}
+
+@test 'WP6 fix1 destroyed target removal keeps surviving ops refs' {
+  wp6_config ops
+  wp6_second_target removed
+  run boot trust --target beta --vault-subscription "$VAULT_SUB" --subscription "$TARGET_SUB" --resource-group rg-second --location example-region --remove-target --apply
+  [ "$status" -eq 0 ]
+  refute_match 'vm list --resource-group rg-second' "$CALLS"
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+v=json.loads((Path(os.environ['SF_INSTANCE_DIR'])/'config/instance.tfvars.json').read_text())
+assert set(v['targets'])=={'primary'} and len(v['workflow_refs']['ops'])==4
+PY
+  assert_clean
+}
+
+@test 'WP6 fix1 new target without a VM finishes trust and stages no caller' {
+  wp6_config ops
+  wp6_second_target active
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['SF_INSTANCE_DIR'])/'config/instance.tfvars.json'; v=json.loads(p.read_text()); del v['targets']['beta']; p.write_text(json.dumps(v))
+PY
+  run boot trust --target beta --vault-subscription "$VAULT_SUB" --subscription "$TARGET_SUB" --resource-group rg-second --location example-region --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'Target beta has no live sf-approved-sha; callers cannot be staged'* ]]
+  [[ "$output" == *'vCPU headroom:'* && "$output" == *'Cost headroom:'* ]]
+  [ ! -f "$SF_INSTANCE_DIR/.github/workflows/ph-ops.yml" ]
+  run trust --apply
+  [ "$status" -eq 0 ]
+  assert_clean
+}
+
+@test 'WP6 fix1 ambiguous VM inventory still refuses before apply' {
+  wp6_config ops
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['vm_count']=2; p.write_text(json.dumps(v))
+PY
+  run trust --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Expected exactly one live target VM'* ]]
+  refute_match 'assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 fix1 missing release on first matching tag checks next tag' {
+  wp6_config ops
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['release_shas']=['a'*40,'a'*40]; v['release_status']={'v1.0.0':404}; p.write_text(json.dumps(v))
+PY
+  run trust --apply
+  [ "$status" -eq 0 ]
+  grep -F '/releases/tags/v1.0.1' "$CALLS"
+  assert_clean
+}
+
+@test 'WP6 fix1 release lookup fails closed on HTTP errors other than 404' {
+  wp6_config ops
+  for code in 403 500; do
+    python3 - "$code" <<'PY'
+import json, os, sys
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['release_shas']=['a'*40,'a'*40]; v['release_status']={'v1.0.0':int(sys.argv[1])}; p.write_text(json.dumps(v))
+PY
+    run trust --apply
+    [ "$status" -eq 1 ]
+    [[ "$output" == *'release metadata read failed'* ]]
+  done
+  refute_match '/releases/tags/v1.0.1|assignment create|^terraform ' "$CALLS"
+}
+
+@test 'WP6 fix1 probe refuses job IDs colliding after environment expansion' {
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['SF_INSTANCE_DIR'])/'config/instance.tfvars.json'; v=json.loads(p.read_text())
+source='example-org/example-instance/.github/workflows/'
+v['workflow_refs']={'deploy':{'a':source+'ph-move.yml@'+'a'*40,'a-restore':source+'ph-deploy.yml@'+'b'*40}}
+p.write_text(json.dumps(v))
+PY
+  run boot oidc-probe --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Credential keys collide after environment expansion'* ]]
+  refute_match 'GH_BODY|/git/trees/|/contents/|/pulls' "$CALLS"
+}
+
+@test 'WP6 fix1 target with no resource group approves nothing' {
+  wp6_config ops
+  wp6_second_target active
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['missing_rgs']=['rg-second']; p.write_text(json.dumps(v))
+PY
+  run trust --apply
+  [ "$status" -eq 0 ]
+  refute_match 'vm list --resource-group rg-second' "$CALLS"
+  assert_clean
+}
+
+assert_no_trust_mutation() {
+  refute_match '^terraform .* apply|^az .* (create|update|delete|register|set) |^az rest --method (post|put|patch|delete)' "$CALLS"
+  cmp "$FAKE_DB" "$BATS_TEST_TMPDIR/cloud-before"
+  cmp "$SF_INSTANCE_DIR/config/instance.tfvars.json" "$BATS_TEST_TMPDIR/vars-before"
+}
+
+@test 'WP6 fix2 new target VM without valid approval refuses before any mutation' {
+  wp6_config ops
+  wp6_second_target active
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+home=Path(os.environ['SF_INSTANCE_DIR'])
+p=home/'config/instance.tfvars.json'; v=json.loads(p.read_text()); del v['targets']['beta']; p.write_text(json.dumps(v))
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text()); v['empty_vm_rgs']=[]
+v['vm_ids']={'rg-second':'/mock/virtualMachines/beta'}; p.write_text(json.dumps(v))
+PY
+  for approval in missing invalid; do
+    python3 - "$approval" <<'PY'
+import json, os, sys
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text())
+v['vm_tags']={'/mock/virtualMachines/beta': {} if sys.argv[1]=='missing' else {'sf-approved-sha':'invalid'}}
+p.write_text(json.dumps(v))
+PY
+    cp "$FAKE_DB" "$BATS_TEST_TMPDIR/cloud-before"
+    cp "$SF_INSTANCE_DIR/config/instance.tfvars.json" "$BATS_TEST_TMPDIR/vars-before"
+    cp "$SF_INSTANCE_DIR/config/targets/beta.json" "$BATS_TEST_TMPDIR/target-before"
+    : > "$CALLS"
+    run boot trust --target beta --vault-subscription "$VAULT_SUB" --subscription "$TARGET_SUB" --resource-group rg-second --location example-region --apply
+    [ "$status" -eq 1 ]
+    [[ "$output" == *'Target beta has no live sf-approved-sha; callers cannot be staged'* ]]
+    assert_no_trust_mutation
+    cmp "$SF_INSTANCE_DIR/config/targets/beta.json" "$BATS_TEST_TMPDIR/target-before"
+  done
+}
+
+@test 'WP6 fix2 removal of sole ops SHA approver refuses without mutation' {
+  wp6_config ops
+  wp6_second_target removed
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['FAKE_DB']); v=json.loads(p.read_text())
+v['empty_vm_rgs']=[]; v['target_tags']={}
+v['vm_ids']={'rg-second':'/mock/virtualMachines/beta'}
+v['vm_tags']={'/mock/virtualMachines/beta':{'sf-approved-sha':'a'*40}}
+p.write_text(json.dumps(v))
+PY
+  cp "$FAKE_DB" "$BATS_TEST_TMPDIR/cloud-before"
+  cp "$SF_INSTANCE_DIR/config/instance.tfvars.json" "$BATS_TEST_TMPDIR/vars-before"
+  run boot trust --target beta --vault-subscription "$VAULT_SUB" --subscription "$TARGET_SUB" --resource-group rg-second --location example-region --remove-target --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Stale ops SHAs'* ]]
+  for workflow in ph-ops ph-power ph-cost-guard ph-backup-verify; do
+    [[ "$output" == *"workflow_refs.ops.$workflow = \"example-org/example-instance/.github/workflows/$workflow.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""* ]]
+  done
+  refute_match 'vm list --resource-group rg-second' "$CALLS"
+  assert_no_trust_mutation
 }

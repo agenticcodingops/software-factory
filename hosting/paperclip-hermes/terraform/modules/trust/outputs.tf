@@ -19,3 +19,8 @@ output "storage" {
   value       = { backups = module.backups.resource, staging = module.staging.resource, state = module.state.resource, key_vault = azurerm_key_vault.this, container_retention = azapi_resource.container_retention, container_retention_locks = azapi_resource_action.lock_container_retention }
   sensitive   = true
 }
+
+output "mint_client_id" {
+  description = "Vault-only production mint identity client ID."
+  value       = module.identities["mint"].client_id
+}

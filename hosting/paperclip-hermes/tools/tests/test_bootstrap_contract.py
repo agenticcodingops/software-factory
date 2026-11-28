@@ -62,5 +62,23 @@ class BootstrapContractTests(unittest.TestCase):
             self.assertEqual(list(outside.iterdir()), [])
 
 
+class FederationAllowlistTests(unittest.TestCase):
+    def test_bootstrap_reads_every_allowlist_environment(self):
+        allow = json.loads((BASE / 'modules/trust/federation-allowlist.json').read_text())
+        for identity, files in allow['identities'].items():
+            for file, envs in files.items():
+                ref = 'example-org/example-instance/.github/workflows/' + file + '@' + 'a' * 40
+                self.assertEqual(bootstrap.envs_for(identity, ref), envs)
+        for identity, file in (('ops', 'ph-deploy.yml'), ('mint', 'ph-ops.yml'), ('plan', 'sf-oidc-probe.yml')):
+            with self.assertRaisesRegex(bootstrap.Refusal, identity + '.*' + file):
+                bootstrap.envs_for(identity, 'example-org/example-instance/.github/workflows/' + file + '@' + 'a' * 40)
+
+    def test_expansion_preserves_primary_keys_and_skips_gate_probe(self):
+        ref = 'example-org/example-instance/.github/workflows/ph-restore.yml@' + 'a' * 40
+        gate = ref.replace('ph-restore.yml', 'sf-merge-gate.yml')
+        entries = list(bootstrap.credential_entries({'deploy': {'release': ref}, 'plan': {'gate': gate}}, probe=True))
+        self.assertEqual(entries, [('deploy', 'release', ref, 'production'), ('deploy', 'release-restore', ref, 'restore')])
+
+
 if __name__ == '__main__':
     unittest.main()
