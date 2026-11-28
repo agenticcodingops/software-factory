@@ -158,7 +158,8 @@ whose digest and release notes the gate checks. It does not check other services
 Dockerfiles (including `COPY --from=<image>`), override files or env files. Protected changes are detected by comparing the captured default-branch SHA with the
 captured head SHA using the [three-dot compare API](https://docs.github.com/en/rest/commits/commits#compare-two-commits),
 including previous filenames on renames. The protected paths are `.github/workflows/`,
-`ci/renovate/release-notes-gate`, `hosting/paperclip-hermes/rulesets/` and root `CODEOWNERS`.
+`ci/renovate/release-notes-gate`, `hosting/paperclip-hermes/rulesets/` and [every CODEOWNERS location GitHub reads](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners)
+(`.github/`, root, `docs/`).
 The script prefix does not match `test_release_notes_gate.py`; that test remains unprotected.
 A PR with 300 or more changed files fails closed because the compare list may be truncated.
 Gate script, gate workflow, ruleset and CODEOWNERS changes always require the operator. Other workflow files

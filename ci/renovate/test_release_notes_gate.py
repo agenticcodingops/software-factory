@@ -264,12 +264,16 @@ class NotesTests(unittest.TestCase):
         for file in ({"filename": "ci/renovate/release-notes-gate.py"},
                      {"filename": "docs/old.py", "previous_filename": "ci/renovate/release-notes-gate.py"},
                      {"filename": "hosting/paperclip-hermes/rulesets/public-repo.json"},
-                     {"filename": "CODEOWNERS"}):
+                     {"filename": "CODEOWNERS"},
+                     {"filename": ".github/CODEOWNERS"},
+                     {"filename": "docs/CODEOWNERS"},
+                     {"filename": ".github/CODEOWNERS", "previous_filename": "docs/notes.md"},
+                     {"filename": "docs/x.md", "previous_filename": ".github/CODEOWNERS"}):
             with self.subTest(file=file):
                 api = FakeAPI()
                 api.files = [file]
                 self.assertEqual(self.invoke(api), 1)
-        for name in ("renovate/default.json", "ci/renovate/check.cjs", "docs/CODEOWNERS"):
+        for name in ("renovate/default.json", "ci/renovate/check.cjs", "docs/CODEOWNERS.md", ".github/CODEOWNERS.bak"):
             with self.subTest(name=name):
                 api = FakeAPI()
                 api.files = [{"filename": name}]
@@ -801,7 +805,7 @@ class WorkflowPinTests(unittest.TestCase):
     def test_workflow_status_and_strict_paths_are_protected(self):
         for status in ("added", "removed", "renamed", "copied", "changed", "unknown"):
             self.assert_result(self.api(status=status), 1)
-        for path in ("ci/renovate/release-notes-gate.py", "hosting/paperclip-hermes/rulesets/public-repo.json", "CODEOWNERS"):
+        for path in ("ci/renovate/release-notes-gate.py", "hosting/paperclip-hermes/rulesets/public-repo.json", ".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
             api = self.api()
             api.files = [{"filename":path, "status":"modified", "patch": self.line()}]
             self.assert_result(api, 1)
