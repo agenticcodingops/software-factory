@@ -530,6 +530,25 @@ class PinExtractionTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 gate.compose_pin(text, self.paper, "paperclip")
 
+    def test_compose_file_reading_keys_are_rejected(self):
+        text = self.compose()
+        tracked = next(line for line in text.splitlines(True) if line.startswith("    image: " + self.paper))
+        variants = [text.replace(tracked, tracked + key) for key in (
+            "    env_file: /etc/hostname\n",
+            "    label_file: /etc/hostname\n",
+            '    "env_file": /etc/hostname\n',
+            "    'label_file': x\n",
+            "    env_file: [/etc/hostname]\n",
+            "    env_file:\n      - path: /etc/hostname\n",
+        )]
+        for key in ("env_file", "label_file"):
+            variants.append(text.replace("  hermes:\n", "  hermes:\n    " + key + ": /etc/hostname\n"))
+            variants.append("x-runtime: &runtime\n  " + key + ": /etc/hostname\n" +
+                            text.replace("  paperclip:\n", "  paperclip:\n    <<: *runtime\n"))
+        for variant in variants:
+            with self.subTest(text=variant), self.assertRaises(ValueError):
+                gate.compose_pin(variant, self.paper, "paperclip")
+
     def test_non_ascii_and_document_markers_fail(self):
         for text in (self.compose() + "\r", self.compose() + "\ufeff", "---\n" + self.compose()):
             with self.assertRaises(ValueError):
@@ -548,6 +567,22 @@ class ComposeOracleTests(unittest.TestCase):
         binary.write_text(f"#!{sys.executable}\n" + program + "\n")
         binary.chmod(0o755)
         return patch.dict(os.environ, {"PATH": directory + os.pathsep + os.environ["PATH"]})
+
+    def test_compose_is_not_invoked_for_file_reading_keys(self):
+        text = self.kit()
+        tracked = next(line for line in text.splitlines(True) if line.startswith("    image: " + self.paper))
+        for key in ("env_file", "label_file"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                marker = Path(directory) / "called"
+                pin = gate.compose_pin(text, self.paper, "paperclip")
+                expected = {"services": {"paperclip": {"image": f"{self.paper}:{pin[0]}@{pin[1]}"}}}
+                program = ("from pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\n" +
+                           "print(" + repr(json.dumps(expected)) + ")")
+                with self.fake_binary(directory, program):
+                    with self.assertRaises(ValueError):
+                        gate.checked_compose_pin(text.replace(tracked, tracked + "    " + key +
+                                                             ": /etc/hostname\n"), self.paper, "paperclip")
+                self.assertFalse(marker.exists(), "Compose must never run for file-reading keys")
 
     def test_real_compose_confirms_kit_pin(self):
         text = self.kit()

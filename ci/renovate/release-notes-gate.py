@@ -227,6 +227,10 @@ def compose_pin(text, image, service):
                 if current in services:
                     raise ValueError("duplicate compose service")
                 services.add(current)
+        # https://docs.docker.com/reference/compose-file/services/#env_file
+        # https://docs.docker.com/reference/compose-file/services/#label_file
+        if re.search(r"(?:^|[\s{,\[])[\"']?(?:env_file|label_file)[\"']?\s*:", line):
+            raise ValueError("compose env_file and label_file are unsupported")
         if re.search(r"(?:^|[\s{,\[])[\"']?(?:extends|include)[\"']?\s*:", line):
             raise ValueError("compose includes and extends are unsupported")
         if re.search(r"(?:^|[\s{,\[])[\"']?image[\"']?\s*:", line) or image in line:
@@ -262,7 +266,8 @@ def confirm_compose_pin(text, image, service, pin):
     # on PATH in both workflows. Never fall back to the runner's Docker CLI plugin.
     # config resolves the paperclip image the registry/notes checks describe:
     # https://docs.docker.com/reference/cli/docker/compose/config/
-    # This does not check other services, Dockerfiles, override files or env files.
+    # File-reading env_file/label_file keys are rejected before invoking Compose.
+    # This does not check other services, Dockerfiles or override files.
     binary = shutil.which("docker-compose")
     if binary is None:
         raise ValueError("verified Compose is unavailable")
