@@ -562,10 +562,10 @@ home=Path(os.environ['SF_INSTANCE_DIR']);db=Path(os.environ['FAKE_DB'])
 v=json.loads((home/'config/instance.tfvars.json').read_text());c=json.loads((home/'config/receipts/oidc.json').read_text())
 x=json.loads(db.read_text())
 for w in ('ph-ops','ph-power','ph-cost-guard','ph-backup-verify'):
- ref='sample/source/.github/workflows/'+w+'.yml@'+'a'*40
+ ref='example-org/example-instance/.github/workflows/'+w+'.yml@'+'a'*40
  v['workflow_refs']['ops'][w]=ref
  c['claims']['ops'][w]={'job_workflow_ref':ref,'sub':'repo:sample@7/instance@8:environment:ops:job_workflow_ref:'+ref}
- text='name: '+w+'\non: workflow_dispatch\npermissions: {}\njobs:\n  target-other:\n    uses: sample/source/.github/workflows/'+w+'.yml@'+'b'*40+' # v0.9.0\n    with:\n      target: other\n'
+ text='name: '+w+'\non: workflow_dispatch\npermissions: {}\njobs:\n  target-other:\n    uses: example-org/example-instance/.github/workflows/'+w+'.yml@'+'b'*40+' # v0.9.0\n    with:\n      target: other\n'
  x['files']['.github/workflows/'+w+'.yml']=base64.b64encode(text.encode()).decode()
 (home/'config/instance.tfvars.json').write_text(json.dumps(v));(home/'config/receipts/oidc.json').write_text(json.dumps(c));db.write_text(json.dumps(x))
 PY
