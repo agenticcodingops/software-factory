@@ -1,6 +1,7 @@
 """First-observation timestamps and atomic API publishing for the Paperclip index."""
 
 import base64
+from datetime import datetime, timedelta, timezone
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import importlib.util
@@ -18,6 +19,10 @@ NOW = "2026-11-27T07:23:00Z"
 EARLIER = "2026-11-20T07:23:00Z"
 DIGEST = "sha256:" + "a" * 64
 RELEASE = {"tag_name":"v2026.1117.0", "published_at":"2026-11-17T07:23:00Z"}
+
+
+def clock_at(value):
+    return lambda: index.utc_timestamp(value)
 
 
 def missing():
@@ -74,6 +79,43 @@ class FakeAPI:
 
 
 class IndexTests(unittest.TestCase):
+    def test_new_digest_timestamp_is_sampled_after_each_lookup(self):
+        current = index.utc_timestamp("2026-11-28T07:23:00Z")
+        moments = iter(["2026-11-28T07:50:00Z", "2026-11-28T08:10:00Z"])
+        calls = []
+        def resolve(image, tag):
+            nonlocal current
+            current = index.utc_timestamp(next(moments))
+            calls.append(("resolve", tag))
+            return DIGEST
+        def clock():
+            calls.append(("clock", current))
+            return current
+        result = index.build([RELEASE], {}, resolve, clock)
+        self.assertEqual([e["releaseTimestamp"] for e in result["releases"]],
+                         ["2026-11-28T07:50:00Z", "2026-11-28T08:10:00Z"])
+        self.assertEqual([kind for kind, _ in calls], ["resolve", "clock", "resolve", "clock"])
+
+    def test_unchanged_digest_never_calls_clock(self):
+        previous = index.build([RELEASE], {}, lambda *_: DIGEST, clock_at(EARLIER))
+        def clock():
+            raise AssertionError("unchanged digest must keep its observation")
+        self.assertEqual(index.build([RELEASE], previous, lambda *_: DIGEST, clock), previous)
+        api = FakeAPI(previous)
+        self.assertFalse(index.publish(api, "fixture/repo", clock))
+        self.assertTrue(all(payload is None for _, payload, _ in api.calls))
+
+    def test_non_utc_clock_aborts_before_any_write(self):
+        for tz in (None, timezone(timedelta(hours=1))):
+            with self.subTest(tz=tz):
+                clock = lambda: datetime(2026, 11, 28, 7, 50, tzinfo=tz)
+                with self.assertRaises(ValueError):
+                    index.build([RELEASE], {}, lambda *_: DIGEST, clock)
+                api = FakeAPI()
+                with self.assertRaises(ValueError):
+                    index.publish(api, "fixture/repo", clock)
+                self.assertTrue(all(payload is None for _, payload, _ in api.calls))
+
     def test_both_forms_one_form_and_unresolved(self):
         for forms in (("2026.1117.0", "v2026.1117.0"), ("2026.1117.0",), ("v2026.1117.0",)):
             def resolve(image, tag):
@@ -81,14 +123,14 @@ class IndexTests(unittest.TestCase):
                 if tag not in forms:
                     raise missing()
                 return DIGEST
-            result = index.build([RELEASE], {}, resolve, NOW)
+            result = index.build([RELEASE], {}, resolve, clock_at(NOW))
             self.assertEqual([e["version"] for e in result["releases"]], sorted(forms))
             self.assertTrue(all(e["releaseTimestamp"] == NOW for e in result["releases"]))
         def one_release(image, tag):
             if "1118" in tag:
                 raise missing()
             return DIGEST
-        result = index.build([RELEASE, dict(RELEASE, tag_name="2026.1118.0")], {}, one_release, NOW)
+        result = index.build([RELEASE, dict(RELEASE, tag_name="2026.1118.0")], {}, one_release, clock_at(NOW))
         self.assertEqual(len(result["releases"]), 2)
 
     def test_nonstable_releases_never_resolve(self):
@@ -98,32 +140,32 @@ class IndexTests(unittest.TestCase):
         def resolve(image, tag):
             calls.append(tag)
             return DIGEST
-        result = index.build(skipped + [RELEASE], {}, resolve, NOW)
+        result = index.build(skipped + [RELEASE], {}, resolve, clock_at(NOW))
         self.assertEqual(calls, ["2026.1117.0", "v2026.1117.0"])
         self.assertEqual([entry["version"] for entry in result["releases"]], ["2026.1117.0", "v2026.1117.0"])
 
     def test_timestamp_kept_for_same_digest_and_restarted_for_repush(self):
-        previous = index.build([RELEASE], {}, lambda *_: DIGEST, EARLIER)
-        unchanged = index.build([RELEASE], previous, lambda *_: DIGEST, NOW)
+        previous = index.build([RELEASE], {}, lambda *_: DIGEST, clock_at(EARLIER))
+        unchanged = index.build([RELEASE], previous, lambda *_: DIGEST, clock_at(NOW))
         self.assertEqual(unchanged, previous)
-        changed = index.build([RELEASE], previous, lambda *_: "sha256:" + "b" * 64, NOW)
+        changed = index.build([RELEASE], previous, lambda *_: "sha256:" + "b" * 64, clock_at(NOW))
         self.assertTrue(all(e["releaseTimestamp"] == NOW for e in changed["releases"]))
 
     def test_backdated_index_is_raised_to_publication_and_rewritten(self):
-        previous = index.build([RELEASE], {}, lambda *_: DIGEST, EARLIER)
+        previous = index.build([RELEASE], {}, lambda *_: DIGEST, clock_at(EARLIER))
         for entry in previous["releases"]:
             entry["releaseTimestamp"] = "2026-11-01T00:00:00Z"
-        result = index.build([RELEASE], previous, lambda *_: DIGEST, NOW)
+        result = index.build([RELEASE], previous, lambda *_: DIGEST, clock_at(NOW))
         self.assertTrue(all(e["releaseTimestamp"] == RELEASE["published_at"] for e in result["releases"]))
         api = FakeAPI(previous)
-        self.assertTrue(index.publish(api, "fixture/repo", NOW))
+        self.assertTrue(index.publish(api, "fixture/repo", clock_at(NOW)))
         self.assertEqual(api.calls[-1][2], "PUT")
         self.assertEqual(json.loads(base64.b64decode(api.calls[-1][1]["content"])), result)
 
     def test_later_observation_is_kept_and_invalid_publication_fails_closed(self):
-        previous = index.build([RELEASE], {}, lambda *_: DIGEST, EARLIER)
+        previous = index.build([RELEASE], {}, lambda *_: DIGEST, clock_at(EARLIER))
         self.assertGreater(EARLIER, RELEASE["published_at"])
-        self.assertEqual(index.build([RELEASE], previous, lambda *_: DIGEST, NOW), previous)
+        self.assertEqual(index.build([RELEASE], previous, lambda *_: DIGEST, clock_at(NOW)), previous)
         for published in (None, "invalid", "2026-11-17T01:00:00", "2026-11-17T01:00:00+01:00"):
             for retained in ({}, previous):
                 with self.subTest(published=published, retained=bool(retained)):
@@ -133,12 +175,12 @@ class IndexTests(unittest.TestCase):
                     api = FakeAPI(retained or None)
                     api.release_data = [bad]
                     with self.assertRaises((KeyError, TypeError, ValueError)):
-                        index.publish(api, "fixture/repo", NOW)
+                        index.publish(api, "fixture/repo", clock_at(NOW))
                     self.assertTrue(all(payload is None for _, payload, _ in api.calls))
 
     def test_builder_never_lists_packages_even_beyond_100_versions(self):
         api = FakeAPI()
-        index.publish(api, "fixture/repo", NOW)
+        index.publish(api, "fixture/repo", clock_at(NOW))
         self.assertIn(("repos/paperclipai/paperclip/releases?per_page=100&page=1", None, None), api.calls)
         self.assertTrue(api.resolved)
         self.assertFalse(any("/packages/" in path for path, _, _ in api.calls))
@@ -148,51 +190,51 @@ class IndexTests(unittest.TestCase):
             api = FakeAPI()
             api.error = error
             with self.assertRaises(type(error)):
-                index.publish(api, "fixture/repo", NOW)
+                index.publish(api, "fixture/repo", clock_at(NOW))
             self.assertTrue(all(payload is None for _, payload, _ in api.calls))
         api = FakeAPI()
         with patch.object(api, "registry_digest", side_effect=[DIGEST, OSError("second form failed")]), self.assertRaises(OSError):
-            index.publish(api, "fixture/repo", NOW)
+            index.publish(api, "fixture/repo", clock_at(NOW))
         self.assertTrue(all(payload is None for _, payload, _ in api.calls))
 
     def test_empty_result_exits_nonzero_and_keeps_previous(self):
-        api = FakeAPI(index.build([RELEASE], {}, lambda *_: DIGEST, EARLIER))
+        api = FakeAPI(index.build([RELEASE], {}, lambda *_: DIGEST, clock_at(EARLIER)))
         api.error = missing()
         with patch.dict(os.environ, {"GH_TOKEN":"github-placeholder", "GITHUB_REPOSITORY":"fixture/repo"}), patch.object(index.gate, "GitHub", return_value=api), redirect_stderr(StringIO()), redirect_stdout(StringIO()):
             self.assertEqual(index.main(), 1)
         self.assertTrue(all(payload is None for _, payload, _ in api.calls))
 
     def test_unchanged_content_performs_no_put(self):
-        previous = index.build([RELEASE], {}, lambda *_: DIGEST, EARLIER)
+        previous = index.build([RELEASE], {}, lambda *_: DIGEST, clock_at(EARLIER))
         api = FakeAPI(previous)
-        self.assertFalse(index.publish(api, "fixture/repo", NOW))
+        self.assertFalse(index.publish(api, "fixture/repo", clock_at(NOW)))
         self.assertTrue(all(payload is None for _, payload, _ in api.calls))
 
     def test_missing_branch_created_before_put(self):
         api = FakeAPI(branch=False)
-        self.assertTrue(index.publish(api, "fixture/repo", NOW))
+        self.assertTrue(index.publish(api, "fixture/repo", clock_at(NOW)))
         writes = [(path, payload, method) for path, payload, method in api.calls if payload is not None]
         self.assertEqual(writes[0], ("repos/fixture/repo/git/refs", {"ref":"refs/heads/renovate-data", "sha":"b" * 40}, None))
         self.assertEqual(writes[1][0], "repos/fixture/repo/contents/paperclip-releases.json")
         self.assertEqual(writes[1][2], "PUT")
         self.assertEqual(writes[1][1]["branch"], "renovate-data")
         self.assertNotIn("sha", writes[1][1])
-        self.assertEqual(json.loads(base64.b64decode(writes[1][1]["content"])), index.build([RELEASE], {}, lambda *_: DIGEST, NOW))
+        self.assertEqual(json.loads(base64.b64decode(writes[1][1]["content"])), index.build([RELEASE], {}, lambda *_: DIGEST, clock_at(NOW)))
 
     def test_update_uses_previous_blob(self):
-        api = FakeAPI(index.build([RELEASE], {}, lambda *_: "sha256:" + "b" * 64, EARLIER))
-        self.assertTrue(index.publish(api, "fixture/repo", NOW))
+        api = FakeAPI(index.build([RELEASE], {}, lambda *_: "sha256:" + "b" * 64, clock_at(EARLIER)))
+        self.assertTrue(index.publish(api, "fixture/repo", clock_at(NOW)))
         self.assertEqual(api.calls[-1][1]["sha"], "previous-blob-placeholder")
 
     def test_contents_and_ref_errors_abort_before_any_write(self):
-        previous = index.build([RELEASE], {}, lambda *_: DIGEST, EARLIER)
+        previous = index.build([RELEASE], {}, lambda *_: DIGEST, clock_at(EARLIER))
         for code in (403, 500):
             for suffix in ("?ref=renovate-data", "/git/ref/heads/renovate-data"):
                 with self.subTest(code=code, suffix=suffix):
                     api = FakeAPI(previous if suffix.startswith("?") else None)
                     api.errors[suffix] = HTTPError("https://fixture.invalid", code, "unavailable", {}, None)
                     with self.assertRaises(HTTPError) as raised:
-                        index.publish(api, "fixture/repo", NOW)
+                        index.publish(api, "fixture/repo", clock_at(NOW))
                     self.assertEqual(raised.exception.code, code)
                     self.assertTrue(any(path.endswith(suffix) for path, _, _ in api.calls))
                     self.assertTrue(all(payload is None for _, payload, _ in api.calls))
@@ -214,7 +256,7 @@ class IndexTests(unittest.TestCase):
             return response
         with patch.object(index.gate, "build_opener") as builder:
             builder.return_value.open.side_effect = open_request
-            index.build([RELEASE], {}, index.gate.GitHub("github-placeholder").registry_digest, NOW)
+            index.build([RELEASE], {}, index.gate.GitHub("github-placeholder").registry_digest, clock_at(NOW))
         self.assertEqual(len(registry_requests), 4)
         for request in registry_requests:
             self.assertTrue(request.full_url.startswith("https://ghcr.io/"))

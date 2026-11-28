@@ -28,7 +28,7 @@ def utc_timestamp(value):
     return parsed
 
 
-def build(releases, previous, resolve, now):
+def build(releases, previous, resolve, clock):
     """All registry reads complete before callers may publish anything."""
     observed = {(entry["version"], entry["digest"]): entry["releaseTimestamp"]
                 for entry in previous.get("releases", [])}
@@ -51,7 +51,13 @@ def build(releases, previous, resolve, now):
                 raise
             if not re.fullmatch(gate.DIGEST, digest):
                 raise ValueError("invalid registry digest")
-            timestamp = observed.get((form, digest), now)
+            if (form, digest) in observed:
+                timestamp = observed[(form, digest)]
+            else:
+                observed_at = clock()
+                if observed_at.utcoffset() is None or observed_at.utcoffset().total_seconds() != 0:
+                    raise ValueError("observation clock must be UTC")
+                timestamp = observed_at.isoformat().replace("+00:00", "Z")
             parsed = utc_timestamp(timestamp)
             if (form, digest) in observed and parsed < published_date:
                 timestamp = published
@@ -62,7 +68,7 @@ def build(releases, previous, resolve, now):
             "sourceUrl": "https://github.com/paperclipai/paperclip"}
 
 
-def publish(api, repo, now):
+def publish(api, repo, clock):
     # GitHub contents and refs contracts; all writes use the API, never git push.
     # https://docs.github.com/en/rest/repos/contents#create-or-update-file-contents
     # https://docs.github.com/en/rest/git/refs#create-a-reference
@@ -75,7 +81,7 @@ def publish(api, repo, now):
         previous_file = None
     previous_bytes = base64.b64decode(previous_file["content"]) if previous_file is not None else b""
     previous = json.loads(previous_bytes) if previous_file is not None else {}
-    result = build(api.releases("paperclipai/paperclip"), previous, api.registry_digest, now)
+    result = build(api.releases("paperclipai/paperclip"), previous, api.registry_digest, clock)
     content = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode()
     if content == previous_bytes:
         return False
@@ -99,7 +105,7 @@ def publish(api, repo, now):
 def main():
     try:
         changed = publish(gate.GitHub(os.environ["GH_TOKEN"]), os.environ["GITHUB_REPOSITORY"],
-                          datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+                          lambda: datetime.now(timezone.utc))
     except Exception as error:  # No partial index is written after any read/build failure.
         print(f"paperclip-index: failed ({type(error).__name__})", file=sys.stderr)
         return 1

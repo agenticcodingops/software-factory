@@ -62,7 +62,8 @@ It never lists package versions; the index is bounded by stable releases, and co
 version, digest and timestamp together in the [custom datasource format](https://docs.renovatebot.com/modules/datasource/custom/).
 The GitHub token goes only to `api.github.com`, never a registry or the raw index host.
 
-The timestamp records first observation of each `(version, digest)`, retaining it only
+The timestamp records the UTC time of the first successful digest lookup for each
+`(version, digest)`, retaining it only
 while the digest stays the same, bounded below by the release's UTC `published_at` from
 GitHub's releases API. A missing or invalid publication date fails closed. A re-pushed
 tag restarts the clock when the builder observes its new digest. A new entry soaks for
