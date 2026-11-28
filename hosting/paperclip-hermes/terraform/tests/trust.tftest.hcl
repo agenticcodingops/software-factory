@@ -60,6 +60,94 @@ override_resource {
   values          = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-drill" }
   override_during = plan
 }
+# Plan-only boundary checks precede stateful tenant-migration tests.
+run "mint_has_only_vault_data_grants" {
+  command = plan
+  variables {
+    workflow_refs = { "plan" = { "ph_plan" = "example-org/example-instance/.github/workflows/ph-plan.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_tailnet_import" = "example-org/example-instance/.github/workflows/ph-tailnet-import.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "sf_merge_gate" = "example-org/example-instance/.github/workflows/sf-merge-gate.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "ops" = { "ph_ops" = "example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_power" = "example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_cost_guard" = "example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_backup_verify" = "example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "mint" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "deploy" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "restore" = { "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" } }
+  }
+  assert {
+    condition = (length(output.authorization.target.mint) == 0 &&
+      toset(keys(output.authorization.vault.mint)) == toset(["backup_write", "backup_read", "delegation"]) &&
+      output.authorization.vault.mint == output.authorization.vault.ops &&
+      !contains(output.authorization.twins, "mint") &&
+      length(output.authorization.federations.mint) == 6 &&
+      length(output.authorization.federations.deploy) == 10 &&
+      length(output.authorization.federations.plan) == 4 &&
+      length(output.authorization.federations.ops) == 4 &&
+      length(output.authorization.federations.restore) == 3 &&
+      output.authorization.roles.backup_writer.actions == [] &&
+      output.authorization.roles.delegation.actions == ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"] &&
+    output.mint_client_id != "")
+    error_message = "Mint must have exactly the backup data/delegation grants, no target rights or twin; every allowlisted environment needs one credential."
+  }
+  assert {
+    condition = alltrue([for file in ["ph_move", "ph_restore", "ph_vault_move"] :
+      strcontains(output.authorization.federations.deploy["${file}-restore"].subject, ":environment:restore:") &&
+      strcontains(output.authorization.federations.deploy[file].subject, ":environment:production:")
+    ])
+    error_message = "Move and restore require separate approved restore deploy credentials."
+  }
+}
+run "mint_has_only_vault_data_grants_cross_tenant" {
+  command = plan
+  variables {
+    workflow_refs    = { "plan" = { "ph_plan" = "example-org/example-instance/.github/workflows/ph-plan.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_tailnet_import" = "example-org/example-instance/.github/workflows/ph-tailnet-import.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "sf_merge_gate" = "example-org/example-instance/.github/workflows/sf-merge-gate.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "ops" = { "ph_ops" = "example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_power" = "example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_cost_guard" = "example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_backup_verify" = "example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "mint" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "deploy" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "restore" = { "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" } }
+    target_tenant_id = "different-mocked-tenant"
+  }
+  assert {
+    condition = (length(output.authorization.target.mint) == 0 &&
+      toset(keys(output.authorization.vault.mint)) == toset(["backup_write", "backup_read", "delegation"]) &&
+      output.authorization.vault.mint == output.authorization.vault.ops &&
+      !contains(output.authorization.twins, "mint") &&
+      length(output.authorization.federations.mint) == 6 &&
+      length(output.authorization.federations.deploy) == 10 &&
+      length(output.authorization.federations.plan) == 4 &&
+      length(output.authorization.federations.ops) == 4 &&
+      length(output.authorization.federations.restore) == 3 &&
+      output.authorization.roles.backup_writer.actions == [] &&
+      output.authorization.roles.delegation.actions == ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"] &&
+    output.mint_client_id != "")
+    error_message = "Mint must have exactly the backup data/delegation grants, no target rights or twin; every allowlisted environment needs one credential."
+  }
+  assert {
+    condition = alltrue([for file in ["ph_move", "ph_restore", "ph_vault_move"] :
+      strcontains(output.authorization.federations.deploy["${file}-restore"].subject, ":environment:restore:") &&
+      strcontains(output.authorization.federations.deploy[file].subject, ":environment:production:")
+    ])
+    error_message = "Move and restore require separate approved restore deploy credentials."
+  }
+}
+run "existing_credential_addresses_and_names" {
+  command = plan
+  variables { workflow_refs = { "plan" = { "ph_plan" = "example-org/example-instance/.github/workflows/ph-plan.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_tailnet_import" = "example-org/example-instance/.github/workflows/ph-tailnet-import.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "sf_merge_gate" = "example-org/example-instance/.github/workflows/sf-merge-gate.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "ops" = { "ph_ops" = "example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_power" = "example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_cost_guard" = "example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_backup_verify" = "example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "mint" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "deploy" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "restore" = { "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" } } }
+  assert {
+    condition = length(output.authorization.federations.deploy) == 10 && alltrue(flatten([for identity in ["plan", "deploy", "ops", "restore"] : [
+      for key, ref in var.workflow_refs[identity] :
+      output.authorization.federations[identity][key].name == "github-${key}" &&
+      endswith(output.authorization.federations[identity][key].subject, ":job_workflow_ref:${ref}")
+    ]]))
+    error_message = "Primary credential keys (AVM resource addresses) and github-key names must remain stable."
+  }
+}
+run "reject_production_file_in_ops" {
+  command = plan
+  variables { workflow_refs = { ops = { candidate = "example-org/example-instance/.github/workflows/ph-deploy.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } } }
+  expect_failures = [var.workflow_refs]
+}
+run "reject_probe_federation" {
+  command = plan
+  variables { workflow_refs = { plan = { candidate = "example-org/example-instance/.github/workflows/sf-oidc-probe.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } } }
+  expect_failures = [var.workflow_refs]
+}
+run "reject_expanded_credential_budget" {
+  command = plan
+  variables {
+    workflow_refs = { deploy = { for n in range(11) : "release${n}" => "example-org/example-instance/.github/workflows/ph-restore.yml@${format("%040x", n + 1)}" } }
+  }
+  expect_failures = [var.workflow_refs]
+}
+
 run "trust_storage_and_authorization" {
   command = plan
   assert {
@@ -353,92 +441,6 @@ run "adding_lexically_first_target_preserves_trust_home" {
   }
 }
 
-run "mint_has_only_vault_data_grants" {
-  command = plan
-  variables {
-    workflow_refs = { "plan" = { "ph_plan" = "example-org/example-instance/.github/workflows/ph-plan.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_tailnet_import" = "example-org/example-instance/.github/workflows/ph-tailnet-import.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "sf_merge_gate" = "example-org/example-instance/.github/workflows/sf-merge-gate.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "ops" = { "ph_ops" = "example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_power" = "example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_cost_guard" = "example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_backup_verify" = "example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "mint" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "deploy" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "restore" = { "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" } }
-  }
-  assert {
-    condition = (length(output.authorization.target.mint) == 0 &&
-      toset(keys(output.authorization.vault.mint)) == toset(["backup_write", "backup_read", "delegation"]) &&
-      output.authorization.vault.mint == output.authorization.vault.ops &&
-      !contains(output.authorization.twins, "mint") &&
-      length(output.authorization.federations.mint) == 6 &&
-      length(output.authorization.federations.deploy) == 10 &&
-      length(output.authorization.federations.plan) == 4 &&
-      length(output.authorization.federations.ops) == 4 &&
-      length(output.authorization.federations.restore) == 3 &&
-      output.authorization.roles.backup_writer.actions == [] &&
-      output.authorization.roles.delegation.actions == ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"] &&
-    output.mint_client_id != "")
-    error_message = "Mint must have exactly the backup data/delegation grants, no target rights or twin; every allowlisted environment needs one credential."
-  }
-  assert {
-    condition = alltrue([for file in ["ph_move", "ph_restore", "ph_vault_move"] :
-      strcontains(output.authorization.federations.deploy["${file}-restore"].subject, ":environment:restore:") &&
-      strcontains(output.authorization.federations.deploy[file].subject, ":environment:production:")
-    ])
-    error_message = "Move and restore require separate approved restore deploy credentials."
-  }
-}
-run "mint_has_only_vault_data_grants_cross_tenant" {
-  command = plan
-  variables {
-    workflow_refs    = { "plan" = { "ph_plan" = "example-org/example-instance/.github/workflows/ph-plan.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_tailnet_import" = "example-org/example-instance/.github/workflows/ph-tailnet-import.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "sf_merge_gate" = "example-org/example-instance/.github/workflows/sf-merge-gate.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "ops" = { "ph_ops" = "example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_power" = "example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_cost_guard" = "example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_backup_verify" = "example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "mint" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "deploy" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "restore" = { "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" } }
-    target_tenant_id = "different-mocked-tenant"
-  }
-  assert {
-    condition = (length(output.authorization.target.mint) == 0 &&
-      toset(keys(output.authorization.vault.mint)) == toset(["backup_write", "backup_read", "delegation"]) &&
-      output.authorization.vault.mint == output.authorization.vault.ops &&
-      !contains(output.authorization.twins, "mint") &&
-      length(output.authorization.federations.mint) == 6 &&
-      length(output.authorization.federations.deploy) == 10 &&
-      length(output.authorization.federations.plan) == 4 &&
-      length(output.authorization.federations.ops) == 4 &&
-      length(output.authorization.federations.restore) == 3 &&
-      output.authorization.roles.backup_writer.actions == [] &&
-      output.authorization.roles.delegation.actions == ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"] &&
-    output.mint_client_id != "")
-    error_message = "Mint must have exactly the backup data/delegation grants, no target rights or twin; every allowlisted environment needs one credential."
-  }
-  assert {
-    condition = alltrue([for file in ["ph_move", "ph_restore", "ph_vault_move"] :
-      strcontains(output.authorization.federations.deploy["${file}-restore"].subject, ":environment:restore:") &&
-      strcontains(output.authorization.federations.deploy[file].subject, ":environment:production:")
-    ])
-    error_message = "Move and restore require separate approved restore deploy credentials."
-  }
-}
-run "existing_credential_addresses_and_names" {
-  command = plan
-  variables { workflow_refs = { "plan" = { "ph_plan" = "example-org/example-instance/.github/workflows/ph-plan.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_tailnet_import" = "example-org/example-instance/.github/workflows/ph-tailnet-import.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "sf_merge_gate" = "example-org/example-instance/.github/workflows/sf-merge-gate.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "ops" = { "ph_ops" = "example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_power" = "example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_cost_guard" = "example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_backup_verify" = "example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "mint" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "deploy" = { "ph_deploy" = "example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_teardown" = "example-org/example-instance/.github/workflows/ph-teardown.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_rotate_age" = "example-org/example-instance/.github/workflows/ph-rotate-age.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_selftest" = "example-org/example-instance/.github/workflows/ph-selftest.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" }, "restore" = { "ph_restore" = "example-org/example-instance/.github/workflows/ph-restore.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_move" = "example-org/example-instance/.github/workflows/ph-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba", "ph_vault_move" = "example-org/example-instance/.github/workflows/ph-vault-move.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba" } } }
-  assert {
-    condition = length(output.authorization.federations.deploy) == 10 && alltrue(flatten([for identity in ["plan", "deploy", "ops", "restore"] : [
-      for key, ref in var.workflow_refs[identity] :
-      output.authorization.federations[identity][key].name == "github-${key}" &&
-      endswith(output.authorization.federations[identity][key].subject, ":job_workflow_ref:${ref}")
-    ]]))
-    error_message = "Primary credential keys (AVM resource addresses) and github-key names must remain stable."
-  }
-}
-run "reject_production_file_in_ops" {
-  command = plan
-  variables { workflow_refs = { ops = { candidate = "example-org/example-instance/.github/workflows/ph-deploy.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } } }
-  expect_failures = [var.workflow_refs]
-}
-run "reject_probe_federation" {
-  command = plan
-  variables { workflow_refs = { plan = { candidate = "example-org/example-instance/.github/workflows/sf-oidc-probe.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } } }
-  expect_failures = [var.workflow_refs]
-}
-run "reject_expanded_credential_budget" {
-  command = plan
-  variables {
-    workflow_refs = { deploy = { for n in range(11) : "release${n}" => "example-org/example-instance/.github/workflows/ph-restore.yml@${format("%040x", n + 1)}" } }
-  }
-  expect_failures = [var.workflow_refs]
-}
 
 override_resource {
   target          = module.trust.azurerm_role_definition.target["host_operator"]
