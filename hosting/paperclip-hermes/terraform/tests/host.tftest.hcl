@@ -164,3 +164,24 @@ run "actual100_subscription_email_only_fallback" {
     error_message = "Unverified billing months must keep actual100 email-only for the subscription; RG actual100 deallocates."
   }
 }
+
+run "rendered_bootstrap_for_new_vm" {
+  command = plan
+  module { source = "../../modules/host" }
+  variables {
+    bootstrap_custom_data       = null
+    bootstrap_render_for_new_vm = true
+  }
+  assert {
+    condition     = startswith(base64decode(output.invariants.custom_data), "#cloud-config\n") && strcontains(base64decode(output.invariants.custom_data), base64gzip(file("../../modules/host/bootstrap/sf-host-agent")))
+    error_message = "New VM creation data installs the fixed compressed agent."
+  }
+  assert {
+    condition     = base64decode(output.invariants.custom_data) == file("../../../tools/tests/fixtures/host-cloud-init.yaml")
+    error_message = "Review and record the Terraform-rendered creation payload fixture when bootstrap changes."
+  }
+  assert {
+    condition     = output.invariants.agent_sha256 == filesha256("../../modules/host/bootstrap/sf-host-agent")
+    error_message = "The receipt must record the shipped agent digest."
+  }
+}

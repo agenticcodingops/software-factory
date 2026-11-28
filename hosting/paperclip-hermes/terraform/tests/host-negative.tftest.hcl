@@ -96,3 +96,34 @@ run "reject_standalone_release_sha" {
   variables { bootstrap_custom_data = base64encode("#cloud-config\n# commit ${join("", [for i in range(40) : "A"])}\n") }
   expect_failures = [terraform_data.invariants]
 }
+
+run "reject_null_bootstrap_without_new_vm_flag" {
+  command = plan
+  module { source = "../../modules/host" }
+  variables { bootstrap_custom_data = null }
+  expect_failures = [terraform_data.invariants]
+  assert {
+    condition     = var.bootstrap_render_for_new_vm == false
+    error_message = "Rendering is an explicit opt-in, including for a VM without protocol tags."
+  }
+}
+run "reject_new_vm_flag_with_protocol_tags" {
+  command = plan
+  module { source = "../../modules/host" }
+  variables {
+    bootstrap_custom_data       = null
+    bootstrap_render_for_new_vm = true
+    protocol_tags               = { sf-approved-sha = "candidate" }
+  }
+  expect_failures = [terraform_data.invariants]
+  assert {
+    condition     = startswith(base64decode(output.invariants.custom_data), "#cloud-config\n")
+    error_message = "Null resolves to the template; rejection must come from the explicit new-VM guard."
+  }
+}
+run "reject_new_vm_flag_with_receipt_bytes" {
+  command = plan
+  module { source = "../../modules/host" }
+  variables { bootstrap_render_for_new_vm = true }
+  expect_failures = [terraform_data.invariants]
+}

@@ -118,7 +118,7 @@ module "vm" {
     password_authentication_disabled = true
   }
   managed_identities         = { system_assigned = false, user_assigned_resource_ids = [] }
-  custom_data                = var.bootstrap_custom_data
+  custom_data                = local.bootstrap_custom_data
   boot_diagnostics           = true
   secure_boot_enabled        = true
   vtpm_enabled               = true

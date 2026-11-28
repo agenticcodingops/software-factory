@@ -1,0 +1,103 @@
+#cloud-config
+package_update: true
+packages:
+  - [age, 1.1.1-1ubuntu0.24.04.3]
+  - [tailscale, 1.104.7]
+apt:
+  sources:
+    tailscale.list:
+      source: 'deb [signed-by=$KEY_FILE] https://pkgs.tailscale.com/stable/ubuntu noble main'
+      # Signing fingerprint: 2596 A99E AAB3 3821 893C 0A79 458C A832 957F 5868
+      key: |
+        -----BEGIN PGP PUBLIC KEY BLOCK-----
+
+        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
+        =AIVM
+        -----END PGP PUBLIC KEY BLOCK-----
+write_files:
+  - path: /usr/local/sbin/sf-host-agent
+    encoding: gz+b64
+    content: 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
+    owner: root:root
+    permissions: '0755'
+# P19: verify this LUN-0 link on the selected Ubuntu 24.04 Azure image.
+disk_setup:
+  /dev/disk/azure/scsi1/lun0:
+    table_type: gpt
+    layout: true
+    overwrite: false
+fs_setup:
+  - label: sf-data
+    filesystem: ext4
+    device: /dev/disk/azure/scsi1/lun0
+    partition: any
+    overwrite: false
+mounts:
+  - [LABEL=sf-data, /data, ext4, 'defaults,nofail', '0', '2']
+runcmd:
+  - |
+    set -eu
+    install -d -m 0700 -o root -g root /etc/paperclip-hermes
+    chown root:root /etc/paperclip-hermes
+    chmod 0700 /etc/paperclip-hermes
+    if [ -e /etc/paperclip-hermes/delivery.key ] || [ -L /etc/paperclip-hermes/delivery.key ]; then
+      :
+    else
+      umask 077
+      tmp=$(mktemp /etc/paperclip-hermes/.delivery.XXXXXX)
+      trap 'rm -f "$tmp"' EXIT
+      trap 'exit 1' HUP INT TERM
+      /usr/bin/age-keygen >"$tmp" 2>/dev/null
+      chmod 0600 "$tmp"
+      chown root:root "$tmp"
+      ln "$tmp" /etc/paperclip-hermes/delivery.key
+      rm -f "$tmp"
+      trap - EXIT HUP INT TERM
+    fi

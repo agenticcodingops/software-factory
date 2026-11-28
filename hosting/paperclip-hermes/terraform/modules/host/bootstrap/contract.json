@@ -1,0 +1,48 @@
+{
+  "path": "/usr/local/sbin/sf-host-agent",
+  "agent_sha256": "6e5c7f0f1e39d824ea17c6793ee697bec9c6d9cd3102193b834a008dd13a6bf3",
+  "commands": {
+    "recipient": {
+      "argv": [
+        "recipient"
+      ],
+      "lock": true,
+      "stdout": "^age1[0-9a-z]{58}$"
+    },
+    "fetch": {
+      "argv": [
+        "fetch",
+        "^[0-9a-f]{40}$",
+        "[--prepare-only]"
+      ],
+      "lock": true,
+      "stdout": "JSON: fetched, path (verified); prepared: true also after prepare"
+    },
+    "status": {
+      "argv": [
+        "status"
+      ],
+      "lock": false,
+      "stdout": "JSON status object"
+    }
+  },
+  "exit": {
+    "ok": 0,
+    "internal": 1,
+    "usage": 2,
+    "recipient": 3,
+    "verification": 4,
+    "data_mount": 6,
+    "prepare": 7,
+    "busy": 8,
+    "unsafe": 10
+  },
+  "absent_exit": 127,
+  "retry_exit": 8,
+  "max_runtime_seconds": {
+    "recipient": 60,
+    "fetch": 4200,
+    "status": 60
+  },
+  "status_max_bytes": 2048
+}
