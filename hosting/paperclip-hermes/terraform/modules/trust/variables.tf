@@ -57,16 +57,39 @@ variable "workflow_refs" {
   description = "Owner-authorized exact reusable workflow refs per identity, at full commit SHAs; empty means no federation."
   default     = {}
   validation {
-    condition     = alltrue(flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) : can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[.]github/workflows/[A-Za-z0-9_-]+[.]ya?ml@[0-9a-f]{40}$", ref))]])) && alltrue([for refs in values(var.workflow_refs) : length(refs) <= 20]) && length(setsubtract(toset(keys(var.workflow_refs)), toset(["plan", "deploy", "ops", "restore", "mint"]))) == 0
-    error_message = "Federation requires exact reusable workflow paths at full SHAs, known identities and at most 20 credentials per identity. Requested: ${join(", ", flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) : "${identity}/${basename(split("@", ref)[0])}"]]))}."
+    condition = alltrue(flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) :
+      can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[.]github/workflows/[A-Za-z0-9_-]+[.]ya?ml@[0-9a-f]{40}$", ref)) && contains(["plan", "deploy", "ops", "restore", "mint"], identity)
+    ]])) && length(setsubtract(toset(keys(var.workflow_refs)), toset(["plan", "deploy", "ops", "restore", "mint"]))) == 0
+    error_message = format("Rejected identity/file: %s.", join(", ", concat(
+      flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) : "${identity}/${basename(split("@", ref)[0])}"
+        if !can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[.]github/workflows/[A-Za-z0-9_-]+[.]ya?ml@[0-9a-f]{40}$", ref)) || !contains(["plan", "deploy", "ops", "restore", "mint"], identity)
+      ]]),
+      [for identity, refs in var.workflow_refs : "${identity}/<no refs>" if length(refs) == 0 && !contains(["plan", "deploy", "ops", "restore", "mint"], identity)]
+    )))
+  }
+  validation {
+    condition     = alltrue([for refs in values(var.workflow_refs) : length(refs) <= 20])
+    error_message = format("Over 20 requested refs for identities: %s.", join(", ", [for identity, refs in var.workflow_refs : identity if length(refs) > 20]))
   }
   validation {
     condition = alltrue(flatten([for identity, refs in var.workflow_refs : [
       for ref in values(refs) : contains(keys(lookup(jsondecode(file("${path.module}/federation-allowlist.json")).identities, identity, {})), basename(split("@", ref)[0]))
-      ]])) && alltrue([for identity, refs in var.workflow_refs :
+    ]]))
+    error_message = format("Rejected identity/file: %s.", join(", ", flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) : "${identity}/${basename(split("@", ref)[0])}" if !contains(keys(lookup(jsondecode(file("${path.module}/federation-allowlist.json")).identities, identity, {})), basename(split("@", ref)[0]))]])))
+  }
+  validation {
+    condition = alltrue([for identity, refs in var.workflow_refs :
       sum(concat([0], [for ref in values(refs) : length(lookup(lookup(jsondecode(file("${path.module}/federation-allowlist.json")).identities, identity, {}), basename(split("@", ref)[0]), []))])) <= 20
-    ]) && alltrue([for refs in values(var.workflow_refs) : length(values(refs)) == length(distinct(values(refs)))])
-    error_message = format("Identity/file must be allowlisted and unique per identity; expanded credentials must not exceed 20; prune obsolete SHAs after handoff. Rejected identity/file: %s.", join(", ", flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) : "${identity}/${basename(split("@", ref)[0])}" if !contains(keys(lookup(jsondecode(file("${path.module}/federation-allowlist.json")).identities, identity, {})), basename(split("@", ref)[0]))]])))
+    ])
+    error_message = format("Expanded credentials exceed 20 for identities: %s; prune obsolete SHAs after handoff.", join(", ", [for identity, refs in var.workflow_refs : identity
+      if sum(concat([0], [for ref in values(refs) : length(lookup(lookup(jsondecode(file("${path.module}/federation-allowlist.json")).identities, identity, {}), basename(split("@", ref)[0]), []))])) > 20
+    ]))
+  }
+  validation {
+    condition = alltrue([for refs in values(var.workflow_refs) : length(values(refs)) == length(distinct(values(refs)))])
+    error_message = format("Duplicate identity/file refs: %s.", join(", ", distinct(flatten([for identity, refs in var.workflow_refs : [for ref in distinct(values(refs)) : "${identity}/${basename(split("@", ref)[0])}"
+      if length([for other in values(refs) : other if other == ref]) > 1
+    ]]))))
   }
   validation {
     condition = alltrue([for refs in values(var.workflow_refs) :

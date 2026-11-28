@@ -75,9 +75,9 @@ run "mint_has_only_vault_data_grants_same_tenant" {
       output.authorization.role_names.vault_delegation == "sffixture SF Delegation Key" &&
       endswith(output.authorization.vault.mint.backup_write.role_definition_id_or_name, "/roleDefinitions/${uuidv5("dns", "backup-writer.example.test")}") &&
       endswith(output.authorization.vault.mint.delegation.role_definition_id_or_name, "/roleDefinitions/${uuidv5("dns", "delegation.example.test")}") &&
-      endswith(output.authorization.vault.mint.backup_write.scope, "/storageAccounts/sffixturebackups/blobServices/default/containers/backups") &&
-      endswith(output.authorization.vault.mint.backup_read.scope, "/storageAccounts/sffixturebackups/blobServices/default/containers/backups") &&
-      endswith(output.authorization.vault.mint.delegation.scope, "/storageAccounts/sffixturebackups") &&
+      output.authorization.vault.mint.backup_write.scope == "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault/providers/Microsoft.Storage/storageAccounts/${var.prefix}backups/blobServices/default/containers/backups" &&
+      output.authorization.vault.mint.backup_read.scope == "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault/providers/Microsoft.Storage/storageAccounts/${var.prefix}backups/blobServices/default/containers/backups" &&
+      output.authorization.vault.mint.delegation.scope == "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault/providers/Microsoft.Storage/storageAccounts/${var.prefix}backups" &&
       length(output.authorization.target.restore) == 2 &&
       toset(keys(output.authorization.target.restore)) == toset(["alpha-SF Host Operator", "beta-SF Host Operator"]) &&
       alltrue([for key, target in var.targets :
@@ -118,9 +118,9 @@ run "mint_has_only_vault_data_grants_cross_tenant" {
       output.authorization.role_names.vault_delegation == "sffixture SF Delegation Key" &&
       endswith(output.authorization.vault.mint.backup_write.role_definition_id_or_name, "/roleDefinitions/${uuidv5("dns", "backup-writer.example.test")}") &&
       endswith(output.authorization.vault.mint.delegation.role_definition_id_or_name, "/roleDefinitions/${uuidv5("dns", "delegation.example.test")}") &&
-      endswith(output.authorization.vault.mint.backup_write.scope, "/storageAccounts/sffixturebackups/blobServices/default/containers/backups") &&
-      endswith(output.authorization.vault.mint.backup_read.scope, "/storageAccounts/sffixturebackups/blobServices/default/containers/backups") &&
-      endswith(output.authorization.vault.mint.delegation.scope, "/storageAccounts/sffixturebackups") &&
+      output.authorization.vault.mint.backup_write.scope == "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault/providers/Microsoft.Storage/storageAccounts/${var.prefix}backups/blobServices/default/containers/backups" &&
+      output.authorization.vault.mint.backup_read.scope == "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault/providers/Microsoft.Storage/storageAccounts/${var.prefix}backups/blobServices/default/containers/backups" &&
+      output.authorization.vault.mint.delegation.scope == "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault/providers/Microsoft.Storage/storageAccounts/${var.prefix}backups" &&
       length(output.authorization.target.restore) == 2 &&
       toset(keys(output.authorization.target.restore)) == toset(["alpha-SF Host Operator", "beta-SF Host Operator"]) &&
       alltrue([for key, target in var.targets :
@@ -237,7 +237,7 @@ run "trust_storage_and_authorization" {
     error_message = "Delegation keys require account scope, not container scope."
   }
   assert {
-    condition     = endswith(output.authorization.vault.ops.backup_write.scope, "/containers/backups") && endswith(output.authorization.vault.restore.staging_write.scope, "/containers/restore-staging") && !contains(keys(output.authorization.vault.restore), "key_read")
+    condition     = output.authorization.vault.ops.backup_write.scope == "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault/providers/Microsoft.Storage/storageAccounts/${var.prefix}backups/blobServices/default/containers/backups" && output.authorization.vault.restore.staging_write.scope == "/subscriptions/${var.vault_subscription_id}/resourceGroups/rg-${var.prefix}-vault/providers/Microsoft.Storage/storageAccounts/${var.prefix}staging/blobServices/default/containers/restore-staging" && !contains(keys(output.authorization.vault.restore), "key_read")
     error_message = "Data rights are container scoped and operator custody grants no key access."
   }
   assert {

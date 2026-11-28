@@ -42,11 +42,21 @@ def mint_boundary_findings(plan):
     fixture = json.loads((Path(__file__).parent / "tests/fixtures/mint-boundary.json").read_text())
     errors = []
     definitions = {}
+    role_names = {}
+    variables = plan.get("variables", fixture["plan_variables"])
+    prefix = variables["prefix"]["value"]
+    vault_subscription = variables["vault_subscription_id"]["value"]
+    backup_account = (f"/subscriptions/{vault_subscription}/resourceGroups/rg-{prefix}-vault"
+                      f"/providers/Microsoft.Storage/storageAccounts/{prefix}backups")
+    expected_roles = {"backup_write": prefix + " SF Backup Writer", "backup_read": "Storage Blob Data Reader",
+                      "delegation": prefix + " SF Delegation Key"}
     for resource in resources:
         after = resource.get("change", {}).get("after") or {}
         if resource.get("type") == "azurerm_role_definition":
             actions = [a for p in after.get("permissions", []) for field in ("actions", "data_actions") for a in p.get(field, [])]
-            definitions.setdefault(after.get("role_definition_resource_id"), []).extend(actions)
+            role_id = after.get("role_definition_resource_id")
+            definitions.setdefault(role_id, []).extend(actions)
+            role_names.setdefault(role_id, set()).add(after.get("name"))
     for resource in resources:
         after = resource.get("change", {}).get("after") or {}
         address = resource.get("address", "")
@@ -65,10 +75,16 @@ def mint_boundary_findings(plan):
             if grant not in {"backup_write", "backup_read", "delegation"}:
                 errors.append("mint has forbidden grant key at " + address)
             scope = after.get("scope", "")
-            if ((grant in {"backup_write", "backup_read"} and
-                 not re.search(r'/providers/Microsoft.Storage/storageAccounts/[^/]+backups/blobServices/default/containers/backups$', scope)) or
-                    (grant == "delegation" and not re.search(r'/providers/Microsoft.Storage/storageAccounts/[^/]+backups$', scope))):
-                errors.append("mint grant must use the backups container/account at " + address)
+            expected_scope = backup_account if grant == "delegation" else backup_account + "/blobServices/default/containers/backups"
+            if grant in expected_roles:
+                if scope != expected_scope:
+                    errors.append("mint grant must use the backups container/account at " + address)
+                role_id = after.get("role_definition_id")
+                # Custom assignments resolve by ID; AzureRM can also compute an arbitrary name.
+                # An ambiguous mocked ID cannot prove that a grant has exactly its required role.
+                resolved = role_names.get(role_id, {after.get("role_definition_name")})
+                if resolved != {expected_roles[grant]}:
+                    errors.append(f"mint grant {grant} must use {expected_roles[grant]} at " + address)
             # Built-in reader/contributor roles have Compute rights even if mocked IDs collide.
             name = after.get("role_definition_name")
             role_id = after.get("role_definition_id")

@@ -280,7 +280,26 @@
           "type": "azurerm_role_definition",
           "change": {
             "after": {
-              "role_definition_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000",
+              "role_definition_resource_id": "/mock/role/backup-writer",
+              "permissions": [
+                {
+                  "actions": [],
+                  "data_actions": [
+                    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action",
+                    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
+                  ]
+                }
+              ],
+              "name": "sffixture SF Backup Writer"
+            }
+          }
+        },
+        {
+          "type": "azurerm_role_definition",
+          "change": {
+            "after": {
+              "name": "sffixture SF Delegation Key",
+              "role_definition_resource_id": "/mock/role/delegation",
               "permissions": [
                 {
                   "actions": [
@@ -297,7 +316,7 @@
           "change": {
             "after": {
               "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups/blobServices/default/containers/backups",
-              "role_definition_id": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000"
+              "role_definition_id": "/mock/role/backup-writer"
             }
           }
         },
@@ -317,11 +336,19 @@
           "change": {
             "after": {
               "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sffixture-vault/providers/Microsoft.Storage/storageAccounts/sffixturebackups",
-              "role_definition_id": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000"
+              "role_definition_id": "/mock/role/delegation"
             }
           }
         }
       ]
+    }
+  },
+  "plan_variables": {
+    "prefix": {
+      "value": "sffixture"
+    },
+    "vault_subscription_id": {
+      "value": "00000000-0000-0000-0000-000000000000"
     }
   }
 }
