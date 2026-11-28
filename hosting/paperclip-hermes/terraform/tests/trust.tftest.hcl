@@ -180,8 +180,8 @@ run "reject_mixed_source_repositories" {
   command = plan
   variables {
     workflow_refs = {
-      ops  = { health = "agenticcodingops/software-factory/.github/workflows/ph-ops.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
-      mint = { deploy = "example-org/example-instance/.github/workflows/ph-deploy.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      ops    = { health = "agenticcodingops/software-factory/.github/workflows/ph-ops.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      deploy = { deploy = "example-org/example-instance/.github/workflows/ph-deploy.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
     }
   }
   expect_failures = [var.workflow_refs]
