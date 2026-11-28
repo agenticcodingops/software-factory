@@ -46,6 +46,23 @@ def mint_boundary_findings(plan):
     variables = plan.get("variables", fixture["plan_variables"])
     prefix = variables["prefix"]["value"]
     vault_subscription = variables["vault_subscription_id"]["value"]
+    if "variables" not in plan:
+        # Verbose test_plan events omit input variables. Read the independent
+        # vault declarations, never a mint assignment's role or scope.
+        for resource in resources:
+            after = resource.get("change", {}).get("after") or {}
+            if resource.get("address") == "module.trust.azurerm_resource_group.vault":
+                name = re.fullmatch(r"rg-([a-z0-9]{1,17})-vault", after.get("name", ""))
+                if name:
+                    prefix = name[1]
+                else:
+                    errors.append("mint vault resource group name unresolved")
+            if resource.get("address") == 'module.trust.azurerm_role_definition.vault["backup_writer"]':
+                scope = re.fullmatch(r"/subscriptions/([^/]+)", after.get("scope", ""))
+                if scope:
+                    vault_subscription = scope[1]
+                else:
+                    errors.append("mint vault subscription unresolved")
     backup_account = (f"/subscriptions/{vault_subscription}/resourceGroups/rg-{prefix}-vault"
                       f"/providers/Microsoft.Storage/storageAccounts/{prefix}backups")
     expected_roles = {"backup_write": prefix + " SF Backup Writer", "backup_read": "Storage Blob Data Reader",

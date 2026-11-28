@@ -303,6 +303,27 @@ class MintBoundaryTests(unittest.TestCase):
                     self.assertIn("mint grant must use the backups container/account at " + assignment["address"],
                                   inspector.inspect_plan(plan))
 
+    def test_mint_mock_plan_uses_independent_vault_inputs(self):
+        fragments = json.loads((BASE.parent / "tools/tests/fixtures/mint-boundary.json").read_text())["plan_fragments"]
+        plan = json.loads(json.dumps(fragments["allowed"]).replace("sffixture", "sfsecond"))
+        subscription = str(uuid.uuid5(uuid.NAMESPACE_DNS, "vault-second.example.test"))
+        plan = json.loads(json.dumps(plan).replace("00000000-0000-0000-0000-000000000000", subscription))
+        plan["resource_changes"].append({"address": "module.trust.azurerm_resource_group.vault",
+                                         "type": "azurerm_resource_group", "change": {"after": {"name": "rg-sfsecond-vault"}}})
+        definition = plan["resource_changes"][0]
+        definition["address"] = 'module.trust.azurerm_role_definition.vault["backup_writer"]'
+        definition["change"]["after"]["scope"] = "/subscriptions/" + subscription
+        # Actual verbose Terraform events have no variables field, including the
+        # role_names_include_instance_prefix run. Their vault declarations vary.
+        self.assertEqual(inspector.inspect_plan(plan), [])
+        for grant in ("backup_write", "backup_read", "delegation"):
+            with self.subTest(grant=grant):
+                bad = json.loads(json.dumps(plan))
+                assignment = next(r for r in bad["resource_changes"] if r.get("address", "").endswith(f'["{grant}"]'))
+                assignment["change"]["after"]["scope"] = assignment["change"]["after"]["scope"].replace("sfsecondbackups", "otherbackups")
+                self.assertIn("mint grant must use the backups container/account at " + assignment["address"],
+                              inspector.inspect_plan(bad))
+
     def test_mint_builtin_compute_roles_are_rejected(self):
         for role in ("Contributor", "Reader", "Virtual Machine Contributor"):
             with self.subTest(role=role):
