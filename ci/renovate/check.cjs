@@ -5,6 +5,8 @@ const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
 require('./test_pins.cjs');
+require('./test_fixture_compose.cjs');
+const {fixtureCompose} = require('./fixture-compose.cjs');
 require('./test_validator.cjs');
 const {readPins, bump, next} = require('./pins.cjs');
 const root = path.resolve(__dirname, '../..');
@@ -246,11 +248,7 @@ try {
     const livePins = readPins(root);
     for (const file of ['hosting/paperclip-hermes/kit/compose.yaml','hosting/paperclip-hermes/kit/Dockerfile.hermes','.terraform-version']) {
       let content = fs.readFileSync(path.join(root,file),'utf8');
-      if (scenario === 'prefixed' && file.endsWith('compose.yaml')) {
-        const before = content;
-        content = content.replace(`:${livePins.paperclip.prefix}${livePins.paperclip.version}@`, `:v${livePins.paperclip.version}@`);
-        assert.notEqual(content, before, 'prefixed scenario must change the compose pin');
-      }
+      if (file.endsWith('compose.yaml')) content = fixtureCompose(content, livePins.paperclip, scenario);
       write(dir,file,content);
     }
     fs.cpSync(path.join(root,'hosting/paperclip-hermes/terraform'),path.join(dir,'hosting/paperclip-hermes/terraform'), {
@@ -292,6 +290,7 @@ try {
       rewrite('.github/workflows/release.yml', `# ${pins.actions['googleapis/release-please-action']}`, `# ${want.actions['googleapis/release-please-action']}`);
     }
     const pins = readPins(dir), want = next(pins);
+    assert.equal(pins.paperclip.prefix, scenario === 'prefixed' ? 'v' : '');
     const events = cliRun(dir,scenario,'default');
     assertPublic(events, scenario === 'bumped' ? 'mature' : scenario, pins, want, scenario !== 'bumped');
     if (scenario === 'mature') assertActionStreams(cliRun(dir, 'checkout-minor', 'default'), ['minor', 'major']);
