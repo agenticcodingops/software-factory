@@ -76,6 +76,7 @@ before the first write. Terraform receives only bootstrap-controlled ARM setting
    are logged by `.github/workflows/sf-oidc-probe.yml`; tokens are never logged.
    For each actual workflow ref in `workflow_refs`, run `oidc-probe --apply` and
    collect that run after approval with `oidc-probe --probe-run RUN --apply`.
+   The [single allowlist](../terraform/modules/trust/federation-allowlist.json) expands each ref into its allowed environments; the probe calls each distinct environment/ref once. `sf-oidc-probe.yml` is never federated. `sf-merge-gate.yml` is a PR required workflow, not reusable: it is excluded from the probe caller and its metadata/claim counts. Collect its real public claims with `oidc-probe --gate-run RUN --apply` after the gate producer is available. Probe collection retains existing plan gate claims only for still-requested refs and the same immutable prefix; missing evidence refuses federation and names `--gate-run`. See [reusable workflow requirements](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows) and [OIDC claims](https://docs.github.com/en/actions/reference/security/oidc).
    Without `--apply`, `oidc-probe` describes the PR and dispatch steps without
    creating a branch, writing a nonce or reading a planned branch that does not exist.
    Workflows must implement the probe-only interface (`environment`, `nonce`,
@@ -92,7 +93,7 @@ before the first write. Terraform receives only bootstrap-controlled ARM setting
    Cost forecast input is in private `cost-query.json` (Azure Forecast API body).
    Usage and forecast authorization failures fail the operation. The command prints
    vCPU family/Total Regional and credit-minus-forecast headroom. Repeated targets
-   extend the same trust state and retain existing entries. Every trust initialization uses `render-trust.py` with the full inventory and subscription aliases; removal retains old aliases for that apply. New trees exclude state, plans, tfvars and provider caches. Bootstrap refuses source symlinks that escape the source tree and private output parents that escape the instance directory. When all four ops-plane workflow refs exist, bootstrap stages static caller additions in the private directory for CODEOWNER review, preserving other targets’ current literal refs byte-for-byte. It never pushes these caller edits to main. More than one foreign
+   extend the same trust state and retain existing entries. Every trust initialization uses `render-trust.py` with the full inventory and subscription aliases; removal retains old aliases for that apply. New trees exclude state, plans, tfvars and provider caches. Bootstrap refuses source symlinks that escape the source tree and private output parents that escape the instance directory. When ops refs exist, bootstrap selects the target’s live `sf-approved-sha` for static caller additions in the private directory for CODEOWNER review. A missing approved tag refuses staging; existing entries remain for the reviewed deployment handoff. Other targets’ literal refs are preserved byte-for-byte. It never pushes these caller edits to main. More than one foreign
    target tenant requires a separately reviewed root composition.
    `--vault-mode same-subscription` requires identical subscriptions. With a
    spending limit On, it additionally requires `--accept-vault-risk`: exhausted
@@ -101,6 +102,8 @@ before the first write. Terraform receives only bootstrap-controlled ARM setting
    `--remove-target` requires `config/receipts/destroy-NAME.json` with that target
    and `destroyed=true`, from the approved teardown package, and refuses the last
    target or the trust home. Caller entry removal still requires review.
+   Decision 4: for each release, after `ph-deploy` publishes approval/recovery tags and its four-ref manifest, the Owner authorizes the four ops refs through `trust --apply` within the maximum 24 h recovery window. Every SHA group must include all four ops files, equal an active target’s live approved SHA or unexpired recovery SHA (at most 24 h ahead), and resolve to a published non-prerelease `vX.Y.Z` release with a peeled commit on main (compare ahead or identical). Stale refusals list each SHA and exact `workflow_refs.ops` entries to remove after finalization/expiry. Never copy SHAs from alert text. See [VM reads](https://learn.microsoft.com/en-us/cli/azure/vm#az-vm-show), [releases](https://docs.github.com/en/rest/releases/releases#get-a-release-by-tag-name), [tag refs](https://docs.github.com/en/rest/git/refs#get-a-reference), [tag objects](https://docs.github.com/en/rest/git/tags#get-a-tag) and [comparison](https://docs.github.com/en/rest/commits/commits#compare-two-commits).
+   Trust prints every identity’s expanded credential count and refuses above 20 with pruning guidance. Mint has only backup writer/reader and delegation rights, no VM grants or target twin. Production workflows have no ops job. Restore deploy credentials exist only for the three allowlisted restore/move files; ph-restore rebuilds and rejoins under production before approved restore steps. Per-target ops isolation is enforced in approved code. P1 remains the operator’s release-blocking live denial probe.
 4. `age-key --custody operator --escrow-cmd EXECUTABLE --apply` creates an in-memory
    key. The escrow adapter takes the key on stdin, stores it in a password manager,
    retrieves/derives it and returns **only its public recipient** on stdout as
@@ -324,3 +327,5 @@ is also prefixed and grants read/add/write blob data only.
 All acceptance checks are offline. The probe workflow must still run in the private
 instance and the operator must verify live approvals, token exchanges, RBAC, WORM,
 restore and migration-switch evidence before release.
+
+Tailscale federation uses only allowlisted identity/file pairs in plan or production; restore deploy claims, vault move, rotation, merge gate and mint receive no key. Descriptions and managed inventory use `sf-plan-` and `sf-production-` plus the entry key; withdrawals retain those prefixes. `--print-subject` prints only eligible claims. See [Tailscale federation and scopes](https://tailscale.com/docs/features/workload-identity-federation) and [API](https://tailscale.com/api).

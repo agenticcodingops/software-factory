@@ -25,7 +25,7 @@ RECIPIENT = 'age1fixturepublicrecipient'
 FP = hashlib.sha256(RECIPIENT.encode()).hexdigest()
 SHA = 'a' * 40
 REF = 'sample/source/.github/workflows/sf-oidc-probe.yml@' + SHA
-ENVS = {'plan': 'plan', 'deploy': 'production', 'ops': 'ops', 'restore': 'restore'}
+ENVS = {'plan': 'plan', 'deploy': 'production', 'ops': 'ops', 'restore': 'restore', 'mint': 'production'}
 PREFIX = 'repo:sample@7/instance@8'
 VAULT_SUB = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'vault.example.test'))
 TARGET_SUB = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'target.example.test'))
@@ -39,8 +39,12 @@ def write(path, value):
 
 
 def initialize():
-    refs = {i: {'bootstrap': REF} for i in ENVS}
-    claims = {i: {'bootstrap': {'sub': PREFIX + ':environment:' + e + ':job_workflow_ref:' + REF, 'job_workflow_ref': REF}} for i, e in ENVS.items()}
+    files = {'plan': 'ph-plan', 'deploy': 'ph-deploy', 'restore': 'ph-restore', 'mint': 'ph-deploy'}
+    refs = {i: {'bootstrap': 'example-org/example-instance/.github/workflows/' + f + '.yml@' + SHA} for i, f in files.items()}
+    refs['ops'] = {}
+    claims = {i: {'bootstrap': {'sub': PREFIX + ':environment:' + ENVS[i] + ':job_workflow_ref:' + entries['bootstrap'],
+                              'job_workflow_ref': entries['bootstrap']}} for i, entries in refs.items() if entries}
+    claims['ops'] = {}
     variables = {'prefix': 'example', 'state_account_name': 'examplestate', 'location': 'example-region', 'workflow_refs': refs,
                  'custody': 'vault', 'pilot_end_date': '2030-01-01T00:00:00Z', 'monthly_credit': 100, 'role_home_target': 'primary',
                  'targets': {'primary': {'subscription_resource_id': '/subscriptions/' + TARGET_SUB, 'resource_group_name': 'rg-example', 'location': 'example-region', 'rg_managed_by': 'trust'}}}
@@ -203,21 +207,36 @@ if exe == 'gh':
     if '/actions/runs/' in path:
         if path.endswith('/logs'):
             request = json.loads((HOME / 'probe-request.json').read_text())
-            records = []
+            records, seen = [], set()
             for i, entries in request['refs'].items():
                 for key, ref in entries.items():
-                    c = {'environment': ENVS[i], 'sub': PREFIX + ':environment:' + ENVS[i] + ':job_workflow_ref:' + ref,
-                         'job_workflow_ref': ref, 'iss': 'https://token.actions.githubusercontent.com', 'aud': 'api://AzureADTokenExchange', 'nonce': request['nonce']}
-                    if os.environ.get('BAD_CLAIM'): c[os.environ['BAD_CLAIM']] = 'wrong'
-                    records.append(c)
+                    file = ref.rsplit('/', 1)[1].split('@')[0]
+                    if file == 'sf-merge-gate.yml' and not state.get('gate_producer'): continue
+                    if state.get('gate_producer') and (file != 'sf-merge-gate.yml' or state.get('missing_gate_claim')): continue
+                    envs = ['production', 'restore'] if i == 'deploy' and file in ('ph-move.yml', 'ph-restore.yml', 'ph-vault-move.yml') else [ENVS[i]]
+                    for env in envs:
+                        if (env, ref) in seen: continue
+                        seen.add((env, ref))
+                        c = {'environment': env, 'sub': PREFIX + ':environment:' + env + ':job_workflow_ref:' + ref,
+                             'job_workflow_ref': ref, 'iss': 'https://token.actions.githubusercontent.com', 'aud': 'api://AzureADTokenExchange', 'nonce': request['nonce']}
+                        if os.environ.get('BAD_CLAIM'): c[os.environ['BAD_CLAIM']] = 'wrong'
+                        records.append(c)
             data = io.BytesIO()
             with zipfile.ZipFile(data, 'w') as z:
                 z.writestr('probe.txt', '\n'.join('SF_OIDC_CLAIMS=' + json.dumps(c) for c in records))
             out(data.getvalue(), raw=True)
-        out({'id': 1, 'event': 'workflow_dispatch', 'head_branch': 'main', 'head_sha': SHA,
-             'referenced_workflows': [{'path': REF}], 'path': '.github/workflows/sf-bootstrap-probe.yml', 'conclusion': 'success'})
+        request = json.loads((HOME / 'probe-request.json').read_text())
+        out({'id': 1, 'event': 'pull_request' if state.get('gate_producer') else 'workflow_dispatch', 'head_branch': 'main', 'head_sha': SHA,
+             'referenced_workflows': [{'path': ref} for ref in sorted({r for entries in request['refs'].values() for r in entries.values() if state.get('gate_producer') or 'sf-merge-gate.yml@' not in r})], 'path': '.github/workflows/sf-bootstrap-probe.yml', 'conclusion': 'success'})
     if path.endswith('/dispatches'): out({})
-    if '/tags?' in path: out([{'name': 'v1.0.0', 'commit': {'sha': SHA}}])
+    if '/tags?' in path: out([{'name': 'v1.0.' + str(n), 'commit': {'sha': sha}} for n, sha in enumerate(state.get('release_shas', [SHA]))])
+    if '/git/ref/tags/' in path:
+        n = int(path.rsplit('.', 1)[1]); sha = state.get('release_shas', [SHA])[n]
+        out({'object': {'type': 'tag' if state.get('annotated') else 'commit', 'sha': sha}})
+    if '/git/tags/' in path: out({'object': {'type': 'commit', 'sha': path.rsplit('/', 1)[1]}})
+    if '/releases/tags/' in path:
+        out(dict({'tag_name': path.rsplit('/', 1)[1], 'draft': False, 'prerelease': False, 'published_at': '2026-11-28T00:00:00Z'}, **state.get('release_overrides', {})))
+    if '/compare/' in path: out({'status': state.get('compare_status', 'ahead')})
     if '/rulesets' in path:
         endpoint = path.split('?')[0]
         parts = endpoint.rsplit('/', 1)
@@ -232,6 +251,10 @@ if exe == 'gh':
             key = str(len(rules) + 1); rules[key] = dict(value, id=int(key)); out(rules[key])
         out(list(rules.values()))
 if exe == 'az':
+    if args[:2] == ['vm', 'list']:
+        out([{'id': '/mock/virtualMachines/target'}] if not state.get('no_vm') else [])
+    if args[:2] == ['vm', 'show']:
+        out({'tags': state.get('target_tags', {'sf-approved-sha': SHA})})
     if args[:2] == ['account', 'show']:
         out({'user': {'type': 'servicePrincipal' if os.environ.get('APP_LOGIN') else 'user'}, 'tenantId': 'target-tenant-placeholder' if os.environ.get('CROSS_TENANT') and option('--subscription') != VAULT_SUB else 'tenant-placeholder',
              'subscriptionPolicies': {'spendingLimit': os.environ.get('SPENDING', 'Off')}})

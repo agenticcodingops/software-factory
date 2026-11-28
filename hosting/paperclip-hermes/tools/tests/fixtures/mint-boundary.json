@@ -1,0 +1,198 @@
+{
+  "issuer": "https://token.actions.githubusercontent.com",
+  "audience": "api://AzureADTokenExchange",
+  "cases": [
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-deploy.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-deploy.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-deploy.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-move.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-move.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-restore.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-restore.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-rotate-age.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-rotate-age.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-selftest.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-selftest.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-teardown.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-teardown.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-vault-move.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-vault-move.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "ops"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-ops.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-backup-verify.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-cost-guard.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-ops.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:ops:job_workflow_ref:example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:production:job_workflow_ref:example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    },
+    {
+      "identities": [
+        "mint",
+        "deploy",
+        "restore"
+      ],
+      "subject": "repo:example@1/instance@2:environment:restore:job_workflow_ref:example-org/example-instance/.github/workflows/ph-power.yml@d87a252bc1f8b4dc7622b53b5f98816e24eb6cba"
+    }
+  ]
+}

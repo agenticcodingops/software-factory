@@ -52,9 +52,18 @@ variable "workflow_refs" {
   description = "Owner-authorized exact reusable workflow refs per identity, at full commit SHAs; empty means no federation."
   default     = {}
   validation {
-    condition     = alltrue(flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) : can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[.]github/workflows/[A-Za-z0-9_-]+[.]ya?ml@[0-9a-f]{40}$", ref))]])) && alltrue([for refs in values(var.workflow_refs) : length(refs) <= 20]) && length(setsubtract(toset(keys(var.workflow_refs)), toset(["plan", "deploy", "ops", "restore"]))) == 0
+    condition     = alltrue(flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) : can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[.]github/workflows/[A-Za-z0-9_-]+[.]ya?ml@[0-9a-f]{40}$", ref))]])) && alltrue([for refs in values(var.workflow_refs) : length(refs) <= 20]) && length(setsubtract(toset(keys(var.workflow_refs)), toset(["plan", "deploy", "ops", "restore", "mint"]))) == 0
     error_message = "Federation requires exact reusable workflow paths at full SHAs, known identities and at most 20 credentials per identity."
   }
+  validation {
+    condition = alltrue(flatten([for identity, refs in var.workflow_refs : [
+      for ref in values(refs) : contains(keys(lookup(jsondecode(file("${path.module}/../../modules/trust/federation-allowlist.json")).identities, identity, {})), split("@", basename(ref))[0])
+      ]])) && alltrue([for identity, refs in var.workflow_refs :
+      sum(concat([0], [for ref in values(refs) : length(lookup(lookup(jsondecode(file("${path.module}/../../modules/trust/federation-allowlist.json")).identities, identity, {}), split("@", basename(ref))[0], []))])) <= 20
+    ]) && alltrue([for refs in values(var.workflow_refs) : length(values(refs)) == length(distinct(values(refs)))])
+    error_message = "Identity/file must be allowlisted and unique per identity; expanded credentials must not exceed 20; prune obsolete SHAs after handoff. Requested: ${join(", ", flatten([for identity, refs in var.workflow_refs : [for ref in values(refs) : "${identity}/${split("@", basename(ref))[0]}"]]))}."
+  }
+
 
 }
 

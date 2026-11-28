@@ -34,8 +34,56 @@ def credential_findings(resource, values):
     return errors
 
 
-def inspect_plan(plan):
+def mint_boundary_findings(plan):
+    resources = plan.get("resource_changes", [])
+    if not any(r.get("type") == "azurerm_federated_identity_credential" or
+               r.get("type") == "azurerm_role_assignment" and '["mint"]' in r.get("address", "") for r in resources):
+        return []
+    fixture = json.loads((Path(__file__).parent / "tests/fixtures/mint-boundary.json").read_text())
     errors = []
+    definitions = {}
+    for resource in resources:
+        after = resource.get("change", {}).get("after") or {}
+        if resource.get("type") == "azurerm_role_definition":
+            actions = [a for p in after.get("permissions", []) for field in ("actions", "data_actions") for a in p.get(field, [])]
+            definitions.setdefault(after.get("role_definition_resource_id"), []).extend(actions)
+    for resource in resources:
+        after = resource.get("change", {}).get("after") or {}
+        address = resource.get("address", "")
+        if resource.get("type") == "azurerm_federated_identity_credential":
+            for case in fixture["cases"]:
+                if (any(f'["{identity}"]' in address for identity in case["identities"]) and
+                        after.get("issuer") == fixture["issuer"] and fixture["audience"] in after.get("audience", []) and
+                        after.get("subject") == case["subject"]):
+                    errors.append("mint boundary: forbidden subject can exchange " + address)
+        if resource.get("type") == "azurerm_role_assignment" and '["mint"]' in address:
+            # Built-in reader/contributor roles have Compute rights even if mocked IDs collide.
+            name = after.get("role_definition_name")
+            role_id = after.get("role_definition_id")
+            if (name not in (None, "Storage Blob Data Reader") or
+                    (name is None and role_id not in definitions) or
+                    any(a.lower().startswith("microsoft.compute/") or a == "*" for a in definitions.get(role_id, []))):
+                errors.append("mint has Microsoft.Compute or non-backup rights at " + str(after.get("scope")))
+            if 'module.target_identities["mint"]' in address:
+                errors.append("mint must have no tenant twin")
+    return errors
+
+
+def credential_address_findings(plan):
+    fixture = json.loads((Path(__file__).resolve().parents[1] / "terraform/modules/trust/federation-allowlist.json").read_text())
+    resources = {r["address"]: r for r in plan["resource_changes"]}
+    errors = []
+    for identity in ("plan", "deploy", "ops", "restore"):
+        for file in fixture["identities"][identity]:
+            key = file.removesuffix(".yml").replace("-", "_")
+            address = f'module.trust.module.identities["{identity}"].azurerm_federated_identity_credential.this["{key}"]'
+            if resources.get(address, {}).get("change", {}).get("after", {}).get("name") != "github-" + key:
+                errors.append("existing credential address/name changed: " + address)
+    return errors
+
+
+def inspect_plan(plan):
+    errors = mint_boundary_findings(plan)
     ops_credentials = []
     kinds = []
     for resource in state_resources(plan.get("prior_state", {}).get("values", {}).get("root_module", {})):
@@ -163,6 +211,8 @@ def main():
             event = json.loads(line)
             if event.get("type") == "test_plan":
                 plans += 1
+                if event.get("@testrun") == "existing_credential_addresses_and_names":
+                    errors.extend(credential_address_findings(event["test_plan"]))
                 errors.extend(inspect_plan(event["test_plan"]))
                 if event.get("@testrun") in {"trust_storage_and_authorization", "target_tenant_twins"}:
                     errors.extend(trust_read_findings(event["test_plan"]))

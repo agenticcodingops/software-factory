@@ -143,5 +143,47 @@ class MockPlanTests(unittest.TestCase):
             self.assertTrue(inspector.inspect_plan({"resource_changes": [{"type": "azapi_resource", "change": {"after": {"type": kind + "@2024-01-01", "body": {"properties": props}}}}]}))
 
 
+class MintBoundaryTests(unittest.TestCase):
+    def test_allowlist_is_complete_and_excludes_probe(self):
+        allow = json.loads((BASE / "modules/trust/federation-allowlist.json").read_text())
+        self.assertEqual(set(allow["identities"]), {"plan", "deploy", "ops", "restore", "mint"})
+        self.assertEqual(set(allow["identities"]["ops"]), {f + ".yml" for f in ("ph-ops", "ph-power", "ph-cost-guard", "ph-backup-verify")})
+        self.assertEqual(len(allow["identities"]["mint"]), 6)
+        for f in ("ph-restore.yml", "ph-move.yml", "ph-vault-move.yml"):
+            self.assertEqual(allow["identities"]["deploy"][f], ["production", "restore"])
+        self.assertEqual(sum(map(len, allow["identities"]["deploy"].values())), 10)
+        for files in allow["identities"].values():
+            self.assertNotIn("sf-oidc-probe.yml", files)
+        self.assertNotIn("sf-merge-gate.yml", allow["tailscale"]["plan"])
+        self.assertNotIn("ph-vault-move.yml", allow["tailscale"]["deploy"])
+
+    def test_every_forbidden_fixture_subject_is_rejected(self):
+        fixture = json.loads((BASE.parent / "tools/tests/fixtures/mint-boundary.json").read_text())
+        for case in fixture["cases"]:
+            for identity in case["identities"]:
+                with self.subTest(subject=case["subject"], identity=identity):
+                    credential = {"address": f'module.trust.module.identities["{identity}"].azurerm_federated_identity_credential.this["bad"]',
+                                  "type": "azurerm_federated_identity_credential",
+                                  "change": {"after": {"subject": case["subject"], "issuer": fixture["issuer"], "audience": [fixture["audience"]]}}}
+                    self.assertTrue(inspector.inspect_plan({"resource_changes": [credential]}))
+
+    def test_mint_compute_action_is_rejected_at_every_scope(self):
+        for scope in ("/mock/subscription", "/mock/rg", "/mock/storage"):
+            for action in ("Microsoft.Compute/virtualMachines/read", "Microsoft.Compute/virtualMachines/runCommands/*", "*"):
+                with self.subTest(scope=scope, action=action):
+                    plan = {"resource_changes": [
+                        {"type": "azurerm_role_definition", "change": {"after": {"role_definition_resource_id": "/mock/role", "permissions": [{"actions": [action]}]}}},
+                        {"address": 'module.trust.module.identities["mint"].azurerm_role_assignment.this["bad"]', "type": "azurerm_role_assignment",
+                         "change": {"after": {"role_definition_id": "/mock/role", "scope": scope}}}
+                    ]}
+                    self.assertTrue(inspector.inspect_plan(plan))
+
+    def test_mint_builtin_compute_roles_are_rejected(self):
+        for role in ("Contributor", "Reader", "Virtual Machine Contributor"):
+            resource = {"address": 'module.trust.module.identities["mint"].azurerm_role_assignment.this["bad"]',
+                        "type": "azurerm_role_assignment", "change": {"after": {"role_definition_name": role, "scope": "/mock/rg"}}}
+            self.assertTrue(inspector.inspect_plan({"resource_changes": [resource]}))
+
+
 if __name__ == "__main__":
     unittest.main()

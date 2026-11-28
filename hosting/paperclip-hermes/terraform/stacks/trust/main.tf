@@ -54,3 +54,8 @@ output "workload_resource_groups" {
   description = "Resolved workload RG resources from every subscription."
   value       = {}
 }
+
+output "mint_client_id" {
+  description = "Vault-only production mint identity client ID."
+  value       = module.trust.mint_client_id
+}
