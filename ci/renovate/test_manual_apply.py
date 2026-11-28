@@ -13,7 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 RULESETS = ROOT / "hosting/paperclip-hermes/rulesets"
 STUB = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, re, sys
 args = sys.argv[1:]
 state = pathlib.Path(os.environ["APPLY_STATE"])
 with (state / "calls").open("a") as log:
@@ -84,7 +84,17 @@ elif phase == "user": print("operator-fixture")
 elif phase == "sha": print("a" * 40)
 elif phase == "blob": print(json.loads((pathlib.Path(os.environ["APPLY_ROOT"]) / "hosting/paperclip-hermes/rulesets/org-release-notes-gate.pin.json").read_text())["blob_sha"])
 elif phase in ("team", "repo"): print("456")
-elif phase == "list": print("123" if os.environ.get("EXISTING") else "")
+elif phase == "list":
+    if os.environ.get("RULESET_PAGES"):
+        pages = json.loads(os.environ["RULESET_PAGES"])
+        if "--paginate" not in args: pages = pages[:1]
+        query = args[args.index("--jq") + 1]
+        name = re.search(r'select\(\.name=="([^"]+)"\)', query).group(1)
+        for page in pages:
+            for ruleset in page:
+                if ruleset["name"] == name: print(ruleset["id"])
+    else:
+        print("123" if os.environ.get("EXISTING") else "")
 '''
 
 
@@ -279,6 +289,29 @@ class ManualApplyTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("actor_id", result.stdout)
                 self.assertEqual(leftovers, [])
+
+    def test_later_ruleset_pages_are_updated_and_duplicates_rejected(self):
+        for number, block in enumerate(self.blocks()):
+            name = re.search(r'select\(\.name=="([^"]+)"\)', block).group(1)
+            for duplicate in (False, True):
+                with self.subTest(block=number, duplicate=duplicate):
+                    pages = [[{"name": name if duplicate else "unrelated-ruleset", "id": 123}],
+                             [{"name": name, "id": 789}]]
+                    result, calls, leftovers, _ = self.run_block(block, RULESET_PAGES=json.dumps(pages))
+                    writes = [c for c in calls if "--method" in c]
+                    if duplicate:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(writes, [])
+                        self.assertIn("ruleset lookup is ambiguous or failed", result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(result.stdout, "operator-fixture\n")
+                        self.assertEqual(len(writes), 1)
+                        self.assertEqual(writes[0][0:3], ["api", "--method", "PUT"])
+                        self.assertTrue(writes[0][3].endswith("/rulesets/789"))
+                        listing = next(c for c in calls if "rulesets?" in c[1])
+                        self.assertIn("--paginate", listing)
+                    self.assertEqual(leftovers, [])
 
     def test_successful_create_and_update_have_empty_readback_diff(self):
         for number, block in enumerate(self.blocks()):

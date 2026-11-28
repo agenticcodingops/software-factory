@@ -74,7 +74,7 @@ command -v jq >/dev/null
 command -v gh >/dev/null
 f=hosting/paperclip-hermes/rulesets/public-repo.json
 jq -e . "$f" >/dev/null
-id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --jq '.[] | select(.name=="software-factory-main") | .id') || exit 1
+id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --paginate --jq '.[] | select(.name=="software-factory-main") | .id') || exit 1
 [[ -z $id || $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset lookup is ambiguous or failed' >&2; exit 1; }
 if [ -z "$id" ]; then id=$(gh api --method POST repos/agenticcodingops/software-factory/rulesets --input "$f" --jq .id) || exit 1
 else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" --input "$f" >/dev/null || exit 1; fi
@@ -113,7 +113,7 @@ trap 'rm -rf "$scratch"' EXIT
 body=$scratch/body
 readback=$scratch/readback
 jq --arg sha "$sha" --argjson id "$repo_id" '.enforcement = "active" | .rules[0].parameters.workflows[0] |= (.sha = $sha | .repository_id = $id)' "$f" > "$body"
-id=$(gh api 'orgs/agenticcodingops/rulesets?per_page=100' --jq '.[] | select(.name=="software-factory-release-notes-gate") | .id') || exit 1
+id=$(gh api 'orgs/agenticcodingops/rulesets?per_page=100' --paginate --jq '.[] | select(.name=="software-factory-release-notes-gate") | .id') || exit 1
 [[ -z $id || $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset lookup is ambiguous or failed' >&2; exit 1; }
 if [ -z "$id" ]; then id=$(gh api --method POST orgs/agenticcodingops/rulesets --input "$body" --jq .id) || exit 1
 else gh api --method PUT "orgs/agenticcodingops/rulesets/$id" --input "$body" >/dev/null || exit 1; fi
@@ -147,7 +147,7 @@ trap 'rm -rf "$scratch"' EXIT
 body=$scratch/body
 readback=$scratch/readback
 jq --argjson team "$team" '(.bypass_actors[] | select(.actor_type=="Team") | .actor_id) = $team | .enforcement = "active"' "$f" > "$body"
-id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --jq '.[] | select(.name=="software-factory-release-tags") | .id') || exit 1
+id=$(gh api 'repos/agenticcodingops/software-factory/rulesets?per_page=100&includes_parents=false' --paginate --jq '.[] | select(.name=="software-factory-release-tags") | .id') || exit 1
 [[ -z $id || $id =~ ^[1-9][0-9]*$ ]] || { echo 'ruleset lookup is ambiguous or failed' >&2; exit 1; }
 if [ -z "$id" ]; then id=$(gh api --method POST repos/agenticcodingops/software-factory/rulesets --input "$body" --jq .id) || exit 1
 else gh api --method PUT "repos/agenticcodingops/software-factory/rulesets/$id" --input "$body" >/dev/null || exit 1; fi
@@ -174,7 +174,9 @@ Every committed field, and any rule type absent from the payload, is still compa
 Any remaining diff line means
 the apply failed unless it is a documented API default, which the operator records in
 this README in a reviewed PR. Do not normalize other fields without a real readback.
-Check listings for duplicate names and pagination before applying: the
+Each ID lookup uses [`gh api --paginate`](https://cli.github.com/manual/gh_api) to
+search every page; multiple exact-name matches fail the single-positive-ID check.
+Check listings for duplicate names before applying: the
 [repository rules API](https://docs.github.com/en/rest/repos/rules) supports `includes_parents`
 and caps `per_page` at 100. Use the [teams API](https://docs.github.com/en/rest/teams/teams)
 to verify membership. A later workflow change needs the blob pin updated in a reviewed
