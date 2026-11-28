@@ -4,7 +4,7 @@ locals {
   environments = { for identity, files in local.allowlist.identities : identity => files }
   federations = { for identity, files in local.environments : identity => merge({}, [
     for key, ref in lookup(var.workflow_refs, identity, {}) : {
-      for index, env in lookup(files, split("@", basename(ref))[0], []) :
+      for index, env in lookup(files, basename(split("@", ref)[0]), []) :
       (index == 0 ? key : "${key}-${env}") => {
         name     = index == 0 ? "github-${key}" : "github-${key}-${env}"
         issuer   = "https://token.actions.githubusercontent.com"
@@ -206,7 +206,7 @@ resource "terraform_data" "federation_contract" {
     }
     precondition {
       condition = alltrue([for identity, refs in var.workflow_refs :
-        length(local.federations[identity]) == sum(concat([0], [for ref in values(refs) : length(lookup(local.environments[identity], split("@", basename(ref))[0], []))]))
+        length(local.federations[identity]) == sum(concat([0], [for ref in values(refs) : length(lookup(local.environments[identity], basename(split("@", ref)[0]), []))]))
       if contains(keys(local.environments), identity)])
       error_message = "Credential keys collide after environment expansion; use distinct workflow_refs keys."
     }
